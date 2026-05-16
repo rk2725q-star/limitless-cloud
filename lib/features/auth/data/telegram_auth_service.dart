@@ -75,13 +75,9 @@ class TelegramAuthService {
           msg.contains('Connection refused') || msg.contains('Network')) {
         throw Exception(
           '❌ Cannot reach server.\n\n'
-          'Make sure:\n'
-          '• The backend server is running on your PC\n'
-          '  (double-click server/start_server.bat)\n'
-          '• Your phone & PC are on the same Wi-Fi\n'
-          '• The Server URL in Settings is your PC\'s LAN IP\n'
-          '  e.g. http://192.168.1.5:8000\n\n'
-          'Current URL: $base',
+          'The cloud server is temporarily unavailable.\n'
+          'Please check your internet connection and try again.\n\n'
+          'Server URL: $base',
         );
       }
       rethrow;
@@ -141,7 +137,9 @@ class TelegramAuthService {
         'phone': phone,
         'phone_code_hash': phoneCodeHash,
         'code': code,
+        'session_string': partialSession, // ← CRITICAL: reuse DC from send-code
       });
+
 
       if (data['needs_password'] == true) {
         final prefs = await _prefs;

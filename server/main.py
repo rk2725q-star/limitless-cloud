@@ -66,7 +66,9 @@ class SendCodeRequest(BaseModel):
 class VerifyCodeRequest(BaseModel):
     phone: str
     phone_code_hash: str
-    code: str           # 5-digit code from Telegram
+    code: str                       # 5-digit code from Telegram
+    session_string: str = ""        # partial session from /send-code — MUST be passed back
+
 
 class VerifyPasswordRequest(BaseModel):
     session_string: str
@@ -125,9 +127,12 @@ async def send_code(req: SendCodeRequest):
 async def verify_code(req: VerifyCodeRequest):
     """
     Step 2: Verify the OTP the user received on Telegram.
+    IMPORTANT: Pass back the session_string returned by /send-code so Telethon
+    reuses the same Telegram DC — otherwise the code is seen as expired.
     On success returns a full session_string. On 2FA returns needs_password=true.
     """
-    client = make_client()
+    # Reuse the partial session from send-code (same DC = same auth state)
+    client = make_client(req.session_string)
     try:
         await client.connect()
         result = await client.sign_in(
@@ -163,6 +168,7 @@ async def verify_code(req: VerifyCodeRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         await client.disconnect()
+
 
 
 @app.post("/auth/verify-2fa")
