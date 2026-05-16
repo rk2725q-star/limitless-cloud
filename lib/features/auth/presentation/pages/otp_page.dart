@@ -24,12 +24,14 @@ class _OtpPageState extends ConsumerState<OtpPage> {
 
   late String _phone;
   late String _phoneCodeHash;
+  late String _partialSession; // partial session from send-code — needed to verify
 
   @override
   void initState() {
     super.initState();
     _phone = widget.args['phone'] ?? '';
     _phoneCodeHash = widget.args['phoneCodeHash'] ?? '';
+    _partialSession = widget.args['sessionString'] ?? ''; // ← receive partial session
     _startResendTimer();
   }
 
@@ -79,6 +81,7 @@ class _OtpPageState extends ConsumerState<OtpPage> {
       phone: _phone,
       phoneCodeHash: _phoneCodeHash,
       code: _otpCode,
+      partialSession: _partialSession, // ← CRITICAL: reuse same Telegram DC
     );
 
     if (!mounted) return;

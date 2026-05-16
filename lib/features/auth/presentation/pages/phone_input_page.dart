@@ -124,6 +124,7 @@ class _PhoneInputPageState extends ConsumerState<PhoneInputPage> {
         arguments: {
           'phone': phone,
           'phoneCodeHash': result.phoneCodeHash,
+          'sessionString': result.sessionString ?? '', // ← CRITICAL: pass partial session
         },
       );
     } else {
