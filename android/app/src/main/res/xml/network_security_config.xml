@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Only allow HTTPS connections; block all cleartext HTTP for security -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <!-- Telegram API endpoints (MTProto over TLS) -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">telegram.org</domain>
+        <domain includeSubdomains="true">t.me</domain>
+        <domain includeSubdomains="true">core.telegram.org</domain>
+        <domain includeSubdomains="true">firestore.googleapis.com</domain>
+        <domain includeSubdomains="true">googleapis.com</domain>
+    </domain-config>
+</network-security-config>
