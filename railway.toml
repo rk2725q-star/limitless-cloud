@@ -1,8 +1,7 @@
 [build]
 builder = "DOCKERFILE"
-dockerfilePath = "./server/Dockerfile"
+dockerfilePath = "server/Dockerfile"
 
 [deploy]
-startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
 restartPolicyType = "ON_FAILURE"
