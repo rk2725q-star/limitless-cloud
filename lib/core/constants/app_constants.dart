@@ -11,12 +11,11 @@ class AppConstants {
   static const String telegramApiHash = 'cf8e8509b0ceaf5b229ad47f59b79e6e';
 
   // ── Backend Server ────────────────────────────────────────────────────────
-  // Local development: run server/start_server.bat, then use your PC's LAN IP
-  // so the Android device on the same Wi-Fi can reach it.
-  // Example: 'http://192.168.1.5:8000'  (replace with your actual LAN IP)
-  // For production, deploy the server and set the public URL here.
-  static const String backendBaseUrl = 'http://10.0.2.2:8000'; // Android emulator localhost
-  // static const String backendBaseUrl = 'http://192.168.1.5:8000'; // real device on LAN
+  // ✅ Production: deployed on Railway — works from any network, no PC needed!
+  static const String backendBaseUrl = 'https://limitless-cloud-production.up.railway.app';
+  // Local dev: run server/start_server.bat and use LAN IP:
+  // static const String backendBaseUrl = 'http://192.168.1.5:8000';
+
 
   // ── Firestore Collections ─────────────────────────────────────────────────
   static const String usersCollection = 'users';
