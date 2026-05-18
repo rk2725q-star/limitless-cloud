@@ -49,12 +49,6 @@ dependencies:
   image_picker: ^1.1.2
   flutter_image_compress: ^2.3.0
 
-  # Video playback
-  video_player: ^2.9.2
-
-  # Audio playback
-  audioplayers: ^6.1.0
-
   # Animations
   flutter_animate: ^4.5.0
 
