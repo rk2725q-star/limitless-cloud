@@ -162,8 +162,6 @@ class DriveNotifier extends StateNotifier<DriveState> {
 
   // ── Upload ────────────────────────────────────────────────────────────────
 
-  /// Picks files and uploads them to Telegram Saved Messages.
-  /// Encodes folder info in the caption so it can be restored after reinstall.
   Future<void> uploadFiles({
     String? folderId,
     String folderPath = '/',
@@ -185,7 +183,6 @@ class DriveNotifier extends StateNotifier<DriveState> {
       state = state.copyWith(uploadTasks: [...state.uploadTasks, task]);
 
       try {
-        // Upload to Telegram — folder info encoded in caption for sync restore
         final messageId = await _telegramService.uploadFile(
           file,
           folderId: folderId,
@@ -219,10 +216,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
           state = state.copyWith(uploadTasks: tasks);
         }
 
-        _ref.invalidate(filesProvider((folderId: folderId, sortBy: state.sortBy, descending: state.sortDescending)));
-        _ref.invalidate(filesProvider((folderId: null, sortBy: state.sortBy, descending: state.sortDescending)));
-        _ref.invalidate(allFilesProvider((starredOnly: false, trashedOnly: false)));
-        _ref.invalidate(userStatsProvider);
+        _invalidateAll(folderId);
       } catch (e) {
         final tasks = state.uploadTasks.toList();
         final idx = tasks.indexWhere((t) => t.fileName == fileName);
@@ -243,13 +237,13 @@ class DriveNotifier extends StateNotifier<DriveState> {
 
   /// Full sync: restores both folder structure AND files from Telegram.
   ///
-  /// Step 1: Restore folders from LIMITLESS_FOLDER: metadata messages.
-  ///         These are sorted topologically (parents before children) so nested
-  ///         folders are created in the right order.
-  ///
-  /// Step 2: Restore files from LIMITLESS_FILE: captions on document messages.
-  ///         File captions encode the folderId + folderPath → correct placement.
-  ///         Files without LIMITLESS_FILE: caption go to root (legacy support).
+  /// Strategy:
+  ///   • Always fetch the full file list from Telegram (source of truth).
+  ///   • Compare against local DB to find NEW files/folders only.
+  ///   • On fresh login (DB empty for this user) perform a complete wipe +
+  ///     reimport so a user re-logging in with the same number always
+  ///     sees their complete drive.
+  ///   • On subsequent opens, only import what is missing (incremental).
   ///
   /// Returns: (foldersImported, filesImported)
   Future<({int folders, int files})> syncFromTelegram() async {
@@ -262,38 +256,37 @@ class DriveNotifier extends StateNotifier<DriveState> {
       int foldersImported = 0;
       int filesImported = 0;
 
+      final authService = _ref.read(telegramAuthServiceProvider);
+
+      // ── If user just logged in (after logout), wipe stale local DB ─────────
+      final needsWipe = await authService.needsDbResync();
+      if (needsWipe) {
+        await _firestoreService.clearUserData(userId);
+        await authService.clearResyncFlag();
+      }
+
+      // ── Check current DB state ─────────────────────────────────────────────
+      final existingMsgIds     = await _firestoreService.getExistingMessageIds(userId);
+      final existingFolderIds  = await _firestoreService.getExistingFolderIds(userId);
+
       // ── STEP 1: Restore folder structure ─────────────────────────────────
       final folderMetas = await _telegramService.listFolderMeta();
       if (folderMetas.isNotEmpty) {
-        final existingFolderIds = await _firestoreService.getExistingFolderIds(userId);
-
-        // Sort topologically: folders with no parentId first, then children
         final sorted = _sortFoldersByDepth(folderMetas);
-
         for (final meta in sorted) {
           if (existingFolderIds.contains(meta.id)) continue;
 
-          // Determine parentPath from parent folder's path
           String parentPath = '/';
           if (meta.parentId != null && meta.parentId!.isNotEmpty) {
-            // Try to find parent's path from already-upserted folders
             final parentFolder = await _firestoreService.getFolderById(
-              userId: userId,
-              folderId: meta.parentId!,
-            );
-            if (parentFolder != null) {
-              parentPath = parentFolder.path;
-            }
+              userId: userId, folderId: meta.parentId!);
+            if (parentFolder != null) parentPath = parentFolder.path;
           }
 
           await _firestoreService.upsertFolder(
-            userId: userId,
-            id: meta.id,
-            name: meta.name,
-            parentFolderId: meta.parentId,
-            parentPath: parentPath,
-            color: meta.color,
-            metaMessageId: meta.metaMessageId,
+            userId: userId, id: meta.id, name: meta.name,
+            parentFolderId: meta.parentId, parentPath: parentPath,
+            color: meta.color, metaMessageId: meta.metaMessageId,
           );
           foldersImported++;
         }
@@ -302,60 +295,38 @@ class DriveNotifier extends StateNotifier<DriveState> {
       // ── STEP 2: Restore files ─────────────────────────────────────────────
       final telegramFiles = await _telegramService.listFiles();
       if (telegramFiles.isNotEmpty) {
-        final existingMsgIds = await _firestoreService.getExistingMessageIds(userId);
-
         for (final tf in telegramFiles) {
           if (existingMsgIds.contains(tf.messageId)) continue;
 
-          // Parse folder placement from caption
           String? folderId;
           String folderPath = '/';
-
           final meta = TelegramStorageService.parseFileCaption(tf.caption);
           if (meta != null) {
-            folderId = meta['fi'] as String?;
+            folderId   = meta['fi'] as String?;
             folderPath = meta['fp'] as String? ?? '/';
           }
 
-          // If file belongs to a folder that wasn't synced, fall back to root
           if (folderId != null) {
             final folder = await _firestoreService.getFolderById(
-              userId: userId,
-              folderId: folderId,
-            );
-            if (folder == null) {
-              folderId = null;
-              folderPath = '/';
-            }
+                userId: userId, folderId: folderId);
+            if (folder == null) { folderId = null; folderPath = '/'; }
           }
 
           final ext = tf.fileName.contains('.')
-              ? tf.fileName.split('.').last.toLowerCase()
-              : '';
+              ? tf.fileName.split('.').last.toLowerCase() : '';
 
           await _firestoreService.saveFileMetadata(
-            userId: userId,
-            name: tf.fileName,
-            folderId: folderId,
-            folderPath: folderPath,
+            userId: userId, name: tf.fileName,
+            folderId: folderId, folderPath: folderPath,
             telegramMessageId: tf.messageId,
             telegramFileId: tf.messageId.toString(),
-            mimeType: tf.mimeType,
-            sizeBytes: tf.fileSize,
-            extension: ext,
+            mimeType: tf.mimeType, sizeBytes: tf.fileSize, extension: ext,
           );
           filesImported++;
         }
       }
 
-      // Refresh UI
-      if (foldersImported > 0 || filesImported > 0) {
-        _ref.invalidate(foldersProvider(null));
-        _ref.invalidate(filesProvider((folderId: null, sortBy: state.sortBy, descending: state.sortDescending)));
-        _ref.invalidate(allFilesProvider((starredOnly: false, trashedOnly: false)));
-        _ref.invalidate(userStatsProvider);
-      }
-
+      if (foldersImported > 0 || filesImported > 0) _invalidateAll(null);
       return (folders: foldersImported, files: filesImported);
     } catch (_) {
       return (folders: 0, files: 0);
@@ -376,7 +347,6 @@ class DriveNotifier extends StateNotifier<DriveState> {
       final toAdd = remaining.where((f) =>
           f.parentId == null || addedIds.contains(f.parentId)).toList();
       if (toAdd.isEmpty) {
-        // Circular reference or orphans — add remaining as-is
         result.addAll(remaining);
         break;
       }
@@ -391,7 +361,6 @@ class DriveNotifier extends StateNotifier<DriveState> {
 
   // ── Folder Operations ─────────────────────────────────────────────────────
 
-  /// Creates a folder locally AND persists it to Telegram as a metadata message.
   Future<CloudFolder?> createFolder({
     required String name,
     String? parentFolderId,
@@ -400,7 +369,6 @@ class DriveNotifier extends StateNotifier<DriveState> {
     final userId = await _userId;
     if (userId == null) return null;
 
-    // 1. Insert locally first (instant UI update)
     final folder = await _firestoreService.createFolder(
       userId: userId,
       name: name,
@@ -408,7 +376,6 @@ class DriveNotifier extends StateNotifier<DriveState> {
       parentPath: parentPath,
     );
 
-    // 2. Persist to Telegram (async — non-blocking for UI)
     _persistFolderToTelegram(userId, folder);
 
     _ref.invalidate(foldersProvider(parentFolderId));
@@ -418,12 +385,10 @@ class DriveNotifier extends StateNotifier<DriveState> {
     return folder;
   }
 
-  /// Fire-and-forget: saves LIMITLESS_FOLDER: message to Telegram Saved Messages
-  /// and updates the local DB with the resulting Telegram message ID.
   Future<void> _persistFolderToTelegram(String userId, CloudFolder folder) async {
     try {
       final meta = TelegramFolderMeta(
-        metaMessageId: 0, // not yet known
+        metaMessageId: 0,
         id: folder.id,
         name: folder.name,
         parentId: folder.parentFolderId,
@@ -436,9 +401,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
         folderId: folder.id,
         metaMessageId: msgId,
       );
-    } catch (_) {
-      // Non-fatal — folder still exists locally. Will be synced next time.
-    }
+    } catch (_) {}
   }
 
   Future<void> renameFolder(String folderId, String newName) async {
@@ -519,7 +482,6 @@ class DriveNotifier extends StateNotifier<DriveState> {
     return true;
   }
 
-  /// Download file to device
   Future<String?> downloadFile(
     CloudFile file, {
     required Function(double) onProgress,
@@ -543,6 +505,29 @@ class DriveNotifier extends StateNotifier<DriveState> {
     final userId = await _userId;
     if (userId == null || query.isEmpty) return [];
     return _firestoreService.searchFiles(userId: userId, query: query);
+  }
+
+  /// Clear all local data for the current user (call on logout)
+  Future<void> clearLocalData() async {
+    final userId = await _userId;
+    if (userId == null) return;
+    await _firestoreService.clearUserData(userId);
+    _invalidateAll(null);
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  void _invalidateAll(String? folderId) {
+    _ref.invalidate(foldersProvider(folderId));
+    _ref.invalidate(foldersProvider(null));
+    _ref.invalidate(filesProvider((folderId: folderId, sortBy: state.sortBy, descending: state.sortDescending)));
+    _ref.invalidate(filesProvider((folderId: null, sortBy: state.sortBy, descending: state.sortDescending)));
+    _ref.invalidate(allFilesProvider((starredOnly: false, trashedOnly: false)));
+    _ref.invalidate(allFilesProvider((starredOnly: true, trashedOnly: false)));
+    for (final cat in FileCategory.values) {
+      _ref.invalidate(filesByCategoryProvider(cat));
+    }
+    _ref.invalidate(userStatsProvider);
   }
 }
 
@@ -595,6 +580,19 @@ final allFilesProvider = StreamProvider.family<List<CloudFile>, ({bool starredOn
       starredOnly: params.starredOnly,
       trashedOnly: params.trashedOnly,
     );
+  },
+);
+
+/// Category-filtered file provider — only returns files matching one mime category.
+final filesByCategoryProvider = StreamProvider.family<List<CloudFile>, FileCategory>(
+  (ref, category) async* {
+    final authService = ref.read(telegramAuthServiceProvider);
+    final profile = await authService.getProfile();
+    final userId = profile['userId'];
+    if (userId == null || userId.isEmpty) { yield []; return; }
+
+    final firestoreService = ref.read(firestoreServiceProvider);
+    yield* firestoreService.getFilesByCategory(userId: userId, category: category);
   },
 );
 

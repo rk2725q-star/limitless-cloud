@@ -58,7 +58,7 @@ _LIGHT_SEM = asyncio.Semaphore(8)
 
 CHUNK_SIZE      = 512 * 1024   # 512 KB – stream chunk for downloads
 UPLOAD_BUF_SIZE = 64  * 1024   # 64 KB  – read chunk for uploads
-LIST_LIMIT      = 100          # max files returned by /files/list
+LIST_LIMIT      = 200          # max files returned by /files/list
 META_LIMIT      = 200          # max messages scanned by /meta/list
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────

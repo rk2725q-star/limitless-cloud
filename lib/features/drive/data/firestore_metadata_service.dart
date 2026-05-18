@@ -15,20 +15,27 @@ class _DB {
     return _db!;
   }
 
+
   static Future<Database> _open() async {
     final dbPath = p.join(await getDatabasesPath(), 'limitless_cloud.db');
     return openDatabase(
       dbPath,
-      version: 2,  // bumped to add metaMessageId column
+      version: 3,
       onCreate: (db, version) async {
         await _createTables(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
-          // Add metaMessageId column for existing installs
           try {
             await db.execute(
                 'ALTER TABLE folders ADD COLUMN metaMessageId INTEGER DEFAULT 0');
+          } catch (_) {}
+        }
+        if (oldVersion < 3) {
+          // Add index on mimeType for fast category queries
+          try {
+            await db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_files_mime ON files(userId, mimeType, isTrashed)');
           } catch (_) {}
         }
       },
@@ -70,6 +77,8 @@ class _DB {
         updatedAt          TEXT NOT NULL
       )
     ''');
+    await db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_files_mime ON files(userId, mimeType, isTrashed)');
   }
 }
 
@@ -110,9 +119,64 @@ CloudFile _fileFromMap(Map<String, dynamic> m) => CloudFile(
       updatedAt: DateTime.parse(m['updatedAt'] as String),
     );
 
+// ── File category helper ──────────────────────────────────────────────────────
+
+enum FileCategory { images, videos, audio, documents, others }
+
+extension FileCategoryExt on FileCategory {
+  String get label {
+    switch (this) {
+      case FileCategory.images:    return 'Images';
+      case FileCategory.videos:    return 'Videos';
+      case FileCategory.audio:     return 'Audio';
+      case FileCategory.documents: return 'Documents';
+      case FileCategory.others:    return 'Others';
+    }
+  }
+
+  /// SQL WHERE fragment that matches this category's mime-types.
+  /// Must be used with [userId] and isTrashed=0 already applied.
+  String get mimeCondition {
+    switch (this) {
+      case FileCategory.images:
+        return "mimeType LIKE 'image/%'";
+      case FileCategory.videos:
+        return "mimeType LIKE 'video/%'";
+      case FileCategory.audio:
+        return "mimeType LIKE 'audio/%'";
+      case FileCategory.documents:
+        return "(mimeType LIKE 'application/pdf' OR "
+            "mimeType LIKE 'application/msword' OR "
+            "mimeType LIKE 'application/vnd.openxmlformats%' OR "
+            "mimeType LIKE 'application/vnd.ms-%' OR "
+            "mimeType LIKE 'text/%')";
+      case FileCategory.others:
+        return "(mimeType NOT LIKE 'image/%' AND "
+            "mimeType NOT LIKE 'video/%' AND "
+            "mimeType NOT LIKE 'audio/%' AND "
+            "mimeType NOT LIKE 'application/pdf' AND "
+            "mimeType NOT LIKE 'application/msword' AND "
+            "mimeType NOT LIKE 'application/vnd.openxmlformats%' AND "
+            "mimeType NOT LIKE 'application/vnd.ms-%' AND "
+            "mimeType NOT LIKE 'text/%')";
+    }
+  }
+}
+
 // ── Service ───────────────────────────────────────────────────────────────────
 
 class LocalMetadataService {
+
+  // ── Re-login / logout support ──────────────────────────────────────────────
+
+  /// Wipe ALL local data for [userId].  Called on logout or before a fresh
+  /// sync so stale records from a previous install don't block re-import.
+  Future<void> clearUserData(String userId) async {
+    final db = await _DB.instance;
+    await db.delete('files',   where: 'userId = ?', whereArgs: [userId]);
+    await db.delete('folders', where: 'userId = ?', whereArgs: [userId]);
+  }
+
   // ── Folders ────────────────────────────────────────────────────────────────
 
   Future<CloudFolder> createFolder({
@@ -175,7 +239,6 @@ class LocalMetadataService {
     final now = DateTime.now().toIso8601String();
     final path = parentPath == '/' ? '/$name' : '$parentPath/$name';
 
-    // Check if already exists
     final existing = await db.query('folders',
         where: 'id = ? AND userId = ?', whereArgs: [id, userId]);
     if (existing.isEmpty) {
@@ -220,7 +283,6 @@ class LocalMetadataService {
     );
   }
 
-  /// Update the metaMessageId after Telegram text message was sent.
   Future<void> updateFolderMetaMessageId({
     required String userId,
     required String folderId,
@@ -239,8 +301,6 @@ class LocalMetadataService {
     required String userId,
     String? parentFolderId,
   }) async* {
-    // SQLite is not real-time; we emit once then close stream.
-    // DriveNotifier.invalidate() triggers a new subscription.
     final controller = StreamController<List<CloudFolder>>();
     Future<void> emit() async {
       final db = await _DB.instance;
@@ -436,6 +496,27 @@ class LocalMetadataService {
     await controller.close();
   }
 
+  /// Get files filtered by category (images / videos / audio / docs / others)
+  Stream<List<CloudFile>> getFilesByCategory({
+    required String userId,
+    required FileCategory category,
+  }) async* {
+    final controller = StreamController<List<CloudFile>>();
+    Future<void> emit() async {
+      final db = await _DB.instance;
+      final mimeCond = category.mimeCondition;
+      final rows = await db.rawQuery(
+        'SELECT * FROM files WHERE userId = ? AND isTrashed = 0 AND $mimeCond ORDER BY uploadedAt DESC',
+        [userId],
+      );
+      controller.add(rows.map(_fileFromMap).toList());
+    }
+
+    await emit();
+    yield* controller.stream;
+    await controller.close();
+  }
+
   Future<void> moveFile({
     required String userId,
     required String fileId,
@@ -599,7 +680,6 @@ class LocalMetadataService {
 
 // ── Provider ──────────────────────────────────────────────────────────────────
 
-// Keep old name so existing provider references don't break
 typedef FirestoreMetadataService = LocalMetadataService;
 
 final firestoreServiceProvider = Provider<LocalMetadataService>((ref) {

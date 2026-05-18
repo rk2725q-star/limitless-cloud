@@ -5,6 +5,7 @@ import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
 import '../../data/models/cloud_file.dart';
 import '../../data/models/cloud_folder.dart';
+import '../../data/firestore_metadata_service.dart';
 import '../providers/drive_provider.dart';
 import '../widgets/file_grid_item.dart';
 import '../widgets/file_list_item.dart';
@@ -25,7 +26,7 @@ class _HomePageState extends ConsumerState<HomePage> {
     final pages = [
       const _DriveTab(),
       const _StarredTab(),
-      const _RecentTab(),
+      const _CategoriesTab(),
       const _DownloadsTab(),
     ];
 
@@ -61,7 +62,7 @@ class _HomePageState extends ConsumerState<HomePage> {
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.cloud_rounded), label: 'My Drive'),
           BottomNavigationBarItem(icon: Icon(Icons.star_rounded), label: 'Starred'),
-          BottomNavigationBarItem(icon: Icon(Icons.access_time_rounded), label: 'Recent'),
+          BottomNavigationBarItem(icon: Icon(Icons.category_rounded), label: 'Categories'),
           BottomNavigationBarItem(icon: Icon(Icons.download_for_offline_rounded), label: 'Downloads'),
         ],
       ),
@@ -423,31 +424,143 @@ class _StarredTab extends ConsumerWidget {
   }
 }
 
-// ── Recent Tab ────────────────────────────────────────────────────────────────
+// ── Categories Tab ────────────────────────────────────────────────────────────
 
-class _RecentTab extends ConsumerWidget {
-  const _RecentTab();
+class _CategoriesTab extends ConsumerStatefulWidget {
+  const _CategoriesTab();
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final filesAsync = ref.watch(allFilesProvider((starredOnly: false, trashedOnly: false)));
+  ConsumerState<_CategoriesTab> createState() => _CategoriesTabState();
+}
+
+class _CategoriesTabState extends ConsumerState<_CategoriesTab>
+    with SingleTickerProviderStateMixin {
+  late TabController _tabCtrl;
+
+  static const _cats = [
+    (cat: FileCategory.images,    icon: Icons.image_rounded,          color: Color(0xFF4CAF50)),
+    (cat: FileCategory.videos,    icon: Icons.videocam_rounded,       color: Color(0xFFE91E63)),
+    (cat: FileCategory.audio,     icon: Icons.music_note_rounded,     color: Color(0xFF9C27B0)),
+    (cat: FileCategory.documents, icon: Icons.description_rounded,    color: Color(0xFF2196F3)),
+    (cat: FileCategory.others,    icon: Icons.folder_zip_rounded,     color: Color(0xFFFF9800)),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _tabCtrl = TabController(length: _cats.length, vsync: this);
+  }
+
+  @override
+  void dispose() {
+    _tabCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: AppTheme.background,
-      appBar: AppBar(title: const Text('Recent'), backgroundColor: AppTheme.background),
-      body: filesAsync.when(
-        data: (files) => files.isEmpty
-            ? const _EmptyState(message: 'No files yet\nUpload files to see them here')
-            : ListView.builder(
+      appBar: AppBar(
+        backgroundColor: AppTheme.background,
+        title: const Text('Categories'),
+        bottom: TabBar(
+          controller: _tabCtrl,
+          isScrollable: true,
+          indicatorColor: AppTheme.primary,
+          labelColor: AppTheme.primary,
+          unselectedLabelColor: AppTheme.textSecondary,
+          tabs: _cats.map((c) => Tab(
+            icon: Icon(c.icon, size: 20),
+            text: c.cat.label,
+          )).toList(),
+        ),
+      ),
+      body: TabBarView(
+        controller: _tabCtrl,
+        children: _cats.map((c) => _CategoryList(
+          category: c.cat,
+          accentColor: c.color,
+          icon: c.icon,
+        )).toList(),
+      ),
+    );
+  }
+}
+
+class _CategoryList extends ConsumerWidget {
+  final FileCategory category;
+  final Color accentColor;
+  final IconData icon;
+  const _CategoryList({required this.category, required this.accentColor, required this.icon});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final filesAsync = ref.watch(filesByCategoryProvider(category));
+    return filesAsync.when(
+      data: (files) {
+        if (files.isEmpty) {
+          return Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  width: 72, height: 72,
+                  decoration: BoxDecoration(
+                    color: accentColor.withValues(alpha: 0.12),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(icon, color: accentColor, size: 36),
+                ),
+                const SizedBox(height: 16),
+                Text('No ${category.label}',
+                    style: AppTheme.titleMedium.copyWith(color: AppTheme.textSecondary)),
+                const SizedBox(height: 8),
+                Text('Upload ${category.label.toLowerCase()} to see them here',
+                    style: AppTheme.bodyMedium, textAlign: TextAlign.center),
+              ],
+            ),
+          );
+        }
+        return Column(
+          children: [
+            Container(
+              margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              decoration: BoxDecoration(
+                color: accentColor.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: accentColor.withValues(alpha: 0.25)),
+              ),
+              child: Row(
+                children: [
+                  Icon(icon, color: accentColor, size: 20),
+                  const SizedBox(width: 10),
+                  Text('${files.length} ${category.label}',
+                      style: AppTheme.titleMedium.copyWith(color: accentColor)),
+                  const Spacer(),
+                  Text(FileUtils.formatFileSize(files.fold(0, (s, f) => s + f.sizeBytes)),
+                      style: AppTheme.bodyMedium.copyWith(color: accentColor)),
+                ],
+              ),
+            ),
+            Expanded(
+              child: ListView.builder(
+                padding: const EdgeInsets.only(top: 8, bottom: 80),
                 itemCount: files.length,
                 itemBuilder: (_, i) => FileListItem(
                   file: files[i],
-                  onTap: () => Navigator.pushNamed(context, AppRoutes.fileDetail, arguments: {'file': files[i]}),
+                  onTap: () => Navigator.pushNamed(context, AppRoutes.fileDetail,
+                      arguments: {'file': files[i]}),
                   onLongPress: () {},
                   onMoreTap: () {},
                 ),
               ),
-        loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) => Center(child: Text('$e')),
-      ),
+            ),
+          ],
+        );
+      },
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (e, _) => Center(child: Text('$e')),
     );
   }
 }

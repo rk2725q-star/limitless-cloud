@@ -34,13 +34,14 @@ class AuthResult {
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
-const _kSession    = 'tg_session';
-const _kUserId     = 'tg_user_id';
-const _kFirstName  = 'tg_first_name';
-const _kLastName   = 'tg_last_name';
-const _kPhone      = 'tg_phone';
-const _kUsername   = 'tg_username';
-const kServerUrl   = 'server_url'; // public so Settings can write it
+const _kSession      = 'tg_session';
+const _kUserId       = 'tg_user_id';
+const _kFirstName    = 'tg_first_name';
+const _kLastName     = 'tg_last_name';
+const _kPhone        = 'tg_phone';
+const _kUsername     = 'tg_username';
+const kServerUrl     = 'server_url';     // public so Settings can write it
+const kNeedsDbResync = 'needs_db_resync'; // flag: set on logout, cleared after resync
 
 // ── Service ───────────────────────────────────────────────────────────────────
 
@@ -223,11 +224,25 @@ class TelegramAuthService {
       }
     } catch (_) {}
     final prefs = await _prefs;
+    // Set flag so the next login triggers a full DB wipe + resync
+    await prefs.setBool(kNeedsDbResync, true);
     await prefs.remove(_kSession);
     await prefs.remove(_kUserId);
     await prefs.remove(_kFirstName);
     await prefs.remove(_kLastName);
     await prefs.remove(_kPhone);
     await prefs.remove(_kUsername);
+  }
+
+  /// Returns true if a full DB re-sync is required (set after logout).
+  Future<bool> needsDbResync() async {
+    final prefs = await _prefs;
+    return prefs.getBool(kNeedsDbResync) ?? false;
+  }
+
+  /// Clear the resync flag once sync completes successfully.
+  Future<void> clearResyncFlag() async {
+    final prefs = await _prefs;
+    await prefs.remove(kNeedsDbResync);
   }
 }
