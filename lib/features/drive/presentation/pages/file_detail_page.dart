@@ -3,20 +3,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
 import '../../../../core/utils/date_utils.dart';
 import '../../data/models/cloud_file.dart';
-import '../../data/offline_cache_service.dart';
 import '../../data/telegram_storage_service.dart';
 import '../../../auth/data/telegram_auth_service.dart';
 import '../providers/drive_provider.dart';
-import '../providers/offline_cache_provider.dart';
 
-/// File detail page — shows info, offline toggle, star/share/delete.
-/// Tapping "Open" downloads the file to a temp dir and hands it to
-/// whatever native app the user picks (Gallery, VLC, Docs, etc.).
+/// File detail page.
+/// ▶ Open   → streams to temp dir → native "Open With" chooser (zero permanent storage)
+/// ⬇ Save   → streams to Downloads/LimitlessCloud → visible in Gallery & Files app
 class FileDetailPage extends ConsumerStatefulWidget {
   final Map<String, dynamic> args;
   const FileDetailPage({super.key, required this.args});
@@ -28,53 +27,98 @@ class FileDetailPage extends ConsumerStatefulWidget {
 class _FileDetailPageState extends ConsumerState<FileDetailPage> {
   CloudFile get _file => widget.args['file'] as CloudFile;
 
-  bool _isOpening = false;
+  bool _opening  = false;
+  bool _saving   = false;
+  double _saveProgress = 0;
   String? _openError;
+  String? _saveError;
+  bool _savedOk = false;
 
-  // ── Open with native device app ──────────────────────────────────────────
+  // ── Temp stream → native app (zero permanent storage) ─────────────────────
 
   Future<void> _openWithNativeApp() async {
-    setState(() { _isOpening = true; _openError = null; });
+    setState(() { _opening = true; _openError = null; });
     try {
-      // 1. Check offline cache first
-      final offlineState = ref.read(fileOfflineStateProvider(_file.id));
-      String? localPath = offlineState.localPath;
+      final auth = ref.read(telegramAuthServiceProvider);
+      final tg   = TelegramStorageService(auth);
 
-      // 2. If not cached, download to temp folder
-      if (localPath == null || !File(localPath).existsSync()) {
-        final authService = ref.read(telegramAuthServiceProvider);
-        final telegramService = TelegramStorageService(authService);
+      final tmpDir  = await getTemporaryDirectory();
+      final tmpFile = File('${tmpDir.path}/${_file.name}');
 
-        final tmpDir = await getTemporaryDirectory();
-        final tmpFile = File('${tmpDir.path}/${_file.name}');
+      // Stream from Telegram to temp (temp is cleared by OS)
+      final downloaded = await tg.downloadFile(_file.telegramMessageId, _file.name);
+      await downloaded.copy(tmpFile.path);
 
-        // Stream download from Telegram
-        final downloaded = await telegramService.downloadFile(
-          _file.telegramMessageId,
-          _file.name,
-        );
-        await downloaded.copy(tmpFile.path);
-        localPath = tmpFile.path;
-      }
-
-      // 3. Hand off to device — triggers "Open With" chooser
-      final result = await OpenFilex.open(localPath, type: _file.mimeType);
+      final result = await OpenFilex.open(tmpFile.path, type: _file.mimeType);
 
       if (result.type == ResultType.noAppToOpen) {
         setState(() => _openError =
-            'No app found to open this file type.\nTry installing an app that supports .${_file.extension}');
+            'No app found for .${_file.extension}\nInstall a compatible app and try again.');
       } else if (result.type == ResultType.error ||
                  result.type == ResultType.permissionDenied) {
         setState(() => _openError = result.message);
       }
     } catch (e) {
-      setState(() => _openError = 'Could not open file: $e');
+      setState(() => _openError = 'Could not open: $e');
     } finally {
-      if (mounted) setState(() => _isOpening = false);
+      if (mounted) setState(() => _opening = false);
     }
   }
 
-  // ── Share ────────────────────────────────────────────────────────────────
+  // ── Save to public Downloads/LimitlessCloud (visible in Gallery & Files) ──
+
+  Future<void> _saveToDevice() async {
+    setState(() { _saving = true; _saveError = null; _savedOk = false; _saveProgress = 0; });
+    try {
+      // Permission check
+      if (Platform.isAndroid) {
+        final sdk = await _androidSdk();
+        if (sdk < 33) {
+          final status = await Permission.storage.request();
+          if (!status.isGranted) throw Exception('Storage permission denied');
+        }
+      }
+
+      // Public Downloads folder — visible in Files & Gallery
+      final dir = await _publicDownloadsDir();
+      final dest = File('${dir.path}/${_file.name}');
+
+      final auth = ref.read(telegramAuthServiceProvider);
+      final tg   = TelegramStorageService(auth);
+
+      setState(() => _saveProgress = 0.1);
+      final downloaded = await tg.downloadFile(_file.telegramMessageId, _file.name);
+      setState(() => _saveProgress = 0.6);
+      await downloaded.copy(dest.path);
+      setState(() { _saveProgress = 1.0; _savedOk = true; });
+
+    } catch (e) {
+      setState(() => _saveError = 'Save failed: $e');
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Future<Directory> _publicDownloadsDir() async {
+    if (Platform.isAndroid) {
+      final d = Directory('/storage/emulated/0/Download/LimitlessCloud');
+      if (!await d.exists()) await d.create(recursive: true);
+      return d;
+    }
+    final docs = await getApplicationDocumentsDirectory();
+    final d = Directory('${docs.path}/Downloads');
+    if (!await d.exists()) await d.create(recursive: true);
+    return d;
+  }
+
+  Future<int> _androidSdk() async {
+    try {
+      final r = await Process.run('getprop', ['ro.build.version.sdk']);
+      return int.tryParse(r.stdout.toString().trim()) ?? 30;
+    } catch (_) { return 30; }
+  }
+
+  // ── Share ─────────────────────────────────────────────────────────────────
 
   Future<void> _shareFile() async {
     final link = await ref.read(driveProvider.notifier).getShareLink(_file);
@@ -88,7 +132,6 @@ class _FileDetailPageState extends ConsumerState<FileDetailPage> {
 
   @override
   Widget build(BuildContext context) {
-    final offlineState = ref.watch(fileOfflineStateProvider(_file.id));
     final color = FileUtils.getFileColor(_file.extension);
     final icon  = FileUtils.getFileIcon(_file.extension);
 
@@ -101,10 +144,8 @@ class _FileDetailPageState extends ConsumerState<FileDetailPage> {
             style: const TextStyle(fontSize: 15)),
         actions: [
           IconButton(
-            icon: Icon(
-                _file.isStarred
-                    ? Icons.star_rounded
-                    : Icons.star_border_rounded,
+            icon: Icon(_file.isStarred
+                ? Icons.star_rounded : Icons.star_border_rounded,
                 color: AppTheme.warning),
             onPressed: () => ref.read(driveProvider.notifier).toggleStar(_file),
           ),
@@ -127,29 +168,26 @@ class _FileDetailPageState extends ConsumerState<FileDetailPage> {
             ),
           ),
           const SizedBox(height: 16),
-
-          Text(_file.name,
-              style: AppTheme.titleLarge, textAlign: TextAlign.center),
+          Text(_file.name, style: AppTheme.titleLarge, textAlign: TextAlign.center),
           const SizedBox(height: 4),
           Text(FileUtils.getMimeDisplayName(_file.mimeType),
               style: AppTheme.bodyMedium, textAlign: TextAlign.center),
-
           const SizedBox(height: 28),
 
-          // ── Open button ────────────────────────────────────────────────────
-          _OpenButton(
-            isLoading: _isOpening,
-            error: _openError,
+          // ── Primary action buttons ─────────────────────────────────────────
+          _ActionButtons(
+            isOpening: _opening,
+            isSaving: _saving,
+            saveProgress: _saveProgress,
+            savedOk: _savedOk,
+            openError: _openError,
+            saveError: _saveError,
             fileExt: _file.extension,
             onOpen: _openWithNativeApp,
+            onSave: _saveToDevice,
           ),
 
-          const SizedBox(height: 20),
-
-          // ── Offline toggle (Spotify-style) ─────────────────────────────────
-          _OfflineToggleCard(file: _file, state: offlineState),
-
-          const SizedBox(height: 20),
+          const SizedBox(height: 24),
 
           // ── Metadata ──────────────────────────────────────────────────────
           _MetaRow(label: 'Size',
@@ -163,33 +201,24 @@ class _FileDetailPageState extends ConsumerState<FileDetailPage> {
 
           const SizedBox(height: 28),
 
-          // ── Action buttons ─────────────────────────────────────────────────
+          // ── Secondary actions ──────────────────────────────────────────────
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
-              _ActionChip(
-                icon: Icons.share_rounded,
-                label: 'Share',
-                color: AppTheme.accent,
-                onTap: _shareFile,
-              ),
-              _ActionChip(
+              _Chip(icon: Icons.share_rounded, label: 'Share',
+                  color: AppTheme.accent, onTap: _shareFile),
+              _Chip(
                 icon: _file.isStarred
-                    ? Icons.star_rounded
-                    : Icons.star_border_rounded,
+                    ? Icons.star_rounded : Icons.star_border_rounded,
                 label: _file.isStarred ? 'Unstar' : 'Star',
                 color: AppTheme.warning,
                 onTap: () => ref.read(driveProvider.notifier).toggleStar(_file),
               ),
-              _ActionChip(
-                icon: Icons.delete_outline_rounded,
-                label: 'Delete',
-                color: AppTheme.error,
-                onTap: () {
-                  ref.read(driveProvider.notifier).trashFile(_file);
-                  Navigator.pop(context);
-                },
-              ),
+              _Chip(icon: Icons.delete_outline_rounded, label: 'Delete',
+                  color: AppTheme.error, onTap: () {
+                ref.read(driveProvider.notifier).trashFile(_file);
+                Navigator.pop(context);
+              }),
             ],
           ),
         ],
@@ -198,301 +227,193 @@ class _FileDetailPageState extends ConsumerState<FileDetailPage> {
   }
 }
 
-// ── Open button ───────────────────────────────────────────────────────────────
+// ── Action Buttons (Open + Save) ──────────────────────────────────────────────
 
-class _OpenButton extends StatelessWidget {
-  final bool isLoading;
-  final String? error;
-  final String fileExt;
-  final VoidCallback onOpen;
+class _ActionButtons extends StatelessWidget {
+  final bool isOpening, isSaving, savedOk;
+  final double saveProgress;
+  final String? openError, saveError, fileExt;
+  final VoidCallback onOpen, onSave;
 
-  const _OpenButton({
-    required this.isLoading,
-    required this.error,
+  const _ActionButtons({
+    required this.isOpening, required this.isSaving,
+    required this.saveProgress, required this.savedOk,
+    required this.openError, required this.saveError,
     required this.fileExt,
-    required this.onOpen,
+    required this.onOpen, required this.onSave,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        SizedBox(
-          height: 54,
-          child: ElevatedButton.icon(
-            onPressed: isLoading ? null : onOpen,
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppTheme.primary,
-              disabledBackgroundColor: AppTheme.primary.withValues(alpha: 0.5),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(16)),
-            ),
-            icon: isLoading
-                ? const SizedBox(
-                    width: 20, height: 20,
-                    child: CircularProgressIndicator(
-                        color: Colors.white, strokeWidth: 2))
-                : const Icon(Icons.open_in_new_rounded, color: Colors.white),
-            label: Text(
-              isLoading
-                  ? 'Downloading…'
-                  : 'Open with Device App',
-              style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600),
-            ),
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+
+      // ── Open button ─────────────────────────────────────────────────────
+      SizedBox(
+        height: 52,
+        child: ElevatedButton.icon(
+          onPressed: isOpening ? null : onOpen,
+          style: ElevatedButton.styleFrom(
+            backgroundColor: AppTheme.primary,
+            disabledBackgroundColor: AppTheme.primary.withValues(alpha: 0.4),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          ),
+          icon: isOpening
+              ? const SizedBox(width: 18, height: 18,
+                  child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+              : const Icon(Icons.play_circle_rounded, color: Colors.white),
+          label: Text(isOpening ? 'Streaming…' : 'Open  (stream, zero storage)',
+              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+        ),
+      ),
+
+      if (openError != null) ...[
+        const SizedBox(height: 8),
+        _ErrorBanner(openError!),
+      ],
+
+      const SizedBox(height: 10),
+
+      // ── Save to device button ────────────────────────────────────────────
+      SizedBox(
+        height: 52,
+        child: ElevatedButton.icon(
+          onPressed: isSaving || savedOk ? null : onSave,
+          style: ElevatedButton.styleFrom(
+            backgroundColor: savedOk ? AppTheme.success : AppTheme.accent,
+            disabledBackgroundColor: savedOk
+                ? AppTheme.success.withValues(alpha: 0.7)
+                : AppTheme.accent.withValues(alpha: 0.4),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          ),
+          icon: isSaving
+              ? const SizedBox(width: 18, height: 18,
+                  child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+              : Icon(savedOk ? Icons.check_circle_rounded : Icons.download_rounded,
+                  color: Colors.white),
+          label: Text(
+            savedOk
+                ? 'Saved to Downloads ✓'
+                : isSaving
+                    ? 'Saving… ${(saveProgress * 100).toInt()}%'
+                    : 'Save to Device (Gallery / Files)',
+            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
           ),
         ),
+      ),
 
-        if (error != null) ...[
-          const SizedBox(height: 10),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            decoration: BoxDecoration(
-              color: AppTheme.error.withValues(alpha: 0.08),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: AppTheme.error.withValues(alpha: 0.3)),
-            ),
-            child: Row(children: [
-              const Icon(Icons.warning_amber_rounded,
-                  color: AppTheme.error, size: 18),
-              const SizedBox(width: 10),
-              Expanded(
-                  child: Text(error!,
-                      style: const TextStyle(
-                          color: AppTheme.error, fontSize: 12))),
-            ]),
+      if (isSaving) ...[
+        const SizedBox(height: 8),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: LinearProgressIndicator(
+            value: saveProgress,
+            backgroundColor: AppTheme.surfaceVariant,
+            valueColor: const AlwaysStoppedAnimation(AppTheme.accent),
+            minHeight: 4,
           ),
-        ],
+        ),
+      ],
 
+      if (saveError != null) ...[
+        const SizedBox(height: 8),
+        _ErrorBanner(saveError!),
+      ],
+
+      if (savedOk) ...[
         const SizedBox(height: 6),
-        Text(
-          'The file will be handed to your device\'s default '
-          '${_appHint(fileExt)} — you can also choose a different app.',
-          style: const TextStyle(
-              color: AppTheme.textHint, fontSize: 11, height: 1.5),
+        const Text(
+          'File saved to Downloads/LimitlessCloud\nVisible in your Files app & Gallery',
+          style: TextStyle(color: AppTheme.success, fontSize: 11, height: 1.5),
           textAlign: TextAlign.center,
         ),
       ],
-    );
+
+      const SizedBox(height: 6),
+      Text(
+        '"Open" streams the file and opens it in your ${_appHint(fileExt ?? '')}\n'
+        '"Save" copies it permanently to your device storage.',
+        style: const TextStyle(color: AppTheme.textHint, fontSize: 11, height: 1.5),
+        textAlign: TextAlign.center,
+      ),
+    ]);
   }
 
   static String _appHint(String ext) {
     final e = ext.toLowerCase();
-    if (['jpg','jpeg','png','gif','webp','bmp','heic','tiff'].contains(e)) {
-      return 'Gallery / Photos app';
-    }
-    if (['mp4','mkv','avi','mov','wmv','flv','webm','m4v','3gp'].contains(e)) {
-      return 'Video Player';
-    }
-    if (['mp3','wav','aac','flac','ogg','m4a','wma','opus'].contains(e)) {
-      return 'Music Player';
-    }
-    if (['pdf','doc','docx','xls','xlsx','ppt','pptx'].contains(e)) {
-      return 'Document Viewer';
-    }
-    return 'compatible app';
+    if (['jpg','jpeg','png','gif','webp','bmp','heic'].contains(e)) return 'Gallery';
+    if (['mp4','mkv','avi','mov','wmv','flv','webm'].contains(e))   return 'Video Player';
+    if (['mp3','wav','aac','flac','ogg','m4a','opus'].contains(e))  return 'Music Player';
+    if (['pdf','doc','docx','xls','xlsx','ppt','pptx'].contains(e)) return 'Document Viewer';
+    return 'default app';
   }
 }
 
-// ── Offline toggle card ───────────────────────────────────────────────────────
-
-class _OfflineToggleCard extends ConsumerWidget {
-  final CloudFile file;
-  final FileOfflineState state;
-  const _OfflineToggleCard({required this.file, required this.state});
-
+class _ErrorBanner extends StatelessWidget {
+  final String message;
+  const _ErrorBanner(this.message);
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final isCached  = state.status == OfflineStatus.cached;
-    final isCaching = state.status == OfflineStatus.caching;
-    final isFailed  = state.status == OfflineStatus.failed;
-
-    final Color cardColor;
-    final Color borderColor;
-    final IconData statusIcon;
-    final String statusLabel;
-    final String statusSub;
-
-    if (isCached) {
-      cardColor   = AppTheme.success.withValues(alpha: 0.08);
-      borderColor = AppTheme.success.withValues(alpha: 0.3);
-      statusIcon  = Icons.check_circle_rounded;
-      statusLabel = 'Available Offline';
-      statusSub   = 'Stored in app cache · opens instantly without network';
-    } else if (isCaching) {
-      cardColor   = AppTheme.primary.withValues(alpha: 0.08);
-      borderColor = AppTheme.primary.withValues(alpha: 0.3);
-      statusIcon  = Icons.downloading_rounded;
-      statusLabel = 'Caching… ${(state.progress * 100).toInt()}%';
-      statusSub   = 'Downloading to app cache · Tap toggle to cancel';
-    } else if (isFailed) {
-      cardColor   = AppTheme.error.withValues(alpha: 0.08);
-      borderColor = AppTheme.error.withValues(alpha: 0.3);
-      statusIcon  = Icons.error_outline_rounded;
-      statusLabel = 'Cache failed';
-      statusSub   = state.error ?? 'Tap toggle to retry';
-    } else {
-      cardColor   = AppTheme.card;
-      borderColor = AppTheme.cardBorder;
-      statusIcon  = Icons.cloud_rounded;
-      statusLabel = 'Cloud only';
-      statusSub   = 'Enable to open instantly offline (uses app cache)';
-    }
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: cardColor,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: borderColor),
-      ),
-      child: Column(children: [
-        Row(children: [
-          Container(
-            width: 40, height: 40,
-            decoration: BoxDecoration(
-              color: isCached
-                  ? AppTheme.success.withValues(alpha: 0.15)
-                  : AppTheme.primary.withValues(alpha: 0.1),
-              shape: BoxShape.circle,
-            ),
-            child: Icon(statusIcon,
-                color: isCached
-                    ? AppTheme.success
-                    : isFailed ? AppTheme.error : AppTheme.primary,
-                size: 22),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(statusLabel, style: AppTheme.titleMedium),
-                const SizedBox(height: 2),
-                Text(statusSub,
-                    style: const TextStyle(
-                        color: AppTheme.textSecondary, fontSize: 11)),
-              ],
-            ),
-          ),
-          // Toggle
-          GestureDetector(
-            onTap: () => ref.read(offlineCacheProvider.notifier).toggle(file),
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 200),
-              width: 52, height: 28,
-              decoration: BoxDecoration(
-                color: isCached
-                    ? AppTheme.success
-                    : isCaching ? AppTheme.primary : AppTheme.surfaceVariant,
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(
-                    color: isCached ? AppTheme.success : AppTheme.cardBorder),
-              ),
-              child: Stack(children: [
-                AnimatedPositioned(
-                  duration: const Duration(milliseconds: 200),
-                  left: isCached || isCaching ? 26 : 2,
-                  top: 2,
-                  child: Container(
-                    width: 24, height: 24,
-                    decoration: const BoxDecoration(
-                        color: Colors.white, shape: BoxShape.circle),
-                    child: isCaching
-                        ? const Padding(
-                            padding: EdgeInsets.all(4),
-                            child: CircularProgressIndicator(
-                                strokeWidth: 2, color: AppTheme.primary))
-                        : null,
-                  ),
-                ),
-              ]),
-            ),
-          ),
-        ]),
-
-        if (isCaching) ...[
-          const SizedBox(height: 12),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(4),
-            child: LinearProgressIndicator(
-              value: state.progress,
-              backgroundColor: AppTheme.surfaceVariant,
-              valueColor: const AlwaysStoppedAnimation(AppTheme.primary),
-              minHeight: 4,
-            ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            '${FileUtils.formatFileSize((file.sizeBytes * state.progress).toInt())} '
-            '/ ${FileUtils.formatFileSize(file.sizeBytes)}',
-            style: const TextStyle(color: AppTheme.textSecondary, fontSize: 11),
-          ),
-        ],
-      ]),
-    );
-  }
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+    decoration: BoxDecoration(
+      color: AppTheme.error.withValues(alpha: 0.08),
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: AppTheme.error.withValues(alpha: 0.3)),
+    ),
+    child: Row(children: [
+      const Icon(Icons.warning_amber_rounded, color: AppTheme.error, size: 16),
+      const SizedBox(width: 8),
+      Expanded(child: Text(message,
+          style: const TextStyle(color: AppTheme.error, fontSize: 12))),
+    ]),
+  );
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 class _MetaRow extends StatelessWidget {
-  final String label;
-  final String value;
+  final String label, value;
   const _MetaRow({required this.label, required this.value});
-
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      decoration: BoxDecoration(
-        color: AppTheme.card,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: AppTheme.cardBorder),
-      ),
-      child: Row(children: [
-        Text(label,
-            style: AppTheme.bodyMedium.copyWith(color: AppTheme.textSecondary)),
-        const Spacer(),
-        Flexible(child: Text(value, style: AppTheme.bodyMedium,
-            overflow: TextOverflow.ellipsis)),
-      ]),
-    );
-  }
+  Widget build(BuildContext context) => Container(
+    margin: const EdgeInsets.only(bottom: 8),
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+    decoration: BoxDecoration(
+      color: AppTheme.card,
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: AppTheme.cardBorder),
+    ),
+    child: Row(children: [
+      Text(label, style: AppTheme.bodyMedium.copyWith(color: AppTheme.textSecondary)),
+      const Spacer(),
+      Flexible(child: Text(value, style: AppTheme.bodyMedium,
+          overflow: TextOverflow.ellipsis)),
+    ]),
+  );
 }
 
-class _ActionChip extends StatelessWidget {
+class _Chip extends StatelessWidget {
   final IconData icon;
   final String label;
   final Color color;
   final VoidCallback onTap;
-  const _ActionChip(
-      {required this.icon, required this.label,
-       required this.color, required this.onTap});
-
+  const _Chip({required this.icon, required this.label,
+      required this.color, required this.onTap});
   @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Container(
-          width: 52, height: 52,
-          decoration: BoxDecoration(
-            color: color.withValues(alpha: 0.12),
-            shape: BoxShape.circle,
-            border: Border.all(color: color.withValues(alpha: 0.25)),
-          ),
-          child: Icon(icon, color: color, size: 24),
+  Widget build(BuildContext context) => GestureDetector(
+    onTap: onTap,
+    child: Column(mainAxisSize: MainAxisSize.min, children: [
+      Container(
+        width: 52, height: 52,
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.12),
+          shape: BoxShape.circle,
+          border: Border.all(color: color.withValues(alpha: 0.25)),
         ),
-        const SizedBox(height: 6),
-        Text(label,
-            style: TextStyle(
-                color: color, fontSize: 11, fontWeight: FontWeight.w600)),
-      ]),
-    );
-  }
+        child: Icon(icon, color: color, size: 24),
+      ),
+      const SizedBox(height: 6),
+      Text(label, style: TextStyle(
+          color: color, fontSize: 11, fontWeight: FontWeight.w600)),
+    ]),
+  );
 }
