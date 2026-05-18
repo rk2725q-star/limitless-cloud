@@ -49,7 +49,6 @@ class OfflineCacheNotifier extends StateNotifier<Map<String, FileOfflineState>> 
           localPath: event.status == OfflineStatus.cached
               ? existing.localPath
               : null,
-          error: event.error,
         ),
       };
     });
