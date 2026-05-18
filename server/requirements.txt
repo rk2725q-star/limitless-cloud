@@ -1,6 +1,8 @@
+# Limitless Cloud – server dependencies (memory-optimised)
+# cryptg removed: it is an optional Telethon speed-up but uses ~30 MB extra RAM
+# uvicorn[standard] → uvicorn + h11 only (no uvloop/httptools extra RAM)
 fastapi==0.115.0
-uvicorn[standard]==0.32.0
+uvicorn==0.32.0
 telethon==1.36.0
 python-multipart==0.0.12
-cryptg==0.4.0
 aiofiles==24.1.0

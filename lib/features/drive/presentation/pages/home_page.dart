@@ -9,6 +9,7 @@ import '../providers/drive_provider.dart';
 import '../widgets/file_grid_item.dart';
 import '../widgets/file_list_item.dart';
 import '../widgets/folder_item.dart';
+import './download_manager_page.dart';
 
 class HomePage extends ConsumerStatefulWidget {
   const HomePage({super.key});
@@ -25,6 +26,7 @@ class _HomePageState extends ConsumerState<HomePage> {
       const _DriveTab(),
       const _StarredTab(),
       const _RecentTab(),
+      const _DownloadsTab(),
     ];
 
     return Scaffold(
@@ -55,10 +57,12 @@ class _HomePageState extends ConsumerState<HomePage> {
         onTap: (i) => setState(() => _navIndex = i),
         backgroundColor: Colors.transparent,
         elevation: 0,
+        type: BottomNavigationBarType.fixed,
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.cloud_rounded), label: 'My Drive'),
           BottomNavigationBarItem(icon: Icon(Icons.star_rounded), label: 'Starred'),
           BottomNavigationBarItem(icon: Icon(Icons.access_time_rounded), label: 'Recent'),
+          BottomNavigationBarItem(icon: Icon(Icons.download_for_offline_rounded), label: 'Downloads'),
         ],
       ),
     );
@@ -123,11 +127,39 @@ class _HomePageState extends ConsumerState<HomePage> {
 
 // ── Drive Tab ─────────────────────────────────────────────────────────────────
 
-class _DriveTab extends ConsumerWidget {
+class _DriveTab extends ConsumerStatefulWidget {
   const _DriveTab();
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_DriveTab> createState() => _DriveTabState();
+}
+
+class _DriveTabState extends ConsumerState<_DriveTab> {
+  int _syncedFiles = 0;
+  int _syncedFolders = 0;
+  bool _syncDone = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _sync();
+  }
+
+  Future<void> _sync() async {
+    final result = await ref.read(driveProvider.notifier).syncFromTelegram();
+    if (mounted && (result.files > 0 || result.folders > 0)) {
+      setState(() {
+        _syncedFiles = result.files;
+        _syncedFolders = result.folders;
+        _syncDone = true;
+      });
+      await Future.delayed(const Duration(seconds: 4));
+      if (mounted) setState(() => _syncDone = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final drive = ref.watch(driveProvider);
     final foldersAsync = ref.watch(foldersProvider(null));
     final filesAsync = ref.watch(filesProvider((
@@ -137,7 +169,9 @@ class _DriveTab extends ConsumerWidget {
     )));
     final stats = ref.watch(userStatsProvider);
 
-    return CustomScrollView(
+    return Stack(
+      children: [
+        CustomScrollView(
       slivers: [
         // ── App Bar ────────────────────────────────────────────────────────
         SliverAppBar(
@@ -225,6 +259,31 @@ class _DriveTab extends ConsumerWidget {
         ),
 
         const SliverPadding(padding: EdgeInsets.only(bottom: 100)),
+      ],
+    ),
+        // ── Sync banner ────────────────────────────────────────────────────
+        if (_syncDone)
+          Positioned(
+            top: 80, left: 16, right: 16,
+            child: Material(
+              elevation: 4,
+              borderRadius: BorderRadius.circular(12),
+              color: AppTheme.secondary,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                child: Row(children: [
+                  const Icon(Icons.sync_rounded, color: Colors.white, size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Synced: $_syncedFolders folder(s) · $_syncedFiles file(s)',
+                      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ]),
+              ),
+            ),
+          ),
       ],
     );
   }
@@ -392,6 +451,17 @@ class _RecentTab extends ConsumerWidget {
     );
   }
 }
+
+// ── Downloads Tab ─────────────────────────────────────────────────────────────
+
+class _DownloadsTab extends StatelessWidget {
+  const _DownloadsTab();
+  @override
+  Widget build(BuildContext context) {
+    return const DownloadManagerPage();
+  }
+}
+
 
 // ── Helper Widgets ────────────────────────────────────────────────────────────
 

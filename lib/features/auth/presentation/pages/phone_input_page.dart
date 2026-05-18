@@ -28,7 +28,12 @@ class _PhoneInputPageState extends ConsumerState<PhoneInputPage> {
   }
 
   Future<void> _loadServerUrl() async {
-    final url = await TelegramAuthService.loadServerUrl();
+    var url = await TelegramAuthService.loadServerUrl();
+    // First launch: auto-set Railway production URL as default
+    if (url.isEmpty) {
+      url = 'https://limitless-cloud-production.up.railway.app';
+      await TelegramAuthService.saveServerUrl(url);
+    }
     if (mounted) setState(() => _serverUrl = url);
   }
 

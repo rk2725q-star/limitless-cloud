@@ -19,43 +19,57 @@ class _DB {
     final dbPath = p.join(await getDatabasesPath(), 'limitless_cloud.db');
     return openDatabase(
       dbPath,
-      version: 1,
+      version: 2,  // bumped to add metaMessageId column
       onCreate: (db, version) async {
-        await db.execute('''
-          CREATE TABLE folders (
-            id           TEXT PRIMARY KEY,
-            userId       TEXT NOT NULL,
-            name         TEXT NOT NULL,
-            parentId     TEXT,
-            path         TEXT NOT NULL,
-            color        TEXT DEFAULT "#4F8CFF",
-            itemCount    INTEGER DEFAULT 0,
-            isTrashed    INTEGER DEFAULT 0,
-            createdAt    TEXT NOT NULL,
-            updatedAt    TEXT NOT NULL
-          )
-        ''');
-        await db.execute('''
-          CREATE TABLE files (
-            id                 TEXT PRIMARY KEY,
-            userId             TEXT NOT NULL,
-            name               TEXT NOT NULL,
-            folderId           TEXT,
-            folderPath         TEXT DEFAULT "/",
-            telegramMessageId  INTEGER NOT NULL,
-            telegramFileId     TEXT NOT NULL,
-            mimeType           TEXT,
-            sizeBytes          INTEGER DEFAULT 0,
-            extension          TEXT DEFAULT "",
-            thumbnailPath      TEXT,
-            isStarred          INTEGER DEFAULT 0,
-            isTrashed          INTEGER DEFAULT 0,
-            uploadedAt         TEXT NOT NULL,
-            updatedAt          TEXT NOT NULL
-          )
-        ''');
+        await _createTables(db);
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          // Add metaMessageId column for existing installs
+          try {
+            await db.execute(
+                'ALTER TABLE folders ADD COLUMN metaMessageId INTEGER DEFAULT 0');
+          } catch (_) {}
+        }
       },
     );
+  }
+
+  static Future<void> _createTables(Database db) async {
+    await db.execute('''
+      CREATE TABLE folders (
+        id             TEXT PRIMARY KEY,
+        userId         TEXT NOT NULL,
+        name           TEXT NOT NULL,
+        parentId       TEXT,
+        path           TEXT NOT NULL,
+        color          TEXT DEFAULT "#4F8CFF",
+        itemCount      INTEGER DEFAULT 0,
+        isTrashed      INTEGER DEFAULT 0,
+        metaMessageId  INTEGER DEFAULT 0,
+        createdAt      TEXT NOT NULL,
+        updatedAt      TEXT NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE files (
+        id                 TEXT PRIMARY KEY,
+        userId             TEXT NOT NULL,
+        name               TEXT NOT NULL,
+        folderId           TEXT,
+        folderPath         TEXT DEFAULT "/",
+        telegramMessageId  INTEGER NOT NULL,
+        telegramFileId     TEXT NOT NULL,
+        mimeType           TEXT,
+        sizeBytes          INTEGER DEFAULT 0,
+        extension          TEXT DEFAULT "",
+        thumbnailPath      TEXT,
+        isStarred          INTEGER DEFAULT 0,
+        isTrashed          INTEGER DEFAULT 0,
+        uploadedAt         TEXT NOT NULL,
+        updatedAt          TEXT NOT NULL
+      )
+    ''');
   }
 }
 
@@ -74,6 +88,7 @@ CloudFolder _folderFromMap(Map<String, dynamic> m) => CloudFolder(
       path: m['path'] as String,
       color: m['color'] as String? ?? '#4F8CFF',
       itemCount: m['itemCount'] as int? ?? 0,
+      metaMessageId: m['metaMessageId'] as int? ?? 0,
       createdAt: DateTime.parse(m['createdAt'] as String),
       updatedAt: DateTime.parse(m['updatedAt'] as String),
     );
@@ -106,6 +121,7 @@ class LocalMetadataService {
     String? parentFolderId,
     String parentPath = '/',
     String color = '#4F8CFF',
+    int metaMessageId = 0,
   }) async {
     final db = await _DB.instance;
     final now = DateTime.now().toIso8601String();
@@ -121,6 +137,7 @@ class LocalMetadataService {
       'color': color,
       'itemCount': 0,
       'isTrashed': 0,
+      'metaMessageId': metaMessageId,
       'createdAt': now,
       'updatedAt': now,
     });
@@ -138,8 +155,83 @@ class LocalMetadataService {
       parentFolderId: parentFolderId,
       path: path,
       color: color,
+      metaMessageId: metaMessageId,
       createdAt: DateTime.now(),
       updatedAt: DateTime.now(),
+    );
+  }
+
+  /// Upsert a folder (used during sync — insert or update if already exists)
+  Future<CloudFolder> upsertFolder({
+    required String userId,
+    required String id,
+    required String name,
+    String? parentFolderId,
+    String parentPath = '/',
+    String color = '#4F8CFF',
+    int metaMessageId = 0,
+  }) async {
+    final db = await _DB.instance;
+    final now = DateTime.now().toIso8601String();
+    final path = parentPath == '/' ? '/$name' : '$parentPath/$name';
+
+    // Check if already exists
+    final existing = await db.query('folders',
+        where: 'id = ? AND userId = ?', whereArgs: [id, userId]);
+    if (existing.isEmpty) {
+      await db.insert('folders', {
+        'id': id,
+        'userId': userId,
+        'name': name,
+        'parentId': parentFolderId,
+        'path': path,
+        'color': color,
+        'itemCount': 0,
+        'isTrashed': 0,
+        'metaMessageId': metaMessageId,
+        'createdAt': now,
+        'updatedAt': now,
+      });
+    } else {
+      await db.update(
+        'folders',
+        {
+          'name': name,
+          'parentId': parentFolderId,
+          'path': path,
+          'color': color,
+          'metaMessageId': metaMessageId,
+          'updatedAt': now,
+        },
+        where: 'id = ? AND userId = ?',
+        whereArgs: [id, userId],
+      );
+    }
+
+    return CloudFolder(
+      id: id,
+      name: name,
+      parentFolderId: parentFolderId,
+      path: path,
+      color: color,
+      metaMessageId: metaMessageId,
+      createdAt: DateTime.now(),
+      updatedAt: DateTime.now(),
+    );
+  }
+
+  /// Update the metaMessageId after Telegram text message was sent.
+  Future<void> updateFolderMetaMessageId({
+    required String userId,
+    required String folderId,
+    required int metaMessageId,
+  }) async {
+    final db = await _DB.instance;
+    await db.update(
+      'folders',
+      {'metaMessageId': metaMessageId, 'updatedAt': DateTime.now().toIso8601String()},
+      where: 'id = ? AND userId = ?',
+      whereArgs: [folderId, userId],
     );
   }
 
@@ -147,7 +239,8 @@ class LocalMetadataService {
     required String userId,
     String? parentFolderId,
   }) async* {
-    // SQLite is not real-time; we poll and re-emit via StreamController
+    // SQLite is not real-time; we emit once then close stream.
+    // DriveNotifier.invalidate() triggers a new subscription.
     final controller = StreamController<List<CloudFolder>>();
     Future<void> emit() async {
       final db = await _DB.instance;
@@ -197,6 +290,17 @@ class LocalMetadataService {
       where: 'id = ? AND userId = ?',
       whereArgs: [folderId, userId],
     );
+  }
+
+  Future<CloudFolder?> getFolderById({
+    required String userId,
+    required String folderId,
+  }) async {
+    final db = await _DB.instance;
+    final rows = await db.query('folders',
+        where: 'id = ? AND userId = ?', whereArgs: [folderId, userId]);
+    if (rows.isEmpty) return null;
+    return _folderFromMap(rows.first);
   }
 
   Future<void> deleteFolder({required String userId, required String folderId}) async {
@@ -365,7 +469,8 @@ class LocalMetadataService {
     required CloudFile sourceFile,
     required String? destinationFolderId,
     required String destinationFolderPath,
-  }) => saveFileMetadata(
+  }) =>
+      saveFileMetadata(
         userId: userId,
         name: 'Copy of ${sourceFile.name}',
         folderId: destinationFolderId,
@@ -446,6 +551,30 @@ class LocalMetadataService {
       orderBy: 'name ASC',
     );
     return rows.map(_fileFromMap).toList();
+  }
+
+  /// Returns all Telegram message IDs already stored locally for a user.
+  Future<Set<int>> getExistingMessageIds(String userId) async {
+    final db = await _DB.instance;
+    final rows = await db.query(
+      'files',
+      columns: ['telegramMessageId'],
+      where: 'userId = ?',
+      whereArgs: [userId],
+    );
+    return rows.map((r) => r['telegramMessageId'] as int).toSet();
+  }
+
+  /// Returns all existing folder IDs for a user.
+  Future<Set<String>> getExistingFolderIds(String userId) async {
+    final db = await _DB.instance;
+    final rows = await db.query(
+      'folders',
+      columns: ['id'],
+      where: 'userId = ?',
+      whereArgs: [userId],
+    );
+    return rows.map((r) => r['id'] as String).toSet();
   }
 
   Future<Map<String, dynamic>> getUserStats(String userId) async {

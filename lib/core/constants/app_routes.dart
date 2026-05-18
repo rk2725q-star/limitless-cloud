@@ -7,18 +7,28 @@ import '../../features/drive/presentation/pages/home_page.dart';
 import '../../features/drive/presentation/pages/folder_page.dart';
 import '../../features/drive/presentation/pages/search_page.dart';
 import '../../features/drive/presentation/pages/file_detail_page.dart';
+import '../../features/drive/presentation/pages/music_player_page.dart';
+import '../../features/drive/presentation/pages/image_viewer_page.dart';
+import '../../features/drive/presentation/pages/video_player_page.dart';
+import '../../features/drive/presentation/pages/document_viewer_page.dart';
+import '../../features/drive/presentation/pages/download_manager_page.dart';
 import '../../features/settings/presentation/pages/settings_page.dart';
 
 class AppRoutes {
-  static const String splash = '/';
-  static const String phoneInput = '/phone-input';
-  static const String otp = '/otp';
-  static const String twoFactor = '/two-factor';
-  static const String home = '/home';
-  static const String folder = '/folder';
-  static const String search = '/search';
-  static const String fileDetail = '/file-detail';
-  static const String settings = '/settings';
+  static const String splash          = '/';
+  static const String phoneInput      = '/phone-input';
+  static const String otp             = '/otp';
+  static const String twoFactor       = '/two-factor';
+  static const String home            = '/home';
+  static const String folder          = '/folder';
+  static const String search          = '/search';
+  static const String fileDetail      = '/file-detail';
+  static const String musicPlayer     = '/music-player';
+  static const String imageViewer     = '/image-viewer';
+  static const String videoPlayer     = '/video-player';
+  static const String documentViewer  = '/document-viewer';
+  static const String downloadManager = '/download-manager';
+  static const String settings        = '/settings';
 
   static Route<dynamic> generateRoute(RouteSettings settings_) {
     switch (settings_.name) {
@@ -41,6 +51,21 @@ class AppRoutes {
       case fileDetail:
         final args = settings_.arguments as Map<String, dynamic>?;
         return _slideRoute(FileDetailPage(args: args ?? {}), settings_);
+      case musicPlayer:
+        final args = settings_.arguments as Map<String, dynamic>?;
+        return _slideRoute(MusicPlayerPage(args: args ?? {}), settings_);
+      case imageViewer:
+        final args = settings_.arguments as Map<String, dynamic>?;
+        return _fadeRoute(ImageViewerPage(args: args ?? {}), settings_);
+      case videoPlayer:
+        final args = settings_.arguments as Map<String, dynamic>?;
+        return _fadeRoute(VideoPlayerPage(args: args ?? {}), settings_);
+      case documentViewer:
+        final args = settings_.arguments as Map<String, dynamic>?;
+        return _slideRoute(DocumentViewerPage(args: args ?? {}), settings_);
+      case downloadManager:
+        final args = settings_.arguments as Map<String, dynamic>?;
+        return _slideRoute(DownloadManagerPage(args: args), settings_);
       case AppRoutes.settings:
         return _slideRoute(const SettingsPage(), settings_);
       default:

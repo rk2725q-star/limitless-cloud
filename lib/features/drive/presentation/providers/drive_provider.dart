@@ -54,6 +54,7 @@ class DriveState {
   final List<UploadTask> uploadTasks;
   final List<String> selectedFileIds;
   final bool isSelectionMode;
+  final bool isSyncing;
 
   DriveState({
     this.isGridView = true,
@@ -62,6 +63,7 @@ class DriveState {
     this.uploadTasks = const [],
     this.selectedFileIds = const [],
     this.isSelectionMode = false,
+    this.isSyncing = false,
   });
 
   DriveState copyWith({
@@ -71,6 +73,7 @@ class DriveState {
     List<UploadTask>? uploadTasks,
     List<String>? selectedFileIds,
     bool? isSelectionMode,
+    bool? isSyncing,
   }) {
     return DriveState(
       isGridView: isGridView ?? this.isGridView,
@@ -79,6 +82,7 @@ class DriveState {
       uploadTasks: uploadTasks ?? this.uploadTasks,
       selectedFileIds: selectedFileIds ?? this.selectedFileIds,
       isSelectionMode: isSelectionMode ?? this.isSelectionMode,
+      isSyncing: isSyncing ?? this.isSyncing,
     );
   }
 }
@@ -158,7 +162,8 @@ class DriveNotifier extends StateNotifier<DriveState> {
 
   // ── Upload ────────────────────────────────────────────────────────────────
 
-  /// Picks files and uploads them to Telegram Saved Messages
+  /// Picks files and uploads them to Telegram Saved Messages.
+  /// Encodes folder info in the caption so it can be restored after reinstall.
   Future<void> uploadFiles({
     String? folderId,
     String folderPath = '/',
@@ -176,25 +181,25 @@ class DriveNotifier extends StateNotifier<DriveState> {
       final extension = FileUtils.getExtension(fileName);
       final mimeType = lookupMimeType(pickedFile.path!) ?? 'application/octet-stream';
 
-      // Add upload task to state
       final task = UploadTask(fileName: fileName, progress: 0.0);
       state = state.copyWith(uploadTasks: [...state.uploadTasks, task]);
 
       try {
-        // Upload via Telegram backend — real HTTP multipart upload
+        // Upload to Telegram — folder info encoded in caption for sync restore
         final messageId = await _telegramService.uploadFile(
           file,
+          folderId: folderId,
+          folderPath: folderPath,
           onProgress: (progress) {
             final tasks = state.uploadTasks.toList();
-            final taskIndex = tasks.indexWhere((t) => t.fileName == fileName);
-            if (taskIndex >= 0) {
-              tasks[taskIndex] = tasks[taskIndex].copyWith(progress: progress);
+            final idx = tasks.indexWhere((t) => t.fileName == fileName);
+            if (idx >= 0) {
+              tasks[idx] = tasks[idx].copyWith(progress: progress);
               state = state.copyWith(uploadTasks: tasks);
             }
           },
         );
 
-        // On success: save metadata to Firestore
         await _firestoreService.saveFileMetadata(
           userId: userId,
           name: fileName,
@@ -207,23 +212,26 @@ class DriveNotifier extends StateNotifier<DriveState> {
           extension: extension,
         );
 
-        // Mark complete
         final tasks = state.uploadTasks.toList();
-        final taskIndex = tasks.indexWhere((t) => t.fileName == fileName);
-        if (taskIndex >= 0) {
-          tasks[taskIndex] = tasks[taskIndex].copyWith(isComplete: true, progress: 1.0);
+        final idx = tasks.indexWhere((t) => t.fileName == fileName);
+        if (idx >= 0) {
+          tasks[idx] = tasks[idx].copyWith(isComplete: true, progress: 1.0);
           state = state.copyWith(uploadTasks: tasks);
         }
+
+        _ref.invalidate(filesProvider((folderId: folderId, sortBy: state.sortBy, descending: state.sortDescending)));
+        _ref.invalidate(filesProvider((folderId: null, sortBy: state.sortBy, descending: state.sortDescending)));
+        _ref.invalidate(allFilesProvider((starredOnly: false, trashedOnly: false)));
+        _ref.invalidate(userStatsProvider);
       } catch (e) {
         final tasks = state.uploadTasks.toList();
-        final taskIndex = tasks.indexWhere((t) => t.fileName == fileName);
-        if (taskIndex >= 0) {
-          tasks[taskIndex] = tasks[taskIndex].copyWith(hasError: true, error: e.toString());
+        final idx = tasks.indexWhere((t) => t.fileName == fileName);
+        if (idx >= 0) {
+          tasks[idx] = tasks[idx].copyWith(hasError: true, error: e.toString());
           state = state.copyWith(uploadTasks: tasks);
         }
       }
 
-      // Remove completed/failed task after a short delay
       await Future.delayed(const Duration(seconds: 2));
       final tasks = state.uploadTasks.toList();
       tasks.removeWhere((t) => t.fileName == fileName && (t.isComplete || t.hasError));
@@ -231,8 +239,159 @@ class DriveNotifier extends StateNotifier<DriveState> {
     }
   }
 
+  // ── Sync from Telegram ────────────────────────────────────────────────────
+
+  /// Full sync: restores both folder structure AND files from Telegram.
+  ///
+  /// Step 1: Restore folders from LIMITLESS_FOLDER: metadata messages.
+  ///         These are sorted topologically (parents before children) so nested
+  ///         folders are created in the right order.
+  ///
+  /// Step 2: Restore files from LIMITLESS_FILE: captions on document messages.
+  ///         File captions encode the folderId + folderPath → correct placement.
+  ///         Files without LIMITLESS_FILE: caption go to root (legacy support).
+  ///
+  /// Returns: (foldersImported, filesImported)
+  Future<({int folders, int files})> syncFromTelegram() async {
+    final userId = await _userId;
+    if (userId == null) return (folders: 0, files: 0);
+
+    state = state.copyWith(isSyncing: true);
+
+    try {
+      int foldersImported = 0;
+      int filesImported = 0;
+
+      // ── STEP 1: Restore folder structure ─────────────────────────────────
+      final folderMetas = await _telegramService.listFolderMeta();
+      if (folderMetas.isNotEmpty) {
+        final existingFolderIds = await _firestoreService.getExistingFolderIds(userId);
+
+        // Sort topologically: folders with no parentId first, then children
+        final sorted = _sortFoldersByDepth(folderMetas);
+
+        for (final meta in sorted) {
+          if (existingFolderIds.contains(meta.id)) continue;
+
+          // Determine parentPath from parent folder's path
+          String parentPath = '/';
+          if (meta.parentId != null && meta.parentId!.isNotEmpty) {
+            // Try to find parent's path from already-upserted folders
+            final parentFolder = await _firestoreService.getFolderById(
+              userId: userId,
+              folderId: meta.parentId!,
+            );
+            if (parentFolder != null) {
+              parentPath = parentFolder.path;
+            }
+          }
+
+          await _firestoreService.upsertFolder(
+            userId: userId,
+            id: meta.id,
+            name: meta.name,
+            parentFolderId: meta.parentId,
+            parentPath: parentPath,
+            color: meta.color,
+            metaMessageId: meta.metaMessageId,
+          );
+          foldersImported++;
+        }
+      }
+
+      // ── STEP 2: Restore files ─────────────────────────────────────────────
+      final telegramFiles = await _telegramService.listFiles();
+      if (telegramFiles.isNotEmpty) {
+        final existingMsgIds = await _firestoreService.getExistingMessageIds(userId);
+
+        for (final tf in telegramFiles) {
+          if (existingMsgIds.contains(tf.messageId)) continue;
+
+          // Parse folder placement from caption
+          String? folderId;
+          String folderPath = '/';
+
+          final meta = TelegramStorageService.parseFileCaption(tf.caption);
+          if (meta != null) {
+            folderId = meta['fi'] as String?;
+            folderPath = meta['fp'] as String? ?? '/';
+          }
+
+          // If file belongs to a folder that wasn't synced, fall back to root
+          if (folderId != null) {
+            final folder = await _firestoreService.getFolderById(
+              userId: userId,
+              folderId: folderId,
+            );
+            if (folder == null) {
+              folderId = null;
+              folderPath = '/';
+            }
+          }
+
+          final ext = tf.fileName.contains('.')
+              ? tf.fileName.split('.').last.toLowerCase()
+              : '';
+
+          await _firestoreService.saveFileMetadata(
+            userId: userId,
+            name: tf.fileName,
+            folderId: folderId,
+            folderPath: folderPath,
+            telegramMessageId: tf.messageId,
+            telegramFileId: tf.messageId.toString(),
+            mimeType: tf.mimeType,
+            sizeBytes: tf.fileSize,
+            extension: ext,
+          );
+          filesImported++;
+        }
+      }
+
+      // Refresh UI
+      if (foldersImported > 0 || filesImported > 0) {
+        _ref.invalidate(foldersProvider(null));
+        _ref.invalidate(filesProvider((folderId: null, sortBy: state.sortBy, descending: state.sortDescending)));
+        _ref.invalidate(allFilesProvider((starredOnly: false, trashedOnly: false)));
+        _ref.invalidate(userStatsProvider);
+      }
+
+      return (folders: foldersImported, files: filesImported);
+    } catch (_) {
+      return (folders: 0, files: 0);
+    } finally {
+      if (mounted) state = state.copyWith(isSyncing: false);
+    }
+  }
+
+  /// Sort folders so parents come before children (topological sort by depth).
+  List<TelegramFolderMeta> _sortFoldersByDepth(List<TelegramFolderMeta> folders) {
+    final result = <TelegramFolderMeta>[];
+    final remaining = List<TelegramFolderMeta>.from(folders);
+    final addedIds = <String>{};
+
+    int maxIterations = folders.length * 2;
+    while (remaining.isNotEmpty && maxIterations > 0) {
+      maxIterations--;
+      final toAdd = remaining.where((f) =>
+          f.parentId == null || addedIds.contains(f.parentId)).toList();
+      if (toAdd.isEmpty) {
+        // Circular reference or orphans — add remaining as-is
+        result.addAll(remaining);
+        break;
+      }
+      for (final f in toAdd) {
+        result.add(f);
+        addedIds.add(f.id);
+        remaining.remove(f);
+      }
+    }
+    return result;
+  }
+
   // ── Folder Operations ─────────────────────────────────────────────────────
 
+  /// Creates a folder locally AND persists it to Telegram as a metadata message.
   Future<CloudFolder?> createFolder({
     required String name,
     String? parentFolderId,
@@ -241,24 +400,59 @@ class DriveNotifier extends StateNotifier<DriveState> {
     final userId = await _userId;
     if (userId == null) return null;
 
-    return _firestoreService.createFolder(
+    // 1. Insert locally first (instant UI update)
+    final folder = await _firestoreService.createFolder(
       userId: userId,
       name: name,
       parentFolderId: parentFolderId,
       parentPath: parentPath,
     );
+
+    // 2. Persist to Telegram (async — non-blocking for UI)
+    _persistFolderToTelegram(userId, folder);
+
+    _ref.invalidate(foldersProvider(parentFolderId));
+    _ref.invalidate(foldersProvider(null));
+    _ref.invalidate(userStatsProvider);
+
+    return folder;
+  }
+
+  /// Fire-and-forget: saves LIMITLESS_FOLDER: message to Telegram Saved Messages
+  /// and updates the local DB with the resulting Telegram message ID.
+  Future<void> _persistFolderToTelegram(String userId, CloudFolder folder) async {
+    try {
+      final meta = TelegramFolderMeta(
+        metaMessageId: 0, // not yet known
+        id: folder.id,
+        name: folder.name,
+        parentId: folder.parentFolderId,
+        path: folder.path,
+        color: folder.color,
+      );
+      final msgId = await _telegramService.saveFolderMeta(meta);
+      await _firestoreService.updateFolderMetaMessageId(
+        userId: userId,
+        folderId: folder.id,
+        metaMessageId: msgId,
+      );
+    } catch (_) {
+      // Non-fatal — folder still exists locally. Will be synced next time.
+    }
   }
 
   Future<void> renameFolder(String folderId, String newName) async {
     final userId = await _userId;
     if (userId == null) return;
     await _firestoreService.renameFolder(userId: userId, folderId: folderId, newName: newName);
+    _ref.invalidate(foldersProvider(null));
   }
 
   Future<void> trashFolder(String folderId) async {
     final userId = await _userId;
     if (userId == null) return;
     await _firestoreService.trashFolder(userId: userId, folderId: folderId);
+    _ref.invalidate(foldersProvider(null));
   }
 
   // ── File Operations ────────────────────────────────────────────────────────
@@ -316,11 +510,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
   Future<bool> deleteFile(CloudFile file) async {
     final userId = await _userId;
     if (userId == null) return false;
-
-    // Delete from Telegram
     await _telegramService.deleteFile(file.telegramMessageId);
-
-    // Delete from Firestore
     await _firestoreService.deleteFile(
       userId: userId,
       fileId: file.id,
@@ -345,8 +535,6 @@ class DriveNotifier extends StateNotifier<DriveState> {
     }
   }
 
-  /// Get share link for a file (not natively supported in MTProto user API;
-  /// returns a placeholder so existing UI doesn't break)
   Future<String?> getShareLink(CloudFile file) async {
     return 'https://t.me/saved_messages/${file.telegramMessageId}';
   }
@@ -366,8 +554,6 @@ final driveProvider = StateNotifierProvider<DriveNotifier, DriveState>((ref) {
   final telegramService = TelegramStorageService(authService);
   return DriveNotifier(firestoreService, telegramService, ref);
 });
-
-// Stream providers for Firestore real-time updates
 
 final foldersProvider = StreamProvider.family<List<CloudFolder>, String?>((ref, parentFolderId) async* {
   final authService = ref.read(telegramAuthServiceProvider);

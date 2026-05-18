@@ -13,7 +13,7 @@ import '../../auth/data/telegram_auth_service.dart';
 // ── Upload progress callback ──────────────────────────────────────────────────
 typedef ProgressCallback = void Function(double progress);
 
-// ── Remote file descriptor ────────────────────────────────────────────────────
+// ── Telegram Saved Messages file descriptor ───────────────────────────────────
 class TelegramFile {
   final int messageId;
   final String fileName;
@@ -41,6 +41,47 @@ class TelegramFile {
       );
 }
 
+// ── Folder metadata (stored as LIMITLESS_FOLDER:<json> text in Saved Messages) ─
+class TelegramFolderMeta {
+  final int metaMessageId; // Telegram msg ID of THIS metadata text message
+  final String id;         // Our internal folder UUID
+  final String name;
+  final String? parentId;
+  final String path;
+  final String color;
+
+  const TelegramFolderMeta({
+    required this.metaMessageId,
+    required this.id,
+    required this.name,
+    this.parentId,
+    required this.path,
+    this.color = '#4F8CFF',
+  });
+
+  factory TelegramFolderMeta.fromJson(int msgId, Map<String, dynamic> j) =>
+      TelegramFolderMeta(
+        metaMessageId: msgId,
+        id: j['id'] as String,
+        name: j['name'] as String,
+        parentId: j['parentId'] as String?,
+        path: j['path'] as String,
+        color: j['color'] as String? ?? '#4F8CFF',
+      );
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'parentId': parentId,
+        'path': path,
+        'color': color,
+      };
+}
+
+// ── Caption encoding constants ────────────────────────────────────────────────
+const _folderPrefix = 'LIMITLESS_FOLDER:';
+const _fileMetaPrefix = 'LIMITLESS_FILE:';
+
 // ── Service ───────────────────────────────────────────────────────────────────
 
 class TelegramStorageService {
@@ -49,11 +90,12 @@ class TelegramStorageService {
 
   TelegramStorageService(this._auth);
 
-  // ── Helpers ────────────────────────────────────────────────────────────────
+  // ── Private helpers ────────────────────────────────────────────────────────
 
   Future<String> get _session => _auth.getSession();
 
-  Future<Map<String, dynamic>> _get(String path, [Map<String, String>? params]) async {
+  Future<Map<String, dynamic>> _get(
+      String path, [Map<String, String>? params]) async {
     final session = await _session;
     final uri = Uri.parse('$_base$path').replace(queryParameters: {
       'session_string': session,
@@ -67,14 +109,17 @@ class TelegramStorageService {
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
-  Future<Map<String, dynamic>> _delete(String path, Map<String, dynamic> body) async {
+  Future<Map<String, dynamic>> _delete(
+      String path, Map<String, dynamic> body) async {
     final session = await _session;
     final uri = Uri.parse('$_base$path');
-    final resp = await http.delete(
-      uri,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({...body, 'session_string': session}),
-    ).timeout(const Duration(seconds: 30));
+    final resp = await http
+        .delete(
+          uri,
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({...body, 'session_string': session}),
+        )
+        .timeout(const Duration(seconds: 30));
     if (resp.statusCode >= 400) {
       final err = jsonDecode(resp.body)['detail'] ?? 'Error ${resp.statusCode}';
       throw Exception(err);
@@ -82,27 +127,79 @@ class TelegramStorageService {
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
-  // ── Public API ─────────────────────────────────────────────────────────────
+  Future<Map<String, dynamic>> _postMultipart(
+      String path, Map<String, String> fields) async {
+    final session = await _session;
+    final uri = Uri.parse('$_base$path');
+    final request = http.MultipartRequest('POST', uri)
+      ..fields['session_string'] = session
+      ..fields.addAll(fields);
+    final streamed = await request.send().timeout(const Duration(seconds: 30));
+    final resp = await http.Response.fromStream(streamed);
+    if (resp.statusCode >= 400) {
+      final err = jsonDecode(resp.body)['detail'] ?? 'Error ${resp.statusCode}';
+      throw Exception(err);
+    }
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
 
-  /// Upload [file] to the user's Telegram Saved Messages.
-  /// Calls [onProgress] with 0.0–1.0 as upload progresses.
-  /// Returns the Telegram message_id on success.
+  // ── File Caption Encoding ──────────────────────────────────────────────────
+
+  /// Encode folder membership into the file caption so it can be restored
+  /// on sync after reinstall.  Format: LIMITLESS_FILE:{"n":"x","fi":"id","fp":"/path"}
+  static String buildFileCaption({
+    required String fileName,
+    String? folderId,
+    String folderPath = '/',
+  }) {
+    return '$_fileMetaPrefix${jsonEncode({
+      'n': fileName,
+      'fi': folderId,
+      'fp': folderPath,
+    })}';
+  }
+
+  /// Parse encoded folder info from a file's Telegram caption.
+  /// Returns null if caption was not written by Limitless Cloud.
+  static Map<String, dynamic>? parseFileCaption(String caption) {
+    if (!caption.startsWith(_fileMetaPrefix)) return null;
+    try {
+      return jsonDecode(caption.substring(_fileMetaPrefix.length))
+          as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ── File Operations ────────────────────────────────────────────────────────
+
+  /// Upload [file] to Telegram Saved Messages.
+  /// [folderId] / [folderPath] are encoded in the caption for later sync.
+  /// Returns the Telegram message_id.
   Future<int> uploadFile(
     File file, {
     ProgressCallback? onProgress,
-    String caption = '',
+    String? folderId,
+    String folderPath = '/',
   }) async {
     final session = await _session;
     final fileName = p.basename(file.path);
-    final mimeType = lookupMimeType(file.path) ?? 'application/octet-stream';
+    final mimeType =
+        lookupMimeType(file.path) ?? 'application/octet-stream';
     final fileBytes = await file.readAsBytes();
 
     onProgress?.call(0.05);
 
+    final caption = buildFileCaption(
+      fileName: fileName,
+      folderId: folderId,
+      folderPath: folderPath,
+    );
+
     final uri = Uri.parse('$_base/files/upload');
     final request = http.MultipartRequest('POST', uri)
       ..fields['session_string'] = session
-      ..fields['caption'] = caption.isEmpty ? fileName : caption
+      ..fields['caption'] = caption
       ..files.add(http.MultipartFile.fromBytes(
         'file',
         fileBytes,
@@ -112,7 +209,8 @@ class TelegramStorageService {
 
     onProgress?.call(0.2);
 
-    final streamed = await request.send().timeout(const Duration(minutes: 10));
+    final streamed =
+        await request.send().timeout(const Duration(minutes: 10));
 
     onProgress?.call(0.9);
 
@@ -127,18 +225,14 @@ class TelegramStorageService {
     return data['message_id'] as int;
   }
 
-  /// List all files stored in Saved Messages.
+  /// List all document files stored in Saved Messages.
   Future<List<TelegramFile>> listFiles() async {
     final data = await _get('/files/list');
     final raw = data['files'] as List<dynamic>;
-    return raw
-        .cast<Map<String, dynamic>>()
-        .map(TelegramFile.fromJson)
-        .toList();
+    return raw.cast<Map<String, dynamic>>().map(TelegramFile.fromJson).toList();
   }
 
-  /// Download a file by its message_id to the device's downloads/temp folder.
-  /// Returns the local [File] path.
+  /// Download a file by its message_id to app documents directory.
   Future<File> downloadFile(int messageId, String fileName) async {
     final session = await _session;
     final uri = Uri.parse('$_base/files/download/$messageId')
@@ -165,5 +259,41 @@ class TelegramStorageService {
   Future<TelegramFile> getFileInfo(int messageId) async {
     final data = await _get('/files/info/$messageId');
     return TelegramFile.fromJson(data);
+  }
+
+  // ── Folder Metadata (persisted to Telegram as LIMITLESS_FOLDER: text msgs) ─
+
+  /// Persist a folder's metadata to Telegram Saved Messages.
+  /// Returns the Telegram message_id of the metadata text message.
+  Future<int> saveFolderMeta(TelegramFolderMeta meta) async {
+    final payload = '$_folderPrefix${jsonEncode(meta.toJson())}';
+    final data = await _postMultipart('/meta/save', {'data': payload});
+    return data['message_id'] as int;
+  }
+
+  /// Delete a folder's metadata message from Telegram.
+  /// Call this when a folder is permanently deleted.
+  Future<void> deleteFolderMeta(int metaMessageId) async {
+    await _delete('/meta/$metaMessageId', {'message_id': metaMessageId});
+  }
+
+  /// Fetch all LIMITLESS_FOLDER: metadata messages from Saved Messages.
+  Future<List<TelegramFolderMeta>> listFolderMeta() async {
+    final data = await _get('/meta/list', {'prefix': _folderPrefix});
+    final items = (data['metadata'] as List<dynamic>).cast<Map<String, dynamic>>();
+    final result = <TelegramFolderMeta>[];
+    for (final item in items) {
+      final text = item['text'] as String;
+      final msgId = item['message_id'] as int;
+      if (!text.startsWith(_folderPrefix)) continue;
+      try {
+        final json = jsonDecode(text.substring(_folderPrefix.length))
+            as Map<String, dynamic>;
+        result.add(TelegramFolderMeta.fromJson(msgId, json));
+      } catch (_) {
+        // Skip malformed entries
+      }
+    }
+    return result;
   }
 }
