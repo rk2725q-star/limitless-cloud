@@ -55,16 +55,32 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
   /// Get public Downloads directory (visible in file manager & gallery)
   Future<Directory> _downloadsDir() async {
     if (Platform.isAndroid) {
-      // Android public Downloads — visible in Files/Gallery
       final dir = Directory('/storage/emulated/0/Download/LimitlessCloud');
       if (!await dir.exists()) await dir.create(recursive: true);
       return dir;
     }
-    // iOS: Documents folder (accessible via Files app)
     final docs = await getApplicationDocumentsDirectory();
     final dir = Directory('${docs.path}/Downloads');
     if (!await dir.exists()) await dir.create(recursive: true);
     return dir;
+  }
+
+  /// Returns a unique file path — if [base] already exists, appends (1), (2) … until free.
+  String _uniquePath(String dirPath, String fileName) {
+    final file = File('$dirPath/$fileName');
+    if (!file.existsSync()) return file.path;
+
+    // Split name and extension
+    final dotIdx = fileName.lastIndexOf('.');
+    final name = dotIdx >= 0 ? fileName.substring(0, dotIdx) : fileName;
+    final ext  = dotIdx >= 0 ? fileName.substring(dotIdx) : '';
+
+    int counter = 1;
+    while (true) {
+      final candidate = File('$dirPath/$name ($counter)$ext');
+      if (!candidate.existsSync()) return candidate.path;
+      counter++;
+    }
   }
 
   Future<bool> _requestPermission() async {
@@ -107,7 +123,8 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
       if (!ok) throw Exception('Storage permission denied');
 
       final dir = await _downloadsDir();
-      final dest = File('${dir.path}/${file.name}');
+      // Use unique path so re-downloading the same file doesn't crash
+      final dest = File(_uniquePath(dir.path, file.name));
 
       // Stream download from Telegram
       final downloaded = await tg.downloadFile(file.telegramMessageId, file.name);
@@ -139,25 +156,67 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
       if (!ok) throw Exception('Storage permission denied');
 
       final dir = await _downloadsDir();
-      final dest = '${dir.path}/$name';
+      // Unique path prevents PathExistsException on duplicate URLs
+      final dest = _uniquePath(dir.path, name);
 
       await _dio.download(
         url,
         dest,
-        options: Options(receiveTimeout: const Duration(minutes: 30)),
+        deleteOnError: true,
+        options: Options(
+          receiveTimeout: const Duration(minutes: 30),
+          sendTimeout: const Duration(seconds: 30),
+          headers: {
+            'User-Agent':
+                'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0',
+          },
+        ),
         onReceiveProgress: (received, total) {
           if (total > 0) {
-            _updateTask(taskId,
-                progress: received / total, totalBytes: total);
+            _updateTask(taskId, progress: received / total, totalBytes: total);
+          } else {
+            _updateTask(taskId, progress: -1, totalBytes: received);
           }
         },
       );
       _updateTask(taskId, status: DlStatus.done, progress: 1.0, savedPath: dest);
     } on DioException catch (e) {
-      _updateTask(taskId, status: DlStatus.failed,
-          error: e.message ?? 'Download failed');
+      _updateTask(taskId,
+          status: DlStatus.failed, error: e.message ?? 'Download failed');
     } catch (e) {
       _updateTask(taskId, status: DlStatus.failed, error: e.toString());
+    }
+  }
+
+  /// Upload URL → Telegram Saved Messages (cloud-to-cloud, phone stores nothing)
+  Future<void> uploadUrl(String url, TelegramStorageService tg) async {
+    final uri = Uri.tryParse(url.trim());
+    if (uri == null) return;
+
+    final segments = uri.pathSegments;
+    String name = segments.isNotEmpty
+        ? segments.last
+        : 'upload_${DateTime.now().millisecondsSinceEpoch}';
+    if (!name.contains('.')) name += '.bin';
+    final ext = name.split('.').last.toLowerCase();
+
+    final taskId = 'ul_${DateTime.now().microsecondsSinceEpoch}';
+    state = [...state, DlTask(
+      id: taskId, name: '☁ $name', url: url, ext: ext,
+    )];
+    _updateTask(taskId, status: DlStatus.downloading, progress: -1);
+
+    try {
+      await tg.uploadFileFromUrl(url);
+      _updateTask(taskId, status: DlStatus.done, progress: 1.0,
+          savedPath: 'telegram://saved');
+    } catch (e) {
+      final msg = e.toString();
+      // 405 = server deployment doesn't have this endpoint yet
+      final friendlyError = msg.contains('405') || msg.toLowerCase().contains('method not allowed')
+          ? 'Server needs update — redeploy Railway to enable URL uploads'
+          : msg.replaceFirst('Exception: ', '');
+      _updateTask(taskId, status: DlStatus.failed, error: friendlyError);
     }
   }
 
@@ -269,7 +328,7 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage>
       floatingActionButton: FloatingActionButton.extended(
         backgroundColor: AppTheme.primary,
         icon: const Icon(Icons.link_rounded, color: Colors.white),
-        label: const Text('Download URL', style: TextStyle(color: Colors.white)),
+        label: const Text('Add URL', style: TextStyle(color: Colors.white)),
         onPressed: _showUrlDialog,
       ),
     );
@@ -279,49 +338,72 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage>
     final ctrl = TextEditingController();
     showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppTheme.surface,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Row(children: [
-          Icon(Icons.link_rounded, color: AppTheme.primary),
-          SizedBox(width: 8),
-          Text('Download from URL', style: TextStyle(color: Colors.white, fontSize: 16)),
-        ]),
-        content: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Text(
-            'Paste any download URL — image, video, PDF, ZIP, etc.\nChrome URL, YouTube (direct), isaidub, etc.',
-            style: TextStyle(color: AppTheme.textSecondary, fontSize: 12, height: 1.5),
-          ),
-          const SizedBox(height: 14),
-          TextField(
-            controller: ctrl,
-            autofocus: true,
-            style: const TextStyle(color: Colors.white, fontSize: 13),
-            decoration: const InputDecoration(
-              hintText: 'https://example.com/file.mp4',
-              prefixIcon: Icon(Icons.public_rounded, color: AppTheme.textHint),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setInner) => AlertDialog(
+          backgroundColor: AppTheme.surface,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          title: const Row(children: [
+            Icon(Icons.link_rounded, color: AppTheme.primary),
+            SizedBox(width: 8),
+            Text('URL Action', style: TextStyle(color: Colors.white, fontSize: 16)),
+          ]),
+          content: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Text(
+              'Paste a direct URL. Choose where the file goes:',
+              style: TextStyle(color: AppTheme.textSecondary, fontSize: 12, height: 1.5),
             ),
-            keyboardType: TextInputType.url,
-          ),
-        ]),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primary),
-            onPressed: () {
-              final url = ctrl.text.trim();
-              if (url.isNotEmpty) {
-                ref.read(dlManagerProvider.notifier).downloadUrl(url);
-                Navigator.pop(ctx);
-                _tab.animateTo(1);
-              }
-            },
-            child: const Text('Download'),
-          ),
-        ],
+            const SizedBox(height: 14),
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+              decoration: const InputDecoration(
+                hintText: 'https://example.com/file.mp4',
+                prefixIcon: Icon(Icons.public_rounded, color: AppTheme.textHint),
+              ),
+              keyboardType: TextInputType.url,
+            ),
+          ]),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel')),
+            // ── Upload to Telegram ────────────────────────────────────────────
+            OutlinedButton.icon(
+              icon: const Icon(Icons.cloud_upload_rounded, size: 16),
+              label: const Text('→ Telegram'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.lightBlueAccent,
+                side: const BorderSide(color: Colors.lightBlueAccent),
+              ),
+              onPressed: () {
+                final url = ctrl.text.trim();
+                if (url.isNotEmpty) {
+                  final auth = ref.read(telegramAuthServiceProvider);
+                  final tg = TelegramStorageService(auth);
+                  ref.read(dlManagerProvider.notifier).uploadUrl(url, tg);
+                  Navigator.pop(ctx);
+                  _tab.animateTo(1);
+                }
+              },
+            ),
+            // ── Download to device ────────────────────────────────────────────
+            ElevatedButton.icon(
+              icon: const Icon(Icons.download_rounded, size: 16),
+              label: const Text('→ Device'),
+              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primary),
+              onPressed: () {
+                final url = ctrl.text.trim();
+                if (url.isNotEmpty) {
+                  ref.read(dlManagerProvider.notifier).downloadUrl(url);
+                  Navigator.pop(ctx);
+                  _tab.animateTo(1);
+                }
+              },
+            ),
+          ],
+        ),
       ),
-    );
-    ctrl.dispose();
+    ).whenComplete(() => ctrl.dispose());
   }
 }
 
@@ -473,7 +555,7 @@ class _DoneTab extends ConsumerWidget {
           task: t,
           onCancel: () => ref.read(dlManagerProvider.notifier).removeTask(t.id),
           showProgress: false,
-          onOpen: t.savedPath != null
+          onOpen: (t.savedPath != null && t.savedPath != 'telegram://saved')
               ? () => OpenFilex.open(t.savedPath!)
               : null,
         )),
@@ -528,9 +610,13 @@ class _TaskTile extends StatelessWidget {
               isFailed
                   ? task.error ?? 'Failed'
                   : isDone
-                      ? 'Saved to device ✓'
-                      : '${(task.progress * 100).toInt()}%'
-                          '${task.totalBytes > 0 ? '  ·  ${FileUtils.formatFileSize(task.totalBytes)}' : ''}',
+                      ? (task.savedPath == 'telegram://saved'
+                          ? 'Saved to Telegram ☁'
+                          : 'Saved to device ✓')
+                      : task.progress < 0
+                          ? 'Receiving…${task.totalBytes > 0 ? '  ${FileUtils.formatFileSize(task.totalBytes)}' : ''}'
+                          : '${(task.progress * 100).toInt()}%'
+                              '${task.totalBytes > 0 ? '  ·  ${FileUtils.formatFileSize(task.totalBytes)}' : ''}',
               style: TextStyle(
                   color: isFailed
                       ? AppTheme.error
@@ -560,9 +646,12 @@ class _TaskTile extends StatelessWidget {
           ClipRRect(
             borderRadius: BorderRadius.circular(4),
             child: LinearProgressIndicator(
+              // progress < 0 → indeterminate; 0 queued → also indeterminate
               value: task.progress > 0 ? task.progress : null,
               backgroundColor: AppTheme.surfaceVariant,
-              valueColor: const AlwaysStoppedAnimation(AppTheme.primary),
+              valueColor: AlwaysStoppedAnimation(
+                task.progress < 0 ? Colors.lightBlueAccent : AppTheme.primary,
+              ),
               minHeight: 4,
             ),
           ),

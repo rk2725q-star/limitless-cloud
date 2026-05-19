@@ -224,49 +224,74 @@ class _FolderPageState extends ConsumerState<FolderPage> {
 
               // Files list / grid
               filesAsync.when(
-                data: (files) => files.isEmpty
-                    ? const SliverToBoxAdapter(
-                        child: Center(
-                          child: Padding(
-                            padding: EdgeInsets.all(40),
-                            child: Column(children: [
-                              Icon(Icons.folder_open_rounded, color: AppTheme.textHint, size: 56),
-                              SizedBox(height: 12),
-                              Text('Folder is empty', style: TextStyle(color: AppTheme.textSecondary)),
-                              SizedBox(height: 4),
-                              Text('Tap + New to upload or create a subfolder', style: TextStyle(color: AppTheme.textHint, fontSize: 12)),
-                            ]),
-                          ),
+                data: (files) {
+                  final sessionAsync = ref.watch(sessionProvider);
+                  final session = sessionAsync.valueOrNull ?? '';
+                  const imgExts = {
+                    'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'avif'
+                  };
+                  if (files.isEmpty) {
+                    return const SliverToBoxAdapter(
+                      child: Center(
+                        child: Padding(
+                          padding: EdgeInsets.all(40),
+                          child: Column(children: [
+                            Icon(Icons.folder_open_rounded, color: AppTheme.textHint, size: 56),
+                            SizedBox(height: 12),
+                            Text('Folder is empty', style: TextStyle(color: AppTheme.textSecondary)),
+                            SizedBox(height: 4),
+                            Text('Tap + New to upload or create a subfolder', style: TextStyle(color: AppTheme.textHint, fontSize: 12)),
+                          ]),
                         ),
-                      )
-                    : drive.isGridView
-                        ? SliverPadding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            sliver: SliverGrid(
-                              delegate: SliverChildBuilderDelegate(
-                                (_, i) => FileGridItem(
-                                  file: files[i],
-                                  onTap: () => Navigator.pushNamed(context, AppRoutes.fileDetail, arguments: {'file': files[i]}),
-                                  onLongPress: () {},
-                                ),
-                                childCount: files.length,
-                              ),
-                              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                                crossAxisCount: 2, crossAxisSpacing: 12, mainAxisSpacing: 12, childAspectRatio: 0.78,
-                              ),
-                            ),
-                          )
-                        : SliverList(
+                      ),
+                    );
+                  }
+                  return drive.isGridView
+                      ? SliverPadding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16),
+                          sliver: SliverGrid(
                             delegate: SliverChildBuilderDelegate(
-                              (_, i) => FileListItem(
-                                file: files[i],
-                                onTap: () => Navigator.pushNamed(context, AppRoutes.fileDetail, arguments: {'file': files[i]}),
-                                onLongPress: () {},
-                                onMoreTap: () => _showFileOptions(context, files[i]),
-                              ),
+                              (_, i) {
+                                final f = files[i];
+                                final isImg = imgExts.contains(f.extension.toLowerCase());
+                                return FileGridItem(
+                                  file: f,
+                                  sessionString: session,
+                                  onTap: () => Navigator.pushNamed(
+                                    context,
+                                    isImg ? AppRoutes.imageViewer : AppRoutes.fileDetail,
+                                    arguments: {'file': f},
+                                  ),
+                                  onLongPress: () {},
+                                );
+                              },
                               childCount: files.length,
                             ),
+                            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 2, crossAxisSpacing: 12, mainAxisSpacing: 12, childAspectRatio: 0.78,
+                            ),
                           ),
+                        )
+                      : SliverList(
+                          delegate: SliverChildBuilderDelegate(
+                            (_, i) {
+                              final f = files[i];
+                              final isImg = imgExts.contains(f.extension.toLowerCase());
+                              return FileListItem(
+                                file: f,
+                                onTap: () => Navigator.pushNamed(
+                                  context,
+                                  isImg ? AppRoutes.imageViewer : AppRoutes.fileDetail,
+                                  arguments: {'file': f},
+                                ),
+                                onLongPress: () {},
+                                onMoreTap: () => _showFileOptions(context, f),
+                              );
+                            },
+                            childCount: files.length,
+                          ),
+                        );
+                },
                 loading: () => const SliverToBoxAdapter(child: Center(child: CircularProgressIndicator())),
                 error: (e, _) => SliverToBoxAdapter(child: Text('$e')),
               ),

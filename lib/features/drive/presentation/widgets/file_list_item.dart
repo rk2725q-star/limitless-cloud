@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
 import '../../../../core/utils/date_utils.dart';
@@ -22,10 +23,15 @@ class FileListItem extends StatelessWidget {
     this.isSelectionMode = false,
   });
 
+  bool get _isImage {
+    const imageExts = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'avif'};
+    return imageExts.contains(file.extension.toLowerCase());
+  }
+
   @override
   Widget build(BuildContext context) {
     final color = FileUtils.getFileColor(file.extension);
-    final icon = FileUtils.getFileIcon(file.extension);
+    final icon  = FileUtils.getFileIcon(file.extension);
 
     return GestureDetector(
       onTap: onTap,
@@ -33,26 +39,26 @@ class FileListItem extends StatelessWidget {
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
         margin: const EdgeInsets.only(bottom: 2),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
         decoration: BoxDecoration(
           color: isSelected
-              ? AppTheme.primary.withValues(alpha:0.1)
+              ? AppTheme.primary.withValues(alpha: 0.1)
               : Colors.transparent,
           borderRadius: BorderRadius.circular(12),
           border: Border.all(
-            color: isSelected ? AppTheme.primary.withValues(alpha:0.5) : Colors.transparent,
+            color: isSelected ? AppTheme.primary.withValues(alpha: 0.5) : Colors.transparent,
           ),
         ),
         child: Row(
           children: [
-            // ── File Icon ──────────────────────────────────────────────────
+            // ── File Icon / Thumbnail ──────────────────────────────────────
             if (isSelectionMode)
               GestureDetector(
                 onTap: onTap,
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 200),
-                  width: 44,
-                  height: 44,
+                  width: 52,
+                  height: 52,
                   margin: const EdgeInsets.only(right: 14),
                   decoration: BoxDecoration(
                     color: isSelected ? AppTheme.primary : AppTheme.surfaceVariant,
@@ -70,14 +76,22 @@ class FileListItem extends StatelessWidget {
               )
             else
               Container(
-                width: 44,
-                height: 44,
+                width: 52,
+                height: 52,
                 margin: const EdgeInsets.only(right: 14),
                 decoration: BoxDecoration(
-                  color: color.withValues(alpha:0.12),
+                  color: color.withValues(alpha: 0.12),
                   borderRadius: BorderRadius.circular(12),
                 ),
-                child: Icon(icon, color: color, size: 22),
+                clipBehavior: Clip.antiAlias,
+                child: _isImage && file.thumbnailPath != null && file.thumbnailPath!.isNotEmpty
+                    ? CachedNetworkImage(
+                        imageUrl: file.thumbnailPath!,
+                        fit: BoxFit.cover,
+                        placeholder: (_, __) => Icon(icon, color: color, size: 22),
+                        errorWidget: (_, __, ___) => Icon(icon, color: color, size: 22),
+                      )
+                    : Icon(icon, color: color, size: 22),
               ),
 
             // ── File Details ───────────────────────────────────────────────
@@ -90,9 +104,7 @@ class FileListItem extends StatelessWidget {
                       Expanded(
                         child: Text(
                           file.name,
-                          style: AppTheme.bodyLarge.copyWith(
-                            fontWeight: FontWeight.w500,
-                          ),
+                          style: AppTheme.bodyLarge.copyWith(fontWeight: FontWeight.w500),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
@@ -100,26 +112,16 @@ class FileListItem extends StatelessWidget {
                       if (file.isStarred)
                         const Padding(
                           padding: EdgeInsets.only(left: 6),
-                          child: Icon(
-                            Icons.star_rounded,
-                            color: AppTheme.warning,
-                            size: 14,
-                          ),
+                          child: Icon(Icons.star_rounded, color: AppTheme.warning, size: 14),
                         ),
                     ],
                   ),
                   const SizedBox(height: 3),
                   Row(
                     children: [
-                      Text(
-                        FileUtils.formatFileSize(file.sizeBytes),
-                        style: AppTheme.bodyMedium,
-                      ),
+                      Text(FileUtils.formatFileSize(file.sizeBytes), style: AppTheme.bodyMedium),
                       const Text(' · ', style: TextStyle(color: AppTheme.textHint)),
-                      Text(
-                        AppDateUtils.getRelativeTime(file.uploadedAt),
-                        style: AppTheme.bodyMedium,
-                      ),
+                      Text(AppDateUtils.getRelativeTime(file.uploadedAt), style: AppTheme.bodyMedium),
                     ],
                   ),
                 ],
@@ -129,11 +131,7 @@ class FileListItem extends StatelessWidget {
             // ── More Button ────────────────────────────────────────────────
             if (!isSelectionMode)
               IconButton(
-                icon: const Icon(
-                  Icons.more_vert_rounded,
-                  color: AppTheme.textHint,
-                  size: 20,
-                ),
+                icon: const Icon(Icons.more_vert_rounded, color: AppTheme.textHint, size: 20),
                 onPressed: onMoreTap,
                 splashRadius: 20,
               ),

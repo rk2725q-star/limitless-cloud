@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import '../../../../core/constants/app_routes.dart';
+import '../../../../core/constants/app_constants.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
 import '../../data/models/cloud_file.dart';
@@ -333,19 +335,28 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
   }
 
   Widget _buildFileGrid(BuildContext context, WidgetRef ref, List<CloudFile> files, DriveState drive) {
+    final sessionAsync = ref.watch(sessionProvider);
+    final session = sessionAsync.valueOrNull ?? '';
     return SliverPadding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
       sliver: SliverGrid(
         delegate: SliverChildBuilderDelegate(
-          (_, i) => FileGridItem(
-            file: files[i],
-            isSelected: drive.selectedFileIds.contains(files[i].id),
-            isSelectionMode: drive.isSelectionMode,
-            onTap: () => drive.isSelectionMode
-                ? ref.read(driveProvider.notifier).toggleSelection(files[i].id)
-                : Navigator.pushNamed(context, AppRoutes.fileDetail, arguments: {'file': files[i]}),
-            onLongPress: () => ref.read(driveProvider.notifier).toggleSelection(files[i].id),
-          ),
+          (_, i) {
+            final f = files[i];
+            final isImg = _imageExts.contains(f.extension.toLowerCase());
+            return FileGridItem(
+              file: f,
+              isSelected: drive.selectedFileIds.contains(f.id),
+              isSelectionMode: drive.isSelectionMode,
+              sessionString: session,
+              onTap: () => drive.isSelectionMode
+                  ? ref.read(driveProvider.notifier).toggleSelection(f.id)
+                  : isImg
+                      ? Navigator.pushNamed(context, AppRoutes.imageViewer, arguments: {'file': f})
+                      : Navigator.pushNamed(context, AppRoutes.fileDetail, arguments: {'file': f}),
+              onLongPress: () => ref.read(driveProvider.notifier).toggleSelection(f.id),
+            );
+          },
           childCount: files.length,
         ),
         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
@@ -361,16 +372,22 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
   Widget _buildFileList(BuildContext context, WidgetRef ref, List<CloudFile> files, DriveState drive) {
     return SliverList(
       delegate: SliverChildBuilderDelegate(
-        (_, i) => FileListItem(
-          file: files[i],
-          isSelected: drive.selectedFileIds.contains(files[i].id),
-          isSelectionMode: drive.isSelectionMode,
-          onTap: () => drive.isSelectionMode
-              ? ref.read(driveProvider.notifier).toggleSelection(files[i].id)
-              : Navigator.pushNamed(context, AppRoutes.fileDetail, arguments: {'file': files[i]}),
-          onLongPress: () => ref.read(driveProvider.notifier).toggleSelection(files[i].id),
-          onMoreTap: () => _showFileOptions(context, ref, files[i]),
-        ),
+        (_, i) {
+          final f = files[i];
+          final isImg = _imageExts.contains(f.extension.toLowerCase());
+          return FileListItem(
+            file: f,
+            isSelected: drive.selectedFileIds.contains(f.id),
+            isSelectionMode: drive.isSelectionMode,
+            onTap: () => drive.isSelectionMode
+                ? ref.read(driveProvider.notifier).toggleSelection(f.id)
+                : isImg
+                    ? Navigator.pushNamed(context, AppRoutes.imageViewer, arguments: {'file': f})
+                    : Navigator.pushNamed(context, AppRoutes.fileDetail, arguments: {'file': f}),
+            onLongPress: () => ref.read(driveProvider.notifier).toggleSelection(f.id),
+            onMoreTap: () => _showFileOptions(context, ref, f),
+          );
+        },
         childCount: files.length,
       ),
     );
@@ -410,12 +427,20 @@ class _StarredTab extends ConsumerWidget {
             ? const _EmptyState(message: 'No starred files\nStar files to find them quickly')
             : ListView.builder(
                 itemCount: files.length,
-                itemBuilder: (_, i) => FileListItem(
-                  file: files[i],
-                  onTap: () => Navigator.pushNamed(context, AppRoutes.fileDetail, arguments: {'file': files[i]}),
-                  onLongPress: () {},
-                  onMoreTap: () {},
-                ),
+                itemBuilder: (_, i) {
+                  final f = files[i];
+                  final isImg = _imageExts.contains(f.extension.toLowerCase());
+                  return FileListItem(
+                    file: f,
+                    onTap: () => Navigator.pushNamed(
+                      context,
+                      isImg ? AppRoutes.imageViewer : AppRoutes.fileDetail,
+                      arguments: {'file': f},
+                    ),
+                    onLongPress: () {},
+                    onMoreTap: () {},
+                  );
+                },
               ),
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => Center(child: Text('$e')),
@@ -462,7 +487,18 @@ class _CategoriesTabState extends ConsumerState<_CategoriesTab>
       backgroundColor: AppTheme.background,
       appBar: AppBar(
         backgroundColor: AppTheme.background,
-        title: const Text('Categories'),
+        title: Row(children: [
+          Container(
+            width: 28, height: 28,
+            decoration: BoxDecoration(
+              gradient: AppTheme.primaryGradient,
+              borderRadius: BorderRadius.circular(7),
+            ),
+            child: const Icon(Icons.category_rounded, color: Colors.white, size: 16),
+          ),
+          const SizedBox(width: 10),
+          const Text('Categories'),
+        ]),
         bottom: TabBar(
           controller: _tabCtrl,
           isScrollable: true,
@@ -470,7 +506,7 @@ class _CategoriesTabState extends ConsumerState<_CategoriesTab>
           labelColor: AppTheme.primary,
           unselectedLabelColor: AppTheme.textSecondary,
           tabs: _cats.map((c) => Tab(
-            icon: Icon(c.icon, size: 20),
+            icon: Icon(c.icon, size: 18),
             text: c.cat.label,
           )).toList(),
         ),
@@ -487,15 +523,29 @@ class _CategoriesTabState extends ConsumerState<_CategoriesTab>
   }
 }
 
-class _CategoryList extends ConsumerWidget {
+class _CategoryList extends ConsumerStatefulWidget {
   final FileCategory category;
   final Color accentColor;
   final IconData icon;
   const _CategoryList({required this.category, required this.accentColor, required this.icon});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final filesAsync = ref.watch(filesByCategoryProvider(category));
+  ConsumerState<_CategoryList> createState() => _CategoryListState();
+}
+
+class _CategoryListState extends ConsumerState<_CategoryList> {
+  bool _isGridView = true; // default grid for images
+
+  @override
+  void initState() {
+    super.initState();
+    // Images start in grid, others in list
+    _isGridView = widget.category == FileCategory.images;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final filesAsync = ref.watch(filesByCategoryProvider(widget.category));
     return filesAsync.when(
       data: (files) {
         if (files.isEmpty) {
@@ -504,18 +554,18 @@ class _CategoryList extends ConsumerWidget {
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 Container(
-                  width: 72, height: 72,
+                  width: 80, height: 80,
                   decoration: BoxDecoration(
-                    color: accentColor.withValues(alpha: 0.12),
+                    color: widget.accentColor.withValues(alpha: 0.1),
                     shape: BoxShape.circle,
                   ),
-                  child: Icon(icon, color: accentColor, size: 36),
+                  child: Icon(widget.icon, color: widget.accentColor, size: 40),
                 ),
-                const SizedBox(height: 16),
-                Text('No ${category.label}',
-                    style: AppTheme.titleMedium.copyWith(color: AppTheme.textSecondary)),
+                const SizedBox(height: 20),
+                Text('No ${widget.category.label}',
+                    style: AppTheme.titleLarge.copyWith(color: AppTheme.textSecondary)),
                 const SizedBox(height: 8),
-                Text('Upload ${category.label.toLowerCase()} to see them here',
+                Text('Upload ${widget.category.label.toLowerCase()} to see them here',
                     style: AppTheme.bodyMedium, textAlign: TextAlign.center),
               ],
             ),
@@ -523,44 +573,197 @@ class _CategoryList extends ConsumerWidget {
         }
         return Column(
           children: [
+            // ── Stats header + view toggle ─────────────────────────────────
             Container(
-              margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              margin: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
               decoration: BoxDecoration(
-                color: accentColor.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: accentColor.withValues(alpha: 0.25)),
+                color: widget.accentColor.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: widget.accentColor.withValues(alpha: 0.25)),
               ),
               child: Row(
                 children: [
-                  Icon(icon, color: accentColor, size: 20),
-                  const SizedBox(width: 10),
-                  Text('${files.length} ${category.label}',
-                      style: AppTheme.titleMedium.copyWith(color: accentColor)),
+                  Container(
+                    width: 36, height: 36,
+                    decoration: BoxDecoration(
+                      color: widget.accentColor.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(9),
+                    ),
+                    child: Icon(widget.icon, color: widget.accentColor, size: 20),
+                  ),
+                  const SizedBox(width: 12),
+                  Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text('${files.length} ${widget.category.label}',
+                        style: AppTheme.titleMedium.copyWith(color: widget.accentColor)),
+                    Text(FileUtils.formatFileSize(files.fold(0, (s, f) => s + f.sizeBytes)),
+                        style: AppTheme.bodyMedium),
+                  ]),
                   const Spacer(),
-                  Text(FileUtils.formatFileSize(files.fold(0, (s, f) => s + f.sizeBytes)),
-                      style: AppTheme.bodyMedium.copyWith(color: accentColor)),
+                  // View toggle
+                  GestureDetector(
+                    onTap: () => setState(() => _isGridView = !_isGridView),
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 200),
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: widget.accentColor.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Icon(
+                        _isGridView ? Icons.view_list_rounded : Icons.grid_view_rounded,
+                        color: widget.accentColor, size: 18,
+                      ),
+                    ),
+                  ),
                 ],
               ),
             ),
+
+            // ── File list or image grid ────────────────────────────────────
             Expanded(
-              child: ListView.builder(
-                padding: const EdgeInsets.only(top: 8, bottom: 80),
-                itemCount: files.length,
-                itemBuilder: (_, i) => FileListItem(
-                  file: files[i],
-                  onTap: () => Navigator.pushNamed(context, AppRoutes.fileDetail,
-                      arguments: {'file': files[i]}),
-                  onLongPress: () {},
-                  onMoreTap: () {},
-                ),
-              ),
+              child: widget.category == FileCategory.images && _isGridView
+                  ? _ImageGalleryGrid(files: files, accentColor: widget.accentColor)
+                  : ListView.builder(
+                      padding: const EdgeInsets.only(bottom: 80),
+                      itemCount: files.length,
+                      itemBuilder: (_, i) {
+                        final f = files[i];
+                        final isImg = _imageExts.contains(f.extension.toLowerCase());
+                        return FileListItem(
+                          file: f,
+                          onTap: () => Navigator.pushNamed(
+                            context,
+                            isImg ? AppRoutes.imageViewer : AppRoutes.fileDetail,
+                            arguments: {'file': f},
+                          ),
+                          onLongPress: () {},
+                          onMoreTap: () {},
+                        );
+                      },
+                    ),
             ),
           ],
         );
       },
       loading: () => const Center(child: CircularProgressIndicator()),
       error: (e, _) => Center(child: Text('$e')),
+    );
+  }
+}
+
+// ── Image Gallery Grid ────────────────────────────────────────────────────────
+
+const _imageExts = {
+  'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'avif'
+};
+
+class _ImageGalleryGrid extends ConsumerWidget {
+  final List<CloudFile> files;
+  final Color accentColor;
+  const _ImageGalleryGrid({required this.files, required this.accentColor});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final sessionAsync = ref.watch(sessionProvider);
+    final session = sessionAsync.valueOrNull ?? '';
+    return GridView.builder(
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 80),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        crossAxisSpacing: 3,
+        mainAxisSpacing: 3,
+      ),
+      itemCount: files.length,
+      itemBuilder: (_, i) {
+        final f = files[i];
+        return GestureDetector(
+          onTap: () => Navigator.pushNamed(context, AppRoutes.imageViewer, arguments: {'file': f}),
+          child: _GalleryThumbnail(file: f, session: session),
+        );
+      },
+    );
+  }
+}
+
+class _GalleryThumbnail extends StatelessWidget {
+  final CloudFile file;
+  final String session;
+  const _GalleryThumbnail({required this.file, required this.session});
+
+  String? get _streamUrl {
+    if (session.isEmpty) return null;
+    final encoded = Uri.encodeQueryComponent(session);
+    return '${AppConstants.backendBaseUrl}/files/download'
+        '/${file.telegramMessageId}?session_string=$encoded';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final color = FileUtils.getFileColor(file.extension);
+    final url = _streamUrl;
+
+    Widget content;
+    if (url != null) {
+      content = CachedNetworkImage(
+        imageUrl: url,
+        fit: BoxFit.cover,
+        memCacheWidth: 300,
+        placeholder: (_, __) => _imgPlaceholder(color),
+        errorWidget: (_, __, ___) => _imgPlaceholder(color),
+      );
+    } else {
+      content = _imgPlaceholder(color);
+    }
+
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(3),
+      ),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          content,
+          // Bottom gradient
+          Positioned(
+            bottom: 0, left: 0, right: 0,
+            child: Container(
+              height: 40,
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.bottomCenter,
+                  end: Alignment.topCenter,
+                  colors: [Colors.black.withValues(alpha: 0.6), Colors.transparent],
+                ),
+              ),
+              padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
+              alignment: Alignment.bottomLeft,
+              child: Text(
+                file.name,
+                style: const TextStyle(
+                    color: Colors.white, fontSize: 9, fontWeight: FontWeight.w500),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+          // Star
+          if (file.isStarred)
+            const Positioned(
+              top: 4, right: 4,
+              child: Icon(Icons.star_rounded, color: AppTheme.warning, size: 14),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _imgPlaceholder(Color color) {
+    return Container(
+      color: color.withValues(alpha: 0.08),
+      child: Icon(Icons.image_rounded, color: color, size: 32),
     );
   }
 }

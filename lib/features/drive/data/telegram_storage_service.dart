@@ -250,6 +250,31 @@ class TelegramStorageService {
     return localFile;
   }
 
+  /// [Cloud-to-Cloud] Fetch [url] server-side and upload it straight to
+  /// the user's Telegram Saved Messages — the phone never downloads any bytes.
+  /// Returns the Telegram message_id on success.
+  Future<int> uploadFileFromUrl(String url, {String caption = ''}) async {
+    final session = await _session;
+    final uri = Uri.parse('$_base/files/upload-from-url');
+    final body = jsonEncode({
+      'session_string': session,
+      'url': url,
+      'caption': caption,
+    });
+    final resp = await http
+        .post(uri,
+            headers: {'Content-Type': 'application/json'}, body: body)
+        .timeout(const Duration(minutes: 60)); // large files can take time
+    if (resp.statusCode >= 400) {
+      final err =
+          (jsonDecode(resp.body) as Map<String, dynamic>)['detail'] ??
+              'Upload failed (${resp.statusCode})';
+      throw Exception(err);
+    }
+    final data = jsonDecode(resp.body) as Map<String, dynamic>;
+    return data['message_id'] as int;
+  }
+
   /// Delete a file from Saved Messages by its message_id.
   Future<void> deleteFile(int messageId) async {
     await _delete('/files/$messageId', {'message_id': messageId});

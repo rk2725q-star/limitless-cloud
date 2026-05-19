@@ -604,3 +604,10 @@ final userStatsProvider = FutureProvider<Map<String, dynamic>>((ref) async {
   final firestoreService = ref.read(firestoreServiceProvider);
   return firestoreService.getUserStats(userId);
 });
+
+/// Exposes the authenticated Telegram session string so widgets can build
+/// backend-authenticated thumbnail / stream URLs directly.
+final sessionProvider = FutureProvider<String>((ref) async {
+  final authService = ref.read(telegramAuthServiceProvider);
+  return authService.getSession();
+});

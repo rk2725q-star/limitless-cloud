@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
+import '../../../../core/constants/app_constants.dart';
 import '../../data/models/cloud_file.dart';
 
 class FileGridItem extends StatelessWidget {
@@ -9,6 +11,8 @@ class FileGridItem extends StatelessWidget {
   final bool isSelectionMode;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
+  /// Authenticated session string — pass it so thumbnails can load via backend.
+  final String? sessionString;
 
   const FileGridItem({
     super.key,
@@ -17,12 +21,27 @@ class FileGridItem extends StatelessWidget {
     required this.onLongPress,
     this.isSelected = false,
     this.isSelectionMode = false,
+    this.sessionString,
   });
+
+  static const _imageExts = {
+    'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'avif'
+  };
+
+  bool get _isImage => _imageExts.contains(file.extension.toLowerCase());
+
+  /// Backend streaming URL for the file — authenticated via session query-param.
+  String? get _streamUrl {
+    if (sessionString == null || sessionString!.isEmpty) return null;
+    final encoded = Uri.encodeQueryComponent(sessionString!);
+    return '${AppConstants.backendBaseUrl}/files/download'
+        '/${file.telegramMessageId}?session_string=$encoded';
+  }
 
   @override
   Widget build(BuildContext context) {
     final color = FileUtils.getFileColor(file.extension);
-    final icon = FileUtils.getFileIcon(file.extension);
+    final icon  = FileUtils.getFileIcon(file.extension);
 
     return GestureDetector(
       onTap: onTap,
@@ -31,7 +50,7 @@ class FileGridItem extends StatelessWidget {
         duration: const Duration(milliseconds: 200),
         decoration: BoxDecoration(
           color: isSelected
-              ? AppTheme.primary.withValues(alpha:0.15)
+              ? AppTheme.primary.withValues(alpha: 0.15)
               : AppTheme.card,
           borderRadius: BorderRadius.circular(16),
           border: Border.all(
@@ -39,7 +58,7 @@ class FileGridItem extends StatelessWidget {
             width: isSelected ? 1.5 : 1,
           ),
           boxShadow: isSelected
-              ? [BoxShadow(color: AppTheme.primary.withValues(alpha:0.15), blurRadius: 8)]
+              ? [BoxShadow(color: AppTheme.primary.withValues(alpha: 0.15), blurRadius: 8)]
               : null,
         ),
         child: Column(
@@ -48,39 +67,55 @@ class FileGridItem extends StatelessWidget {
             // ── Thumbnail / Icon Area ──────────────────────────────────────
             Expanded(
               child: Stack(
+                fit: StackFit.expand,
                 children: [
-                  // File type icon background
-                  Container(
-                    decoration: BoxDecoration(
-                      color: color.withValues(alpha:0.08),
+                  // ── Image preview OR file-type icon ──────────────────────
+                  if (_isImage && _streamUrl != null)
+                    ClipRRect(
                       borderRadius: const BorderRadius.vertical(top: Radius.circular(15)),
+                      child: CachedNetworkImage(
+                        imageUrl: _streamUrl!,
+                        fit: BoxFit.cover,
+                        placeholder: (_, __) => _IconBackground(color: color, icon: icon),
+                        errorWidget: (_, __, ___) => _IconBackground(color: color, icon: icon),
+                        // Thumbnails are small, use low quality for speed
+                        memCacheWidth: 300,
+                      ),
+                    )
+                  else
+                    _IconBackground(color: color, icon: icon),
+
+                  // Gradient overlay for image items (readability)
+                  if (_isImage && _streamUrl != null)
+                    Positioned(
+                      bottom: 0, left: 0, right: 0,
+                      child: Container(
+                        height: 32,
+                        decoration: BoxDecoration(
+                          borderRadius: const BorderRadius.vertical(top: Radius.circular(0)),
+                          gradient: LinearGradient(
+                            begin: Alignment.bottomCenter,
+                            end: Alignment.topCenter,
+                            colors: [Colors.black.withValues(alpha: 0.55), Colors.transparent],
+                          ),
+                        ),
+                      ),
                     ),
-                    child: Center(
-                      child: Icon(icon, color: color, size: 44),
-                    ),
-                  ),
 
                   // Star indicator
                   if (file.isStarred)
                     const Positioned(
-                      top: 8,
-                      right: 8,
-                      child: Icon(
-                        Icons.star_rounded,
-                        color: AppTheme.warning,
-                        size: 16,
-                      ),
+                      top: 8, right: 8,
+                      child: Icon(Icons.star_rounded, color: AppTheme.warning, size: 16),
                     ),
 
                   // Selection checkbox
                   if (isSelectionMode)
                     Positioned(
-                      top: 8,
-                      left: 8,
+                      top: 8, left: 8,
                       child: AnimatedContainer(
                         duration: const Duration(milliseconds: 200),
-                        width: 24,
-                        height: 24,
+                        width: 24, height: 24,
                         decoration: BoxDecoration(
                           color: isSelected ? AppTheme.primary : Colors.transparent,
                           shape: BoxShape.circle,
@@ -138,6 +173,23 @@ class FileGridItem extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _IconBackground extends StatelessWidget {
+  final Color color;
+  final IconData icon;
+  const _IconBackground({required this.color, required this.icon});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(15)),
+      ),
+      child: Center(child: Icon(icon, color: color, size: 44)),
     );
   }
 }

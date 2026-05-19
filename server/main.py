@@ -24,7 +24,9 @@ import os
 import tempfile
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
+from urllib.parse import urlparse, unquote
 
+import aiohttp
 import uvicorn
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -309,6 +311,103 @@ async def upload_file(
                 "file_name": filename,
                 "file_size": file_size,
                 "date": message.date.isoformat(),
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(500, str(e))
+        finally:
+            await client.disconnect()
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            gc.collect()
+
+
+class UploadFromUrlRequest(BaseModel):
+    session_string: str
+    url: str
+    caption: str = ""
+
+
+@app.post("/files/upload-from-url")
+async def upload_file_from_url(req: UploadFromUrlRequest):
+    """
+    Fetch a remote URL server-side and upload the bytes to the user's
+    Telegram Saved Messages — the file NEVER touches the phone.
+
+    Memory strategy: stream the HTTP response in UPLOAD_BUF_SIZE (64 KB)
+    chunks into a NamedTemporaryFile, then let Telethon read from disk.
+    """
+    async with _HEAVY_SEM:
+        client = make_client(req.session_string)
+        tmp_path = None
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise HTTPException(401, "Session expired.")
+
+            # Derive a clean filename from the URL path
+            parsed   = urlparse(req.url)
+            raw_name = unquote(parsed.path.split("/")[-1]) or "download"
+            if "." not in raw_name:
+                raw_name += ".bin"
+            filename  = raw_name
+            file_size = 0
+
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Linux; Android 13) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0 Mobile Safari/537.36"
+                )
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    req.url,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=1800),  # 30 min cap
+                    allow_redirects=True,
+                ) as resp:
+                    if resp.status >= 400:
+                        raise HTTPException(
+                            resp.status,
+                            f"Remote server returned {resp.status} for URL."
+                        )
+                    # Try to get a real filename from Content-Disposition
+                    cd = resp.headers.get("Content-Disposition", "")
+                    if "filename=" in cd:
+                        try:
+                            filename = cd.split("filename=")[-1].strip(' "\'')
+                        except Exception:
+                            pass
+
+                    with tempfile.NamedTemporaryFile(
+                        delete=False, suffix=f"_{filename}"
+                    ) as tmp:
+                        tmp_path = tmp.name
+                        async for chunk in resp.content.iter_chunked(UPLOAD_BUF_SIZE):
+                            tmp.write(chunk)
+                            file_size += len(chunk)
+
+            caption = req.caption or filename
+            message = await client.send_file(
+                "me",
+                tmp_path,
+                caption=caption,
+                force_document=True,
+                attributes=[DocumentAttributeFilename(file_name=filename)],
+            )
+
+            return {
+                "success":    True,
+                "message_id": message.id,
+                "file_name":  filename,
+                "file_size":  file_size,
+                "date":       message.date.isoformat(),
             }
         except HTTPException:
             raise
