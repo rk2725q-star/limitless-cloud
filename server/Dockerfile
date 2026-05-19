@@ -3,8 +3,9 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-# Only copy requirements first (layer cache-friendly)
-COPY server/requirements.txt .
+# Build context = server/ directory (Railway Root Directory setting)
+# so paths are relative to server/ — no "server/" prefix needed
+COPY requirements.txt .
 
 # Install into a prefix so we can copy cleanly
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
@@ -20,8 +21,8 @@ WORKDIR /app
 # Copy only the installed packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy source
-COPY server/main.py .
+# Copy source (relative to server/ build context)
+COPY main.py .
 
 # Set Python memory/GC env vars
 ENV PYTHONDONTWRITEBYTECODE=1 \
