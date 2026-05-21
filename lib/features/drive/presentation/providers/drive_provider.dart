@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:path/path.dart' as p;
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../../auth/data/telegram_auth_service.dart';
 import '../../data/models/cloud_file.dart';
@@ -14,33 +16,51 @@ import 'package:mime/mime.dart';
 // ── Upload State ──────────────────────────────────────────────────────────────
 
 class UploadTask {
+  /// Unique ID for this task — avoids matching by filename when two files
+  /// with the same name are uploading concurrently.
+  final String taskId;
   final String fileName;
   final double progress;
   final bool isComplete;
   final bool hasError;
   final String? error;
+  final int totalBytes;
+  final int totalChunks;
+  final int currentChunk;
 
   UploadTask({
+    required this.taskId,
     required this.fileName,
     required this.progress,
     this.isComplete = false,
     this.hasError = false,
     this.error,
+    this.totalBytes = 0,
+    this.totalChunks = 1,
+    this.currentChunk = 1,
   });
 
   UploadTask copyWith({
+    String? taskId,
     String? fileName,
     double? progress,
     bool? isComplete,
     bool? hasError,
     String? error,
+    int? totalBytes,
+    int? totalChunks,
+    int? currentChunk,
   }) {
     return UploadTask(
+      taskId: taskId ?? this.taskId,
       fileName: fileName ?? this.fileName,
       progress: progress ?? this.progress,
       isComplete: isComplete ?? this.isComplete,
       hasError: hasError ?? this.hasError,
       error: error ?? this.error,
+      totalBytes: totalBytes ?? this.totalBytes,
+      totalChunks: totalChunks ?? this.totalChunks,
+      currentChunk: currentChunk ?? this.currentChunk,
     );
   }
 }
@@ -162,75 +182,282 @@ class DriveNotifier extends StateNotifier<DriveState> {
 
   // ── Upload ────────────────────────────────────────────────────────────────
 
+  /// Dismiss a failed/completed upload task from the UI.
+  void dismissUploadTask(String taskId) {
+    if (!mounted) return;
+    final tasks = state.uploadTasks.where((t) => t.taskId != taskId).toList();
+    state = state.copyWith(uploadTasks: tasks);
+  }
+
   Future<void> uploadFiles({
     String? folderId,
     String folderPath = '/',
   }) async {
-    final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+    // ── Step 1: Ensure storage permissions ────────────────────────────────────
+    // Without proper permissions, file_picker may return inaccessible paths.
+    final permOk = await _requestStoragePermission();
+    if (!permOk) {
+      // Still try — file_picker uses SAF which works even without permissions
+      // on Android 10+. We just warn but don't block.
+    }
+
+    // ── Step 2: Pick files ────────────────────────────────────────────────────
+    // CRITICAL: Do NOT use withReadStream:true — it skips file_picker's internal
+    // SAF→cache resolution and returns an unusable content:// URI as the path.
+    // withData:false prevents loading the entire file into RAM (safe for 2GB+).
+    final result = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      withData: false,
+      type: FileType.any,
+    );
     if (result == null || result.files.isEmpty) return;
 
     final userId = await _userId;
     if (userId == null) return;
 
+    // ── Step 3: Upload each file ───────────────────────────────────────────────
+    // file_picker on Android uses the Storage Access Framework (SAF) internally.
+    // For content:// URIs it ALREADY copies the file to its own cache directory
+    // and returns that cache path. The returned pickedFile.path is ALWAYS a real,
+    // accessible file path by the time pickFiles() completes.
     for (final pickedFile in result.files) {
-      if (pickedFile.path == null) continue;
-      final file = File(pickedFile.path!);
       final fileName = pickedFile.name;
-      final extension = FileUtils.getExtension(fileName);
-      final mimeType = lookupMimeType(pickedFile.path!) ?? 'application/octet-stream';
 
-      final task = UploadTask(fileName: fileName, progress: 0.0);
-      state = state.copyWith(uploadTasks: [...state.uploadTasks, task]);
+      if (pickedFile.path == null) {
+        // Very rare: path is null only on Web (not Android). Skip.
+        _markError(null, fileName, 'File path unavailable. Please try again.');
+        continue;
+      }
 
-      try {
-        final messageId = await _telegramService.uploadFile(
-          file,
-          folderId: folderId,
-          folderPath: folderPath,
-          onProgress: (progress) {
-            final tasks = state.uploadTasks.toList();
-            final idx = tasks.indexWhere((t) => t.fileName == fileName);
-            if (idx >= 0) {
-              tasks[idx] = tasks[idx].copyWith(progress: progress);
-              state = state.copyWith(uploadTasks: tasks);
-            }
-          },
-        );
+      final file = File(pickedFile.path!);
 
-        await _firestoreService.saveFileMetadata(
-          userId: userId,
-          name: fileName,
-          folderId: folderId,
-          folderPath: folderPath,
-          telegramMessageId: messageId,
-          telegramFileId: messageId.toString(),
-          mimeType: mimeType,
-          sizeBytes: pickedFile.size,
-          extension: extension,
-        );
+      // Verify the file is accessible — file_picker guarantees this, but guard anyway.
+      if (!await file.exists()) {
+        _markError(null, fileName,
+            'File not accessible. Check storage permission in Settings > Apps > Limitless Cloud > Permissions.');
+        continue;
+      }
 
+      await _runUpload(
+        file: file,
+        fileName: fileName,
+        folderId: folderId,
+        folderPath: folderPath,
+        userId: userId,
+        // file_picker copies content:// URIs to its own cache dir.
+        // We mark those as cache files so we can clean them up after upload.
+        isCacheFile: file.path.contains('/cache/'),
+      );
+    }
+  }
+
+  /// Requests storage permissions appropriate for the Android version.
+  /// Returns true if at least one useful permission is granted.
+  Future<bool> _requestStoragePermission() async {
+    if (!Platform.isAndroid) return true;
+
+    // Android 13+ (API 33): granular media permissions
+    // We request all three so the user can pick any file type.
+    final photos  = await Permission.photos.status;
+    final videos  = await Permission.videos.status;
+    final audio   = await Permission.audio.status;
+
+    // Also try MANAGE_EXTERNAL_STORAGE (Android 11+) for full access.
+    // On Android 9-10 this silently returns denied, which is fine.
+    final manageStatus = await Permission.manageExternalStorage.status;
+
+    // Classic READ_EXTERNAL_STORAGE for Android 9-12.
+    final storageStatus = await Permission.storage.status;
+
+    // Only request what is not yet granted.
+    final toRequest = <Permission>[];
+    if (!photos.isGranted)  toRequest.add(Permission.photos);
+    if (!videos.isGranted)  toRequest.add(Permission.videos);
+    if (!audio.isGranted)   toRequest.add(Permission.audio);
+    if (!storageStatus.isGranted && !manageStatus.isGranted) {
+      toRequest.add(Permission.storage);
+    }
+
+    if (toRequest.isNotEmpty) {
+      await toRequest.request();
+    }
+
+    // Even if denied, SAF-based file picker still works on Android 10+.
+    return true;
+  }
+
+  /// Show an error task card for a file that couldn't be opened.
+  void _markError(String? taskId, String fileName, String error) {
+    final id = taskId ?? '${fileName}_${DateTime.now().microsecondsSinceEpoch}';
+    if (!mounted) return;
+    state = state.copyWith(uploadTasks: [
+      ...state.uploadTasks,
+      UploadTask(
+        taskId: id,
+        fileName: fileName,
+        progress: 0,
+        hasError: true,
+        error: error,
+      ),
+    ]);
+  }
+
+  /// Internal: run a single file upload, adding/updating the task in state.
+  /// [isCacheFile] — if true the temp cache copy is deleted after upload.
+  Future<void> _runUpload({
+    required File file,
+    required String fileName,
+    required String? folderId,
+    required String folderPath,
+    required String userId,
+    bool isCacheFile = false,
+  }) async {
+    final extension = FileUtils.getExtension(fileName);
+    final mimeType = lookupMimeType(file.path) ?? 'application/octet-stream';
+    final fileSize = await file.length();
+
+    // Mirrors chunk logic in TelegramStorageService.
+    const telegramLimit = 2 * 1024 * 1024 * 1024; // 2 GB
+    const maxChunkBytes = 1.95 * 1024 * 1024 * 1024; // 1.95 GB
+    final totalChunks = fileSize < telegramLimit
+        ? 1
+        : (fileSize / maxChunkBytes).ceil();
+
+    final taskId = '${fileName}_${DateTime.now().microsecondsSinceEpoch}';
+
+    // Add task immediately at 0% so it is visible right away.
+    final task = UploadTask(
+      taskId: taskId,
+      fileName: fileName,
+      progress: 0.0,
+      totalBytes: fileSize,
+      totalChunks: totalChunks,
+      currentChunk: 1,
+    );
+    if (mounted) state = state.copyWith(uploadTasks: [...state.uploadTasks, task]);
+
+    try {
+      final uploadResult = await _telegramService.uploadFileChunked(
+        file,
+        folderId: folderId,
+        folderPath: folderPath,
+        onProgress: (progress) {
+          if (!mounted) return;
+          final tasks = state.uploadTasks.toList();
+          final idx = tasks.indexWhere((t) => t.taskId == taskId);
+          if (idx >= 0) {
+            final currentChunk = totalChunks > 1
+                ? ((progress * totalChunks).floor() + 1).clamp(1, totalChunks)
+                : 1;
+            tasks[idx] = tasks[idx].copyWith(
+              progress: progress,
+              currentChunk: currentChunk,
+            );
+            state = state.copyWith(uploadTasks: tasks);
+          }
+        },
+      );
+
+      await _firestoreService.saveFileMetadata(
+        userId: userId,
+        name: fileName,
+        folderId: folderId,
+        folderPath: folderPath,
+        telegramMessageId: uploadResult.primaryMessageId,
+        telegramFileId: uploadResult.primaryMessageId.toString(),
+        mimeType: mimeType,
+        sizeBytes: fileSize,
+        extension: extension,
+        chunkMessageIds: uploadResult.allMessageIds,
+      );
+
+      // Mark complete.
+      if (mounted) {
         final tasks = state.uploadTasks.toList();
-        final idx = tasks.indexWhere((t) => t.fileName == fileName);
+        final idx = tasks.indexWhere((t) => t.taskId == taskId);
         if (idx >= 0) {
           tasks[idx] = tasks[idx].copyWith(isComplete: true, progress: 1.0);
           state = state.copyWith(uploadTasks: tasks);
         }
-
         _invalidateAll(folderId);
-      } catch (e) {
+      }
+
+      // Auto-dismiss success tile after 4 seconds.
+      await Future.delayed(const Duration(seconds: 4));
+      if (mounted) {
+        final tasks = state.uploadTasks.where((t) => t.taskId != taskId || !t.isComplete).toList();
+        state = state.copyWith(uploadTasks: tasks);
+      }
+      // Clean up temp cache file to free device storage.
+      if (isCacheFile) {
+        try { await file.delete(); } catch (_) {}
+      }
+    } catch (e) {
+      // Clean up temp cache file even on failure.
+      if (isCacheFile) {
+        try { await file.delete(); } catch (_) {}
+      }
+      // Mark as failed — tile stays visible until user explicitly dismisses it.
+      if (mounted) {
         final tasks = state.uploadTasks.toList();
-        final idx = tasks.indexWhere((t) => t.fileName == fileName);
+        final idx = tasks.indexWhere((t) => t.taskId == taskId);
         if (idx >= 0) {
-          tasks[idx] = tasks[idx].copyWith(hasError: true, error: e.toString());
+          tasks[idx] = tasks[idx].copyWith(
+            hasError: true,
+            error: _friendlyError(e.toString()),
+          );
           state = state.copyWith(uploadTasks: tasks);
         }
       }
-
-      await Future.delayed(const Duration(seconds: 2));
-      final tasks = state.uploadTasks.toList();
-      tasks.removeWhere((t) => t.fileName == fileName && (t.isComplete || t.hasError));
-      state = state.copyWith(uploadTasks: tasks);
     }
+  }
+
+  /// Convert raw exception messages into user-friendly strings.
+  String _friendlyError(String raw) {
+    if (raw.contains('SocketException') || raw.contains('Connection')) {
+      return 'Connection lost. Tap Retry.';
+    }
+    if (raw.contains('TimeoutException') || raw.contains('timeout')) {
+      return 'Upload timed out. Tap Retry.';
+    }
+    if (raw.contains('DioException') || raw.contains('dio')) {
+      return 'Network error. Tap Retry.';
+    }
+    return raw.replaceAll('Exception: ', '');
+  }
+
+  /// Retry a failed upload task by taskId.
+  /// The original file path, folder info, and userId must still be accessible.
+  Future<void> retryUpload({
+    required String taskId,
+    required File file,
+    required String? folderId,
+    required String folderPath,
+    required String userId,
+  }) async {
+    // Reset the failed task to uploading state.
+    if (mounted) {
+      final tasks = state.uploadTasks.toList();
+      final idx = tasks.indexWhere((t) => t.taskId == taskId);
+      if (idx >= 0) {
+        tasks[idx] = tasks[idx].copyWith(
+          hasError: false,
+          error: null,
+          progress: 0.0,
+          isComplete: false,
+        );
+        state = state.copyWith(uploadTasks: tasks);
+      }
+    }
+    // Dismiss old task and run a fresh upload (gets a new taskId).
+    dismissUploadTask(taskId);
+    await _runUpload(
+      file: file,
+      fileName: p.basename(file.path),
+      folderId: folderId,
+      folderPath: folderPath,
+      userId: userId,
+    );
   }
 
   // ── Sync from Telegram ────────────────────────────────────────────────────
@@ -268,13 +495,16 @@ class DriveNotifier extends StateNotifier<DriveState> {
       // ── Check current DB state ─────────────────────────────────────────────
       final existingMsgIds     = await _firestoreService.getExistingMessageIds(userId);
       final existingFolderIds  = await _firestoreService.getExistingFolderIds(userId);
+      final deletedFolderIds   = await _firestoreService.getDeletedFolderIds(userId);
 
       // ── STEP 1: Restore folder structure ─────────────────────────────────
       final folderMetas = await _telegramService.listFolderMeta();
       if (folderMetas.isNotEmpty) {
         final sorted = _sortFoldersByDepth(folderMetas);
         for (final meta in sorted) {
+          // Skip folders that already exist locally OR were permanently deleted.
           if (existingFolderIds.contains(meta.id)) continue;
+          if (deletedFolderIds.contains(meta.id)) continue;
 
           String parentPath = '/';
           if (meta.parentId != null && meta.parentId!.isNotEmpty) {
@@ -418,6 +648,35 @@ class DriveNotifier extends StateNotifier<DriveState> {
     _ref.invalidate(foldersProvider(null));
   }
 
+  Future<void> deleteFolder(String folderId) async {
+    final userId = await _userId;
+    if (userId == null) return;
+
+    // Fetch folder before deleting so we can remove its Telegram meta message.
+    final folder = await _firestoreService.getFolderById(
+        userId: userId, folderId: folderId);
+
+    // Delete from local DB first so UI updates immediately.
+    await _firestoreService.deleteFolder(userId: userId, folderId: folderId);
+
+    // Invalidate ALL folder-related providers so UI refreshes instantly
+    _invalidateAll(null);
+    if (folder?.parentFolderId != null) {
+      _ref.invalidate(foldersProvider(folder!.parentFolderId));
+    }
+
+    // Also delete the LIMITLESS_FOLDER: text message from Telegram Saved
+    // Messages — without this the folder reappears on next sync.
+    if (folder != null && folder.metaMessageId > 0) {
+      try {
+        await _telegramService.deleteFolderMeta(folder.metaMessageId);
+      } catch (_) {
+        // Non-fatal: local DB is already updated; worst case a re-sync will
+        // see the orphaned meta message but the folder won't match any files.
+      }
+    }
+  }
+
   // ── File Operations ────────────────────────────────────────────────────────
 
   Future<void> toggleStar(CloudFile file) async {
@@ -439,25 +698,33 @@ class DriveNotifier extends StateNotifier<DriveState> {
   Future<void> moveFile(CloudFile file, CloudFolder destinationFolder) async {
     final userId = await _userId;
     if (userId == null) return;
+    // Empty id means root
+    final destId = destinationFolder.id.isEmpty ? null : destinationFolder.id;
+    final destPath = destinationFolder.path.isEmpty ? '/' : destinationFolder.path;
     await _firestoreService.moveFile(
       userId: userId,
       fileId: file.id,
       oldFolderId: file.folderId,
-      newFolderId: destinationFolder.id,
-      newFolderPath: destinationFolder.path,
+      newFolderId: destId,
+      newFolderPath: destPath,
       fileSizeBytes: file.sizeBytes,
     );
+    _invalidateAll(file.folderId);
+    _invalidateAll(destId);
   }
 
   Future<void> copyFile(CloudFile file, CloudFolder destinationFolder) async {
     final userId = await _userId;
     if (userId == null) return;
+    final destId = destinationFolder.id.isEmpty ? null : destinationFolder.id;
+    final destPath = destinationFolder.path.isEmpty ? '/' : destinationFolder.path;
     await _firestoreService.copyFile(
       userId: userId,
       sourceFile: file,
-      destinationFolderId: destinationFolder.id,
-      destinationFolderPath: destinationFolder.path,
+      destinationFolderId: destId,
+      destinationFolderPath: destPath,
     );
+    _invalidateAll(destId);
   }
 
   Future<void> trashFile(CloudFile file) async {
@@ -473,12 +740,26 @@ class DriveNotifier extends StateNotifier<DriveState> {
   Future<bool> deleteFile(CloudFile file) async {
     final userId = await _userId;
     if (userId == null) return false;
-    await _telegramService.deleteFile(file.telegramMessageId);
-    await _firestoreService.deleteFile(
-      userId: userId,
-      fileId: file.id,
-      fileSizeBytes: file.sizeBytes,
-    );
+    // Always delete from local DB first — Telegram delete is best-effort.
+    try {
+      if (file.isChunked) {
+        await _telegramService.deleteChunkedFile(file.chunkMessageIds);
+      } else {
+        await _telegramService.deleteFile(file.telegramMessageId);
+      }
+    } catch (_) {
+      // Telegram delete failed. Continue anyway — local record must still be removed.
+    }
+    try {
+      await _firestoreService.deleteFile(
+        userId: userId,
+        fileId: file.id,
+        fileSizeBytes: file.sizeBytes,
+      );
+    } catch (_) {
+      return false;
+    }
+    _invalidateAll(file.folderId);
     return true;
   }
 
@@ -487,10 +768,19 @@ class DriveNotifier extends StateNotifier<DriveState> {
     required Function(double) onProgress,
   }) async {
     try {
-      final localFile = await _telegramService.downloadFile(
-        file.telegramMessageId,
-        file.name,
-      );
+      final File localFile;
+      if (file.isChunked) {
+        localFile = await _telegramService.downloadChunkedFile(
+          file.chunkMessageIds,
+          file.name,
+          onProgress: onProgress,
+        );
+      } else {
+        localFile = await _telegramService.downloadFile(
+          file.telegramMessageId,
+          file.name,
+        );
+      }
       return localFile.path;
     } catch (_) {
       return null;

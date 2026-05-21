@@ -1,6 +1,10 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
 
+import 'package:dio/dio.dart';
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 import 'package:mime/mime.dart';
@@ -13,7 +17,63 @@ import '../../auth/data/telegram_auth_service.dart';
 // ── Upload progress callback ──────────────────────────────────────────────────
 typedef ProgressCallback = void Function(double progress);
 
-// ── Telegram Saved Messages file descriptor ───────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  TELEGRAM SIZE RULES
+//  • Files < 2 GB  → 1 Telegram message (single upload)
+//  • Files ≥ 2 GB  → split into 1.95 GB Telegram messages (chunked upload)
+//
+//  DOWNLOAD IS ALWAYS A SINGLE FILE regardless of how many Telegram messages
+//  were used during upload.  The server's /files/download-chunked endpoint
+//  streams all Telegram messages as one contiguous byte stream.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const int    _kTelegramLimit  = 2  * 1024 * 1024 * 1024; // 2 GB
+const double _kMaxChunkBytes  = 1.95 * 1024 * 1024 * 1024; // 1.95 GB per Telegram msg
+
+// ── HTTP chunk size for /upload/chunk requests ────────────────────────────────
+// 16 MB keeps each individual HTTP request short (< 30 s on any connection).
+// Railway's idle timeout is 100 s.  Bytes are flowing during upload so the
+// idle timeout does NOT apply to chunk requests — but keeping chunks small
+// ensures reliable completion even on very slow connections.
+const int _kHttpChunkSize = 16 * 1024 * 1024; // 16 MB per HTTP chunk
+
+// ── Retry / timeout configuration ────────────────────────────────────────────
+const int _kChunkMaxRetries    = 8;  // retries per 16 MB chunk
+const int _kInitMaxRetries     = 5;  // retries for /upload/init
+
+// Polling interval while waiting for server to finish Telegram upload
+const Duration _kPollInterval  = Duration(seconds: 5);
+
+// Maximum time we wait for server to finish sending a Telegram message.
+// ≥ 2 GB files may take 45 min.  We wait 60 min to be safe.
+const Duration _kFinalizeMaxWait = Duration(hours: 1);
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+int _numTelegramChunks(int fileSize) {
+  if (fileSize < _kTelegramLimit) return 1;
+  return (fileSize / _kMaxChunkBytes).ceil();
+}
+
+int _telegramChunkSize(int fileSize) {
+  final n = _numTelegramChunks(fileSize);
+  return (fileSize / n).ceil();
+}
+
+// ── Upload result ─────────────────────────────────────────────────────────────
+class ChunkedUploadResult {
+  final int primaryMessageId;
+  final List<int> allMessageIds;  // empty when NOT chunked across Telegram msgs
+
+  bool get isChunked => allMessageIds.length > 1;
+
+  const ChunkedUploadResult({
+    required this.primaryMessageId,
+    required this.allMessageIds,
+  });
+}
+
+// ── Telegram file info ────────────────────────────────────────────────────────
 class TelegramFile {
   final int messageId;
   final String fileName;
@@ -33,18 +93,18 @@ class TelegramFile {
 
   factory TelegramFile.fromJson(Map<String, dynamic> j) => TelegramFile(
         messageId: j['message_id'] as int,
-        fileName: j['file_name'] as String,
-        fileSize: j['file_size'] as int,
-        mimeType: j['mime_type'] as String? ?? 'application/octet-stream',
-        date: DateTime.parse(j['date'] as String),
-        caption: j['caption'] as String? ?? '',
+        fileName:  j['file_name']  as String,
+        fileSize:  j['file_size']  as int,
+        mimeType:  j['mime_type']  as String? ?? 'application/octet-stream',
+        date:      DateTime.parse(j['date'] as String),
+        caption:   j['caption']    as String? ?? '',
       );
 }
 
-// ── Folder metadata (stored as LIMITLESS_FOLDER:<json> text in Saved Messages) ─
+// ── Folder metadata ───────────────────────────────────────────────────────────
 class TelegramFolderMeta {
-  final int metaMessageId; // Telegram msg ID of THIS metadata text message
-  final String id;         // Our internal folder UUID
+  final int metaMessageId;
+  final String id;
   final String name;
   final String? parentId;
   final String path;
@@ -62,35 +122,43 @@ class TelegramFolderMeta {
   factory TelegramFolderMeta.fromJson(int msgId, Map<String, dynamic> j) =>
       TelegramFolderMeta(
         metaMessageId: msgId,
-        id: j['id'] as String,
-        name: j['name'] as String,
+        id:       j['id']       as String,
+        name:     j['name']     as String,
         parentId: j['parentId'] as String?,
-        path: j['path'] as String,
-        color: j['color'] as String? ?? '#4F8CFF',
+        path:     j['path']     as String,
+        color:    j['color']    as String? ?? '#4F8CFF',
       );
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'name': name,
+        'id':       id,
+        'name':     name,
         'parentId': parentId,
-        'path': path,
-        'color': color,
+        'path':     path,
+        'color':    color,
       };
 }
 
-// ── Caption encoding constants ────────────────────────────────────────────────
-const _folderPrefix = 'LIMITLESS_FOLDER:';
+// ── Caption constants ─────────────────────────────────────────────────────────
+const _folderPrefix   = 'LIMITLESS_FOLDER:';
 const _fileMetaPrefix = 'LIMITLESS_FILE:';
 
-// ── Service ───────────────────────────────────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+//  TelegramStorageService
+// ─────────────────────────────────────────────────────────────────────────────
 class TelegramStorageService {
   final TelegramAuthService _auth;
   final String _base = AppConstants.backendBaseUrl;
 
   TelegramStorageService(this._auth);
 
-  // ── Private helpers ────────────────────────────────────────────────────────
+  // ── Dio (chunk uploads only) ──────────────────────────────────────────────
+  late final Dio _dio = Dio(BaseOptions(
+    connectTimeout: const Duration(seconds: 30),
+    sendTimeout:    Duration.zero,  // individual chunk calls set their own
+    receiveTimeout: const Duration(minutes: 2),
+  ));
+
+  // ── Private helpers ───────────────────────────────────────────────────────
 
   Future<String> get _session => _auth.getSession();
 
@@ -102,10 +170,7 @@ class TelegramStorageService {
       ...?params,
     });
     final resp = await http.get(uri).timeout(const Duration(seconds: 60));
-    if (resp.statusCode >= 400) {
-      final err = jsonDecode(resp.body)['detail'] ?? 'Error ${resp.statusCode}';
-      throw Exception(err);
-    }
+    if (resp.statusCode >= 400) throw Exception(_parseError(resp.body, resp.statusCode));
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
@@ -114,16 +179,11 @@ class TelegramStorageService {
     final session = await _session;
     final uri = Uri.parse('$_base$path');
     final resp = await http
-        .delete(
-          uri,
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({...body, 'session_string': session}),
-        )
+        .delete(uri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({...body, 'session_string': session}))
         .timeout(const Duration(seconds: 30));
-    if (resp.statusCode >= 400) {
-      final err = jsonDecode(resp.body)['detail'] ?? 'Error ${resp.statusCode}';
-      throw Exception(err);
-    }
+    if (resp.statusCode >= 400) throw Exception(_parseError(resp.body, resp.statusCode));
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
@@ -136,31 +196,28 @@ class TelegramStorageService {
       ..fields.addAll(fields);
     final streamed = await request.send().timeout(const Duration(seconds: 30));
     final resp = await http.Response.fromStream(streamed);
-    if (resp.statusCode >= 400) {
-      final err = jsonDecode(resp.body)['detail'] ?? 'Error ${resp.statusCode}';
-      throw Exception(err);
-    }
+    if (resp.statusCode >= 400) throw Exception(_parseError(resp.body, resp.statusCode));
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
-  // ── File Caption Encoding ──────────────────────────────────────────────────
+  static String _parseError(String body, int statusCode) {
+    try {
+      return (jsonDecode(body) as Map<String, dynamic>)['detail'] as String? ??
+          'HTTP $statusCode';
+    } catch (_) {
+      return 'HTTP $statusCode';
+    }
+  }
 
-  /// Encode folder membership into the file caption so it can be restored
-  /// on sync after reinstall.  Format: LIMITLESS_FILE:{"n":"x","fi":"id","fp":"/path"}
+  // ── Caption helpers ───────────────────────────────────────────────────────
+
   static String buildFileCaption({
     required String fileName,
     String? folderId,
     String folderPath = '/',
-  }) {
-    return '$_fileMetaPrefix${jsonEncode({
-      'n': fileName,
-      'fi': folderId,
-      'fp': folderPath,
-    })}';
-  }
+  }) =>
+      '$_fileMetaPrefix${jsonEncode({'n': fileName, 'fi': folderId, 'fp': folderPath})}';
 
-  /// Parse encoded folder info from a file's Telegram caption.
-  /// Returns null if caption was not written by Limitless Cloud.
   static Map<String, dynamic>? parseFileCaption(String caption) {
     if (!caption.startsWith(_fileMetaPrefix)) return null;
     try {
@@ -171,153 +228,551 @@ class TelegramStorageService {
     }
   }
 
-  // ── File Operations ────────────────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+  //  PUBLIC UPLOAD API  (unchanged signature — drive_provider needs no edits)
+  // ══════════════════════════════════════════════════════════════════════════
 
-  /// Upload [file] to Telegram Saved Messages.
-  /// [folderId] / [folderPath] are encoded in the caption for later sync.
-  /// Returns the Telegram message_id.
+  /// Upload [file] using the resumable 4-step protocol.
+  ///
+  /// Files < 2 GB  → 1 Telegram message
+  /// Files ≥ 2 GB  → N Telegram messages of ≤ 1.95 GB each
+  ///
+  /// Either way the user downloads the result as a SINGLE file.
+  Future<ChunkedUploadResult> uploadFileChunked(
+    File file, {
+    ProgressCallback? onProgress,
+    String? folderId,
+    String folderPath = '/',
+    int maxRetries = _kChunkMaxRetries,
+  }) async {
+    final session  = await _session;
+    final fileName = p.basename(file.path);
+    final mimeType = lookupMimeType(file.path) ?? 'application/octet-stream';
+    final fileSize = await file.length();
+
+    onProgress?.call(0.0);
+
+    final numTgChunks = _numTelegramChunks(fileSize);
+
+    if (numTgChunks == 1) {
+      // ── Single Telegram message (file < 2 GB) ─────────────────────────────
+      final caption = buildFileCaption(
+        fileName:   fileName,
+        folderId:   folderId,
+        folderPath: folderPath,
+      );
+      final msgId = await _resumableUpload(
+        file:       file,
+        byteOffset: 0,
+        byteLength: fileSize,
+        fileName:   fileName,
+        mimeType:   mimeType,
+        caption:    caption,
+        session:    session,
+        onProgress: (p) => onProgress?.call(p.clamp(0.0, 1.0)),
+        maxRetries: maxRetries,
+      );
+      onProgress?.call(1.0);
+      return ChunkedUploadResult(primaryMessageId: msgId, allMessageIds: []);
+    } else {
+      // ── Multiple Telegram messages (file ≥ 2 GB) ──────────────────────────
+      final tgChunkSize = _telegramChunkSize(fileSize);
+      final chunkMsgIds = <int>[];
+
+      for (int i = 0; i < numTgChunks; i++) {
+        final offset   = i * tgChunkSize;
+        final chunkLen = min(tgChunkSize, fileSize - offset);
+
+        final String chunkCaption = i == 0
+            ? buildFileCaption(
+                fileName:   fileName,
+                folderId:   folderId,
+                folderPath: folderPath,
+              )
+            : 'LIMITLESS_CHUNK:${jsonEncode({'n': fileName, 'i': i, 'fi': folderId, 'fp': folderPath})}';
+
+        final chunkMsgId = await _resumableUpload(
+          file:       file,
+          byteOffset: offset,
+          byteLength: chunkLen,
+          fileName:   '$fileName.part${i + 1}of$numTgChunks',
+          mimeType:   mimeType,
+          caption:    chunkCaption,
+          session:    session,
+          onProgress: (p) {
+            final overall = (i + p) / numTgChunks;
+            onProgress?.call(overall.clamp(0.0, 1.0));
+          },
+          maxRetries: maxRetries,
+        );
+        chunkMsgIds.add(chunkMsgId);
+      }
+
+      onProgress?.call(1.0);
+      return ChunkedUploadResult(
+        primaryMessageId: chunkMsgIds.first,
+        allMessageIds:    chunkMsgIds,
+      );
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  RESUMABLE UPLOAD — 4 steps per Telegram message
+  // ══════════════════════════════════════════════════════════════════════════
+  //
+  //  Step 1  POST /upload/init       → get upload_id
+  //  Step 2  POST /upload/chunk × N  → upload 16 MB slices (retried per slice)
+  //  Step 3  POST /upload/finalize   → trigger background Telegram send (instant)
+  //  Step 4  GET  /upload/status/{}  → poll every 5 s until done
+  //
+  //  Progress reporting:
+  //    0.00 → 0.90  during chunk uploads   (smooth, byte-accurate)
+  //    0.90 → 0.99  during server→Telegram transfer (pulsed 0.5 s increments)
+  //    1.00          when server confirms 'done'
+  //
+  // ══════════════════════════════════════════════════════════════════════════
+
+  Future<int> _resumableUpload({
+    required File file,
+    required int byteOffset,
+    required int byteLength,
+    required String fileName,
+    required String mimeType,
+    required String caption,
+    required String session,
+    required ProgressCallback onProgress,
+    required int maxRetries,
+  }) async {
+    // ── Step 1: init ──────────────────────────────────────────────────────────
+    final totalHttpChunks = max(1, (byteLength / _kHttpChunkSize).ceil());
+
+    final uploadId = await _uploadInit(
+      session:      session,
+      filename:     fileName,
+      totalSize:    byteLength,
+      totalChunks:  totalHttpChunks,
+      mimeType:     mimeType,
+      maxRetries:   _kInitMaxRetries,
+    );
+
+    // ── Step 2: upload HTTP chunks ────────────────────────────────────────────
+    // Progress 0.0 → 0.90 during this phase
+    final raf = await file.open(mode: FileMode.read);
+    try {
+      for (int ci = 0; ci < totalHttpChunks; ci++) {
+        final chunkStart = byteOffset + ci * _kHttpChunkSize;
+        final chunkLen   = min(_kHttpChunkSize, byteLength - ci * _kHttpChunkSize);
+
+        await raf.setPosition(chunkStart);
+        final bytes = await raf.read(chunkLen);
+
+        await _uploadChunkWithRetry(
+          uploadId:   uploadId,
+          chunkIndex: ci,
+          data:       bytes,
+          maxRetries: maxRetries,
+        );
+
+        // Map chunk progress to 0.0–0.90
+        final rawProgress = (ci + 1) / totalHttpChunks;
+        onProgress((rawProgress * 0.90).clamp(0.0, 0.90));
+      }
+    } finally {
+      await raf.close();
+    }
+
+    // ── Step 3: finalize (returns instantly) ─────────────────────────────────
+    onProgress(0.91);
+    await _uploadFinalizeRequest(
+      uploadId:  uploadId,
+      session:   session,
+      caption:   caption,
+    );
+
+    // ── Step 4: poll until Telegram confirms receipt ──────────────────────────
+    // Progress 0.91 → 0.99 during polling (visual pulse so user knows it's live)
+    return await _pollUntilDone(
+      uploadId:  uploadId,
+      onProgress: onProgress,
+    );
+  }
+
+  // ── Init ──────────────────────────────────────────────────────────────────
+
+  Future<String> _uploadInit({
+    required String session,
+    required String filename,
+    required int totalSize,
+    required int totalChunks,
+    required String mimeType,
+    required int maxRetries,
+  }) async {
+    final uri = Uri.parse('$_base/upload/init');
+    Exception? last;
+
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        final req = http.MultipartRequest('POST', uri)
+          ..fields['session_string'] = session
+          ..fields['filename']       = filename
+          ..fields['total_size']     = totalSize.toString()
+          ..fields['total_chunks']   = totalChunks.toString()
+          ..fields['mime_type']      = mimeType;
+
+        final streamed = await req.send().timeout(const Duration(seconds: 30));
+        final resp     = await http.Response.fromStream(streamed);
+
+        if (resp.statusCode >= 400) {
+          final msg = _parseError(resp.body, resp.statusCode);
+          // 4xx → not retryable (bad session, bad params)
+          throw Exception(msg);
+        }
+
+        return (jsonDecode(resp.body) as Map<String, dynamic>)['upload_id'] as String;
+      } catch (e) {
+        last = e is Exception ? e : Exception(e.toString());
+        if (attempt < maxRetries) await Future.delayed(_backoff(attempt));
+      }
+    }
+    throw last!;
+  }
+
+  // ── Chunk upload ──────────────────────────────────────────────────────────
+
+  Future<void> _uploadChunkWithRetry({
+    required String   uploadId,
+    required int      chunkIndex,
+    required Uint8List data,
+    required int      maxRetries,
+  }) async {
+    Exception? last;
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        await _uploadChunkOnce(
+          uploadId:   uploadId,
+          chunkIndex: chunkIndex,
+          data:       data,
+        );
+        return;
+      } on DioException catch (e) {
+        final code = e.response?.statusCode ?? 0;
+        // 4xx = client error, do not retry
+        if (code >= 400 && code < 500) {
+          throw Exception(
+            'Chunk $chunkIndex rejected by server (HTTP $code): '
+            '${e.response?.data?['detail'] ?? e.message}',
+          );
+        }
+        last = Exception('Chunk $chunkIndex network error (attempt $attempt): ${e.message}');
+        if (attempt < maxRetries) await Future.delayed(_backoff(attempt));
+      } catch (e) {
+        last = e is Exception ? e : Exception(e.toString());
+        if (attempt < maxRetries) await Future.delayed(_backoff(attempt));
+      }
+    }
+    throw last!;
+  }
+
+  Future<void> _uploadChunkOnce({
+    required String    uploadId,
+    required int       chunkIndex,
+    required Uint8List data,
+  }) async {
+    final formData = FormData.fromMap({
+      'upload_id':   uploadId,
+      'chunk_index': chunkIndex.toString(),
+      'chunk_data':  MultipartFile.fromBytes(
+        data,
+        filename: 'chunk_$chunkIndex',
+        contentType: MediaType('application', 'octet-stream'),
+      ),
+    });
+
+    final response = await _dio.post<Map<String, dynamic>>(
+      '$_base/upload/chunk',
+      data: formData,
+      options: Options(
+        // Each 16 MB chunk at 0.5 Mbps = ~256 s.
+        // Give 5 minutes to handle even very slow connections.
+        sendTimeout:    const Duration(minutes: 5),
+        receiveTimeout: const Duration(minutes: 2),
+        responseType: ResponseType.json,
+      ),
+    );
+
+    if ((response.statusCode ?? 0) >= 400) {
+      throw Exception(
+        response.data?['detail'] as String? ?? 'Chunk $chunkIndex upload failed',
+      );
+    }
+  }
+
+  // ── Finalize (fire-and-forget request) ────────────────────────────────────
+
+  Future<void> _uploadFinalizeRequest({
+    required String uploadId,
+    required String session,
+    required String caption,
+  }) async {
+    final uri = Uri.parse('$_base/upload/finalize');
+    Exception? last;
+
+    // Finalize just triggers the background task — returns in < 1 s.
+    // No retry limit needed because the server is idempotent on re-calls.
+    for (int attempt = 1; attempt <= 5; attempt++) {
+      try {
+        final req = http.MultipartRequest('POST', uri)
+          ..fields['upload_id']      = uploadId
+          ..fields['session_string'] = session
+          ..fields['caption']        = caption;
+
+        final streamed = await req.send().timeout(const Duration(seconds: 30));
+        final resp     = await http.Response.fromStream(streamed);
+
+        if (resp.statusCode >= 400) {
+          final msg = _parseError(resp.body, resp.statusCode);
+          throw Exception(msg);
+        }
+        return; // success
+      } catch (e) {
+        last = e is Exception ? e : Exception(e.toString());
+        if (attempt < 5) await Future.delayed(_backoff(attempt));
+      }
+    }
+    throw last!;
+  }
+
+  // ── Poll until done ───────────────────────────────────────────────────────
+
+  /// Polls GET /upload/status/{uploadId} every 5 s until the background
+  /// Telegram upload is done.  Progress is held at 0.91→0.99 during this
+  /// phase so the user sees that work is still happening.
+  ///
+  /// Returns the Telegram message_id when status == "done".
+  /// Throws if status == "error" or timeout exceeds [_kFinalizeMaxWait].
+  Future<int> _pollUntilDone({
+    required String          uploadId,
+    required ProgressCallback onProgress,
+  }) async {
+    final uri      = Uri.parse('$_base/upload/status/$uploadId');
+    final deadline = DateTime.now().add(_kFinalizeMaxWait);
+    int   ticks    = 0;
+
+    while (DateTime.now().isBefore(deadline)) {
+      await Future.delayed(_kPollInterval);
+      ticks++;
+
+      // Pulse progress 0.91 → 0.99 so the user sees ongoing activity
+      final pulse = 0.91 + (ticks % 8) * 0.01;
+      onProgress(pulse.clamp(0.91, 0.99));
+
+      try {
+        final resp = await http.get(uri).timeout(const Duration(seconds: 10));
+
+        if (resp.statusCode == 404) {
+          // Session cleaned up — should not happen within TTL, but handle gracefully
+          throw Exception('Upload session expired on server. Please retry the upload.');
+        }
+
+        if (resp.statusCode >= 400) {
+          throw Exception(_parseError(resp.body, resp.statusCode));
+        }
+
+        final body   = jsonDecode(resp.body) as Map<String, dynamic>;
+        final status = body['status'] as String;
+
+        if (status == 'done') {
+          final messageId = body['message_id'];
+          if (messageId == null) {
+            throw Exception('Server returned done but no message_id.');
+          }
+          onProgress(1.0);
+          return messageId as int;
+        }
+
+        if (status == 'error') {
+          final errMsg = body['error'] as String? ?? 'Unknown server error during upload.';
+          throw Exception(errMsg);
+        }
+
+        // status == 'finalizing' → keep polling
+      } catch (e) {
+        // Re-throw only real errors; transient network hiccups during polling
+        // should not abort the upload — the server is still working.
+        if (e.toString().contains('Upload session expired') ||
+            e.toString().contains('Unknown server error') ||
+            e.toString().contains('message_id')) {
+          rethrow;
+        }
+        // Network glitch — continue polling
+      }
+    }
+
+    throw Exception(
+      'Upload timed out after ${_kFinalizeMaxWait.inMinutes} minutes. '
+      'The server may still be uploading — check your file list.',
+    );
+  }
+
+  // ── Exponential back-off helper ───────────────────────────────────────────
+
+  static Duration _backoff(int attempt) {
+    final seconds = min(60, 1 << attempt); // 2, 4, 8, 16, 32, 60 s
+    return Duration(seconds: seconds);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  LEGACY WRAPPER  (keeps DriveProvider call-sites unchanged)
+  // ══════════════════════════════════════════════════════════════════════════
+
   Future<int> uploadFile(
     File file, {
     ProgressCallback? onProgress,
     String? folderId,
     String folderPath = '/',
   }) async {
-    final session = await _session;
-    final fileName = p.basename(file.path);
-    final mimeType =
-        lookupMimeType(file.path) ?? 'application/octet-stream';
-    final fileBytes = await file.readAsBytes();
-
-    onProgress?.call(0.05);
-
-    final caption = buildFileCaption(
-      fileName: fileName,
-      folderId: folderId,
+    final result = await uploadFileChunked(
+      file,
+      onProgress: onProgress,
+      folderId:   folderId,
       folderPath: folderPath,
     );
-
-    final uri = Uri.parse('$_base/files/upload');
-    final request = http.MultipartRequest('POST', uri)
-      ..fields['session_string'] = session
-      ..fields['caption'] = caption
-      ..files.add(http.MultipartFile.fromBytes(
-        'file',
-        fileBytes,
-        filename: fileName,
-        contentType: MediaType.parse(mimeType),
-      ));
-
-    onProgress?.call(0.2);
-
-    final streamed =
-        await request.send().timeout(const Duration(minutes: 10));
-
-    onProgress?.call(0.9);
-
-    final resp = await http.Response.fromStream(streamed);
-    if (resp.statusCode >= 400) {
-      final err = jsonDecode(resp.body)['detail'] ?? 'Upload failed';
-      throw Exception(err);
-    }
-
-    final data = jsonDecode(resp.body) as Map<String, dynamic>;
-    onProgress?.call(1.0);
-    return data['message_id'] as int;
+    return result.primaryMessageId;
   }
 
-  /// List all document files stored in Saved Messages.
+  // ══════════════════════════════════════════════════════════════════════════
+  //  LIST / DOWNLOAD / DELETE
+  // ══════════════════════════════════════════════════════════════════════════
+
   Future<List<TelegramFile>> listFiles() async {
     final data = await _get('/files/list');
-    final raw = data['files'] as List<dynamic>;
-    return raw.cast<Map<String, dynamic>>().map(TelegramFile.fromJson).toList();
+    return (data['files'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .map(TelegramFile.fromJson)
+        .toList();
   }
 
-  /// Download a file by its message_id to app documents directory.
+  /// Download a single-message file (< 2 GB), streamed to local filesystem.
   Future<File> downloadFile(int messageId, String fileName) async {
-    final session = await _session;
-    final uri = Uri.parse('$_base/files/download/$messageId')
+    final session   = await _session;
+    final uri       = Uri.parse('$_base/files/download/$messageId')
         .replace(queryParameters: {'session_string': session});
-
-    final resp = await http.get(uri).timeout(const Duration(minutes: 10));
-    if (resp.statusCode >= 400) {
-      final err = jsonDecode(resp.body)['detail'] ?? 'Download failed';
-      throw Exception(err);
-    }
-
-    final dir = await getApplicationDocumentsDirectory();
+    final dir       = await getApplicationDocumentsDirectory();
     final localFile = File('${dir.path}/$fileName');
-    await localFile.writeAsBytes(resp.bodyBytes);
+
+    final client = http.Client();
+    final sink   = localFile.openWrite();
+    try {
+      final request  = http.Request('GET', uri);
+      final response = await client.send(request);
+      if (response.statusCode >= 400) {
+        final body = await response.stream.bytesToString();
+        throw Exception(_parseError(body, response.statusCode));
+      }
+      await response.stream.pipe(sink);
+    } finally {
+      client.close();
+      await sink.flush();
+      await sink.close();
+    }
     return localFile;
   }
 
-  /// [Cloud-to-Cloud] Fetch [url] server-side and upload it straight to
-  /// the user's Telegram Saved Messages — the phone never downloads any bytes.
-  /// Returns the Telegram message_id on success.
-  Future<int> uploadFileFromUrl(String url, {String caption = ''}) async {
+  /// Download a file that was uploaded as multiple Telegram messages (≥ 2 GB).
+  ///
+  /// The server streams all Telegram messages as ONE contiguous byte stream.
+  /// The user receives a single complete file — no reassembly needed on device.
+  Future<File> downloadChunkedFile(
+    List<int> chunkMessageIds,
+    String fileName, {
+    ProgressCallback? onProgress,
+  }) async {
     final session = await _session;
-    final uri = Uri.parse('$_base/files/upload-from-url');
-    final body = jsonEncode({
+    final uri     = Uri.parse('$_base/files/download-chunked');
+    final body    = jsonEncode({
       'session_string': session,
-      'url': url,
-      'caption': caption,
+      'message_ids':    chunkMessageIds,
     });
-    final resp = await http
-        .post(uri,
-            headers: {'Content-Type': 'application/json'}, body: body)
-        .timeout(const Duration(minutes: 60)); // large files can take time
-    if (resp.statusCode >= 400) {
-      final err =
-          (jsonDecode(resp.body) as Map<String, dynamic>)['detail'] ??
-              'Upload failed (${resp.statusCode})';
-      throw Exception(err);
+    final dir     = await getApplicationDocumentsDirectory();
+    final outFile = File('${dir.path}/$fileName');
+    final sink    = outFile.openWrite();
+    final client  = http.Client();
+    try {
+      final request = http.Request('POST', uri)
+        ..headers['Content-Type'] = 'application/json'
+        ..body = body;
+      final response = await client.send(request);
+      if (response.statusCode >= 400) {
+        final b = await response.stream.bytesToString();
+        throw Exception(_parseError(b, response.statusCode));
+      }
+      int received  = 0;
+      final cLength = response.contentLength ?? 0;
+      await for (final chunk in response.stream) {
+        sink.add(chunk);
+        received += chunk.length;
+        if (cLength > 0) {
+          onProgress?.call((received / cLength).clamp(0.0, 1.0));
+        }
+      }
+    } finally {
+      client.close();
+      await sink.flush();
+      await sink.close();
     }
-    final data = jsonDecode(resp.body) as Map<String, dynamic>;
-    return data['message_id'] as int;
+    onProgress?.call(1.0);
+    return outFile;
   }
 
-  /// Delete a file from Saved Messages by its message_id.
+  /// Cloud-to-cloud: server downloads [url] and pushes straight to Telegram.
+  Future<int> uploadFileFromUrl(String url, {String caption = ''}) async {
+    final session = await _session;
+    final uri     = Uri.parse('$_base/files/upload-from-url');
+    final body    = jsonEncode({'session_string': session, 'url': url, 'caption': caption});
+    final resp    = await http
+        .post(uri, headers: {'Content-Type': 'application/json'}, body: body)
+        .timeout(const Duration(minutes: 60));
+    if (resp.statusCode >= 400) throw Exception(_parseError(resp.body, resp.statusCode));
+    return (jsonDecode(resp.body) as Map<String, dynamic>)['message_id'] as int;
+  }
+
   Future<void> deleteFile(int messageId) async {
     await _delete('/files/$messageId', {'message_id': messageId});
   }
 
-  /// Get metadata for a single file without downloading it.
-  Future<TelegramFile> getFileInfo(int messageId) async {
-    final data = await _get('/files/info/$messageId');
-    return TelegramFile.fromJson(data);
+  Future<void> deleteChunkedFile(List<int> chunkMessageIds) async {
+    for (final msgId in chunkMessageIds) {
+      try { await deleteFile(msgId); } catch (_) {}
+    }
   }
 
-  // ── Folder Metadata (persisted to Telegram as LIMITLESS_FOLDER: text msgs) ─
+  Future<TelegramFile> getFileInfo(int messageId) async {
+    return TelegramFile.fromJson(await _get('/files/info/$messageId'));
+  }
 
-  /// Persist a folder's metadata to Telegram Saved Messages.
-  /// Returns the Telegram message_id of the metadata text message.
+  // ── Folder metadata ────────────────────────────────────────────────────────
+
   Future<int> saveFolderMeta(TelegramFolderMeta meta) async {
     final payload = '$_folderPrefix${jsonEncode(meta.toJson())}';
-    final data = await _postMultipart('/meta/save', {'data': payload});
-    return data['message_id'] as int;
+    return (await _postMultipart('/meta/save', {'data': payload}))['message_id'] as int;
   }
 
-  /// Delete a folder's metadata message from Telegram.
-  /// Call this when a folder is permanently deleted.
   Future<void> deleteFolderMeta(int metaMessageId) async {
     await _delete('/meta/$metaMessageId', {'message_id': metaMessageId});
   }
 
-  /// Fetch all LIMITLESS_FOLDER: metadata messages from Saved Messages.
   Future<List<TelegramFolderMeta>> listFolderMeta() async {
-    final data = await _get('/meta/list', {'prefix': _folderPrefix});
+    final data  = await _get('/meta/list', {'prefix': _folderPrefix});
     final items = (data['metadata'] as List<dynamic>).cast<Map<String, dynamic>>();
     final result = <TelegramFolderMeta>[];
     for (final item in items) {
-      final text = item['text'] as String;
+      final text  = item['text']       as String;
       final msgId = item['message_id'] as int;
       if (!text.startsWith(_folderPrefix)) continue;
       try {
-        final json = jsonDecode(text.substring(_folderPrefix.length))
-            as Map<String, dynamic>;
+        final json = jsonDecode(text.substring(_folderPrefix.length)) as Map<String, dynamic>;
         result.add(TelegramFolderMeta.fromJson(msgId, json));
-      } catch (_) {
-        // Skip malformed entries
-      }
+      } catch (_) {}
     }
     return result;
   }

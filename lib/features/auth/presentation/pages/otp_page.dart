@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../../../../core/constants/app_routes.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../data/telegram_auth_service.dart';
@@ -283,22 +284,68 @@ class _OtpPageState extends ConsumerState<OtpPage> {
                   borderRadius: BorderRadius.circular(14),
                   border: Border.all(color: const Color(0xFF229ED9).withValues(alpha:0.3)),
                 ),
-                child: Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Icon(Icons.info_outline, color: Color(0xFF229ED9), size: 20),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Text(
-                        'Open your Telegram app → check messages from "Telegram" to find your code.',
-                        style: AppTheme.bodyMedium.copyWith(
-                          color: const Color(0xFF229ED9).withValues(alpha:0.9),
-                          height: 1.5,
+                    Row(
+                      children: [
+                        const Icon(Icons.info_outline, color: Color(0xFF229ED9), size: 20),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            'Code sent to your Telegram app',
+                            style: AppTheme.bodyMedium.copyWith(
+                              color: const Color(0xFF229ED9),
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Open Telegram → look for a message from "Telegram" with your login code. If Telegram is closed, the notification may not appear until you open the app.',
+                      style: AppTheme.bodyMedium.copyWith(
+                        color: const Color(0xFF229ED9).withValues(alpha:0.85),
+                        height: 1.5,
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: () async {
+                          // Try to deep-link into Telegram app
+                          final uri = Uri.parse('tg://');
+                          if (await canLaunchUrl(uri)) {
+                            await launchUrl(uri, mode: LaunchMode.externalApplication);
+                          } else {
+                            // Fallback: open Telegram on Play Store / App Store
+                            await launchUrl(
+                              Uri.parse('https://t.me'),
+                              mode: LaunchMode.externalApplication,
+                            );
+                          }
+                        },
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: const Color(0xFF229ED9),
+                          side: const BorderSide(color: Color(0xFF229ED9)),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          padding: const EdgeInsets.symmetric(vertical: 10),
+                        ),
+                        icon: const Icon(Icons.open_in_new_rounded, size: 18),
+                        label: const Text(
+                          'Open Telegram',
+                          style: TextStyle(fontWeight: FontWeight.w600),
                         ),
                       ),
                     ),
                   ],
                 ),
               ).animate().fadeIn(delay: 700.ms),
+
             ],
           ),
         ),

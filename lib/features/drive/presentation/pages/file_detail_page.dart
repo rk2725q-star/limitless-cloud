@@ -9,6 +9,7 @@ import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
 import '../../../../core/utils/date_utils.dart';
 import '../../data/models/cloud_file.dart';
+import '../../data/models/cloud_folder.dart';
 import '../../data/telegram_storage_service.dart';
 import '../../../auth/data/telegram_auth_service.dart';
 import '../providers/drive_provider.dart';
@@ -201,7 +202,7 @@ class _FileDetailPageState extends ConsumerState<FileDetailPage> {
 
           const SizedBox(height: 28),
 
-          // ── Secondary actions ──────────────────────────────────────────────
+          // ── Secondary actions ───────────────────────────────────────────────
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
@@ -214,13 +215,125 @@ class _FileDetailPageState extends ConsumerState<FileDetailPage> {
                 color: AppTheme.warning,
                 onTap: () => ref.read(driveProvider.notifier).toggleStar(_file),
               ),
-              _Chip(icon: Icons.delete_outline_rounded, label: 'Delete',
-                  color: AppTheme.error, onTap: () {
-                ref.read(driveProvider.notifier).trashFile(_file);
-                Navigator.pop(context);
-              }),
+              _Chip(
+                icon: Icons.drive_file_move_rounded,
+                label: 'Move',
+                color: AppTheme.secondary,
+                onTap: () => _showFolderPicker(mode: 'move'),
+              ),
+              _Chip(
+                icon: Icons.copy_rounded,
+                label: 'Copy',
+                color: AppTheme.accent,
+                onTap: () => _showFolderPicker(mode: 'copy'),
+              ),
+              _Chip(icon: Icons.delete_forever_rounded, label: 'Delete',
+                  color: AppTheme.error, onTap: _confirmDelete),
             ],
           ),
+        ],
+      ),
+    );
+  }
+
+  void _confirmDelete() {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AppTheme.surface,
+        title: const Text('Delete File'),
+        content: Text('Permanently delete "${_file.name}"? This will remove it from Telegram and cannot be undone.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.error),
+            onPressed: () async {
+              Navigator.pop(context);
+              await ref.read(driveProvider.notifier).deleteFile(_file);
+              if (mounted) Navigator.pop(context);
+            },
+            child: const Text('Delete', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showFolderPicker({required String mode}) {
+    final foldersAsync = ref.read(foldersProvider(null));
+    final allFolders = foldersAsync.valueOrNull ?? [];
+    final isMove = mode == 'move';
+
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AppTheme.surface,
+        title: Row(
+          children: [
+            Icon(isMove ? Icons.drive_file_move_rounded : Icons.copy_rounded,
+                color: isMove ? AppTheme.secondary : AppTheme.accent, size: 22),
+            const SizedBox(width: 10),
+            Text(isMove ? 'Move to Folder' : 'Copy to Folder'),
+          ],
+        ),
+        contentPadding: const EdgeInsets.fromLTRB(8, 12, 8, 0),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 300,
+          child: ListView.builder(
+            itemCount: allFolders.length + 1,
+            itemBuilder: (_, i) {
+              final isRoot = i == 0;
+              final f = isRoot
+                  ? CloudFolder(
+                      id: '__root__', name: 'My Drive (Root)',
+                      parentFolderId: null, path: '/', color: '#4F8CFF',
+                      metaMessageId: 0, createdAt: DateTime.now(), updatedAt: DateTime.now())
+                  : allFolders[i - 1];
+              final isCurrent = f.id == (_file.folderId ?? '__root__');
+              return ListTile(
+                leading: Icon(
+                  isRoot ? Icons.cloud_rounded : Icons.folder_rounded,
+                  color: isCurrent ? AppTheme.textHint : const Color(0xFF4F8CFF),
+                ),
+                title: Text(f.name, style: TextStyle(
+                    color: isCurrent ? AppTheme.textHint : AppTheme.textPrimary,
+                    fontWeight: isCurrent ? FontWeight.normal : FontWeight.w500)),
+                subtitle: isCurrent ? const Text('Current location', style: TextStyle(fontSize: 11)) : null,
+                trailing: isCurrent ? null : Icon(
+                  isMove ? Icons.drive_file_move_rounded : Icons.copy_rounded,
+                  color: isMove ? AppTheme.secondary : AppTheme.accent, size: 18,
+                ),
+                enabled: !isCurrent,
+                onTap: isCurrent ? null : () async {
+                  Navigator.pop(context);
+                  final destId = f.id == '__root__' ? null : f.id;
+                  final destPath = f.id == '__root__' ? '/' : f.path;
+                  final dest = CloudFolder(
+                    id: destId ?? '', name: f.name,
+                    parentFolderId: f.parentFolderId, path: destPath,
+                    color: f.color, metaMessageId: f.metaMessageId,
+                    createdAt: f.createdAt, updatedAt: f.updatedAt,
+                  );
+                  if (mode == 'move') {
+                    await ref.read(driveProvider.notifier).moveFile(_file, dest);
+                  } else {
+                    await ref.read(driveProvider.notifier).copyFile(_file, dest);
+                  }
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                      content: Text(mode == 'move' ? 'Moved to ${f.name}' : 'Copied to ${f.name}'),
+                      backgroundColor: mode == 'move' ? AppTheme.secondary : AppTheme.accent,
+                    ));
+                    if (mode == 'move') Navigator.pop(context);
+                  }
+                },
+              );
+            },
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
         ],
       ),
     );

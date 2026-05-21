@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 class CloudFile {
   final String id;
   final String name;
@@ -14,6 +16,12 @@ class CloudFile {
   final DateTime uploadedAt;
   final DateTime updatedAt;
 
+  /// For files split into multiple Telegram messages (>2 GB).
+  /// Empty list means the file is a single message (stored in [telegramMessageId]).
+  final List<int> chunkMessageIds;
+
+  bool get isChunked => chunkMessageIds.isNotEmpty;
+
   CloudFile({
     required this.id,
     required this.name,
@@ -29,6 +37,7 @@ class CloudFile {
     this.isTrashed = false,
     required this.uploadedAt,
     required this.updatedAt,
+    this.chunkMessageIds = const [],
   });
 
   CloudFile copyWith({
@@ -46,6 +55,7 @@ class CloudFile {
     bool? isTrashed,
     DateTime? uploadedAt,
     DateTime? updatedAt,
+    List<int>? chunkMessageIds,
   }) {
     return CloudFile(
       id: id ?? this.id,
@@ -62,6 +72,19 @@ class CloudFile {
       isTrashed: isTrashed ?? this.isTrashed,
       uploadedAt: uploadedAt ?? this.uploadedAt,
       updatedAt: updatedAt ?? this.updatedAt,
+      chunkMessageIds: chunkMessageIds ?? this.chunkMessageIds,
     );
+  }
+
+  /// Encode chunk IDs as JSON string for DB storage
+  String get chunkIdsJson => jsonEncode(chunkMessageIds);
+
+  static List<int> parseChunkIds(String? json) {
+    if (json == null || json.isEmpty) return [];
+    try {
+      return (jsonDecode(json) as List<dynamic>).cast<int>();
+    } catch (_) {
+      return [];
+    }
   }
 }

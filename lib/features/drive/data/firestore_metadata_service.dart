@@ -20,7 +20,7 @@ class _DB {
     final dbPath = p.join(await getDatabasesPath(), 'limitless_cloud.db');
     return openDatabase(
       dbPath,
-      version: 3,
+      version: 5,
       onCreate: (db, version) async {
         await _createTables(db);
       },
@@ -36,6 +36,25 @@ class _DB {
           try {
             await db.execute(
                 'CREATE INDEX IF NOT EXISTS idx_files_mime ON files(userId, mimeType, isTrashed)');
+          } catch (_) {}
+        }
+        if (oldVersion < 4) {
+          // Track permanently deleted folder IDs so sync won't re-import them
+          try {
+            await db.execute('''
+              CREATE TABLE IF NOT EXISTS deleted_folders (
+                id      TEXT NOT NULL,
+                userId  TEXT NOT NULL,
+                PRIMARY KEY (id, userId)
+              )
+            ''');
+          } catch (_) {}
+        }
+        if (oldVersion < 5) {
+          // Add chunkMessageIds column for chunked (>2 GB) file support
+          try {
+            await db.execute(
+                'ALTER TABLE files ADD COLUMN chunkMessageIds TEXT DEFAULT ""');
           } catch (_) {}
         }
       },
@@ -73,8 +92,16 @@ class _DB {
         thumbnailPath      TEXT,
         isStarred          INTEGER DEFAULT 0,
         isTrashed          INTEGER DEFAULT 0,
+        chunkMessageIds    TEXT DEFAULT "",
         uploadedAt         TEXT NOT NULL,
         updatedAt          TEXT NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS deleted_folders (
+        id      TEXT NOT NULL,
+        userId  TEXT NOT NULL,
+        PRIMARY KEY (id, userId)
       )
     ''');
     await db.execute(
@@ -115,6 +142,7 @@ CloudFile _fileFromMap(Map<String, dynamic> m) => CloudFile(
       thumbnailPath: m['thumbnailPath'] as String?,
       isStarred: (m['isStarred'] as int? ?? 0) == 1,
       isTrashed: (m['isTrashed'] as int? ?? 0) == 1,
+      chunkMessageIds: CloudFile.parseChunkIds(m['chunkMessageIds'] as String?),
       uploadedAt: DateTime.parse(m['uploadedAt'] as String),
       updatedAt: DateTime.parse(m['updatedAt'] as String),
     );
@@ -173,8 +201,9 @@ class LocalMetadataService {
   /// sync so stale records from a previous install don't block re-import.
   Future<void> clearUserData(String userId) async {
     final db = await _DB.instance;
-    await db.delete('files',   where: 'userId = ?', whereArgs: [userId]);
-    await db.delete('folders', where: 'userId = ?', whereArgs: [userId]);
+    await db.delete('files',          where: 'userId = ?', whereArgs: [userId]);
+    await db.delete('folders',        where: 'userId = ?', whereArgs: [userId]);
+    await db.delete('deleted_folders', where: 'userId = ?', whereArgs: [userId]);
   }
 
   // ── Folders ────────────────────────────────────────────────────────────────
@@ -365,8 +394,27 @@ class LocalMetadataService {
 
   Future<void> deleteFolder({required String userId, required String folderId}) async {
     final db = await _DB.instance;
-    await db.delete('files', where: 'folderId = ? AND userId = ?', whereArgs: [folderId, userId]);
-    await db.delete('folders', where: 'id = ? AND userId = ?', whereArgs: [folderId, userId]);
+    // Also delete all nested sub-folders recursively using a loop
+    final stack = [folderId];
+    while (stack.isNotEmpty) {
+      final current = stack.removeLast();
+      // Collect child folder IDs
+      final children = await db.query('folders',
+          columns: ['id'],
+          where: 'parentId = ? AND userId = ?',
+          whereArgs: [current, userId]);
+      for (final c in children) { stack.add(c['id'] as String); }
+      // Delete files in this folder
+      await db.delete('files', where: 'folderId = ? AND userId = ?', whereArgs: [current, userId]);
+      // Delete this folder
+      await db.delete('folders', where: 'id = ? AND userId = ?', whereArgs: [current, userId]);
+      // Record as permanently deleted
+      await db.insert(
+        'deleted_folders',
+        {'id': current, 'userId': userId},
+        conflictAlgorithm: ConflictAlgorithm.ignore,
+      );
+    }
   }
 
   // ── Files ──────────────────────────────────────────────────────────────────
@@ -382,6 +430,7 @@ class LocalMetadataService {
     required int sizeBytes,
     required String extension,
     String? thumbnailPath,
+    List<int> chunkMessageIds = const [],
   }) async {
     final db = await _DB.instance;
     final now = DateTime.now().toIso8601String();
@@ -401,6 +450,13 @@ class LocalMetadataService {
       'thumbnailPath': thumbnailPath,
       'isStarred': 0,
       'isTrashed': 0,
+      'chunkMessageIds': CloudFile(
+        id: id, name: name, folderPath: folderPath,
+        telegramMessageId: telegramMessageId, telegramFileId: telegramFileId,
+        sizeBytes: sizeBytes, extension: extension,
+        uploadedAt: DateTime.now(), updatedAt: DateTime.now(),
+        chunkMessageIds: chunkMessageIds,
+      ).chunkIdsJson,
       'uploadedAt': now,
       'updatedAt': now,
     });
@@ -423,6 +479,7 @@ class LocalMetadataService {
       sizeBytes: sizeBytes,
       extension: extension,
       thumbnailPath: thumbnailPath,
+      chunkMessageIds: chunkMessageIds,
       uploadedAt: DateTime.now(),
       updatedAt: DateTime.now(),
     );
@@ -561,6 +618,7 @@ class LocalMetadataService {
         mimeType: sourceFile.mimeType,
         sizeBytes: sourceFile.sizeBytes,
         extension: sourceFile.extension,
+        chunkMessageIds: sourceFile.chunkMessageIds,
       );
 
   Future<void> toggleStar({
@@ -651,6 +709,19 @@ class LocalMetadataService {
     final db = await _DB.instance;
     final rows = await db.query(
       'folders',
+      columns: ['id'],
+      where: 'userId = ?',
+      whereArgs: [userId],
+    );
+    return rows.map((r) => r['id'] as String).toSet();
+  }
+
+  /// Returns folder IDs that were permanently deleted by this user.
+  /// Used during sync to prevent re-importing folders deleted locally.
+  Future<Set<String>> getDeletedFolderIds(String userId) async {
+    final db = await _DB.instance;
+    final rows = await db.query(
+      'deleted_folders',
       columns: ['id'],
       where: 'userId = ?',
       whereArgs: [userId],

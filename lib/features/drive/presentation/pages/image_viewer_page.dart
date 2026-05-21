@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:share_plus/share_plus.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
 import '../../data/models/cloud_file.dart';
@@ -11,10 +12,12 @@ import '../../data/telegram_storage_service.dart';
 import '../providers/drive_provider.dart';
 import '../../../auth/data/telegram_auth_service.dart';
 
-/// Full-screen image viewer.
+/// Full-screen image viewer with swipe navigation.
+/// • Receives 'file', 'allFiles' (optional), 'initialIndex' (optional) in args.
 /// • Single tap: toggle chrome (app-bar / info bar).
 /// • Double tap: zoom 3× at tap point / reset.
-/// • Long press: actions sheet (Save, Star, Share, Delete).
+/// • Swipe horizontally: navigate to previous/next image in gallery.
+/// • Long press / ⋮ button: actions sheet.
 class ImageViewerPage extends ConsumerStatefulWidget {
   final Map<String, dynamic> args;
   const ImageViewerPage({super.key, required this.args});
@@ -25,51 +28,77 @@ class ImageViewerPage extends ConsumerStatefulWidget {
 
 class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
     with SingleTickerProviderStateMixin {
-  CloudFile get _file => widget.args['file'] as CloudFile;
+  late List<CloudFile> _allFiles;
+  late PageController _pageController;
+  late int _currentIndex;
+  CloudFile get _file => _allFiles[_currentIndex];
 
-  File? _localFile;
-  bool _loading = true;
-  bool _error = false;
-  bool _barsVisible = true;
-
-  late TransformationController _transformController;
+  // Per-page zoom/transform
+  final Map<int, TransformationController> _transformControllers = {};
   late AnimationController _doubleTapController;
   Animation<Matrix4>? _doubleTapAnimation;
   TapDownDetails? _doubleTapDetails;
 
+  bool _barsVisible = true;
+
+  // Per-page load state
+  final Map<int, File?> _localFiles = {};
+  final Map<int, bool> _loading = {};
+  final Map<int, bool> _error = {};
+
   @override
   void initState() {
     super.initState();
-    _transformController = TransformationController();
+    final args = widget.args;
+    _allFiles = (args['allFiles'] as List<CloudFile>?)?.toList()
+        ?? [args['file'] as CloudFile];
+    _currentIndex = (args['initialIndex'] as int?) ?? 0;
+    _pageController = PageController(initialPage: _currentIndex);
     _doubleTapController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 300),
     );
-    _loadImage();
+    _loadImage(_currentIndex);
+    // Preload adjacent
+    if (_currentIndex + 1 < _allFiles.length) _loadImage(_currentIndex + 1);
+    if (_currentIndex - 1 >= 0) _loadImage(_currentIndex - 1);
   }
 
   @override
   void dispose() {
-    _transformController.dispose();
+    _pageController.dispose();
     _doubleTapController.dispose();
+    for (final c in _transformControllers.values) {
+      c.dispose();
+    }
     super.dispose();
+  }
+
+  TransformationController _transformFor(int index) {
+    return _transformControllers.putIfAbsent(index, () => TransformationController());
   }
 
   // ── Load image bytes from Telegram ─────────────────────────────────────────
 
-  Future<void> _loadImage() async {
+  Future<void> _loadImage(int index) async {
+    if (_loading[index] == true || _localFiles.containsKey(index)) return;
+    _loading[index] = true;
+    if (mounted) setState(() {});
     try {
       final authService = ref.read(telegramAuthServiceProvider);
       final telegramService = TelegramStorageService(authService);
       final f = await telegramService.downloadFile(
-          _file.telegramMessageId, _file.name);
+          _allFiles[index].telegramMessageId, _allFiles[index].name);
       if (!mounted) return;
-      setState(() {
-        _localFile = f;
-        _loading = false;
-      });
+      _localFiles[index] = f;
+      _loading[index] = false;
+      if (mounted) setState(() {});
     } catch (_) {
-      if (mounted) setState(() { _loading = false; _error = true; });
+      if (mounted) {
+        _loading[index] = false;
+        _error[index] = true;
+        setState(() {});
+      }
     }
   }
 
@@ -79,8 +108,9 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
     _doubleTapDetails = details;
   }
 
-  void _onDoubleTap() {
-    final isZoomedOut = _transformController.value.getMaxScaleOnAxis() < 2.0;
+  void _onDoubleTap(int index) {
+    final ctrl = _transformFor(index);
+    final isZoomedOut = ctrl.value.getMaxScaleOnAxis() < 2.0;
     Matrix4 endMatrix;
     if (isZoomedOut) {
       final pos = _doubleTapDetails?.localPosition ?? Offset.zero;
@@ -91,7 +121,7 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
     }
 
     _doubleTapAnimation = Matrix4Tween(
-      begin: _transformController.value,
+      begin: ctrl.value,
       end: endMatrix,
     ).animate(CurvedAnimation(
       parent: _doubleTapController,
@@ -99,37 +129,39 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
     ));
 
     _doubleTapController.forward(from: 0).then((_) {
-      _transformController.value = endMatrix;
+      ctrl.value = endMatrix;
     });
     _doubleTapAnimation!.addListener(() {
-      _transformController.value = _doubleTapAnimation!.value;
+      ctrl.value = _doubleTapAnimation!.value;
     });
   }
 
   // ── Long-press → actions bottom sheet ─────────────────────────────────────
 
   void _showActions() {
+    final file = _file;
+    final localFile = _localFiles[_currentIndex];
     showModalBottomSheet(
       context: context,
       backgroundColor: AppTheme.surface,
       shape: const RoundedRectangleBorder(
           borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
       builder: (_) => _ImageActionsSheet(
-        file: _file,
-        localFile: _localFile,
+        file: file,
+        localFile: localFile,
         onSave: _saveToDevice,
         onDelete: () {
-          ref.read(driveProvider.notifier).trashFile(_file);
           Navigator.pop(context); // close sheet
-          Navigator.pop(context); // exit viewer
+          _confirmDelete(context, file);
         },
         onStar: () {
-          ref.read(driveProvider.notifier).toggleStar(_file);
+          ref.read(driveProvider.notifier).toggleStar(file);
           Navigator.pop(context);
         },
-        onShare: () async {
+        onShareImage: _shareImageFile,
+        onShareLink: () async {
           Navigator.pop(context);
-          final link = await ref.read(driveProvider.notifier).getShareLink(_file);
+          final link = await ref.read(driveProvider.notifier).getShareLink(file);
           if (mounted && link != null) {
             ScaffoldMessenger.of(context).showSnackBar(SnackBar(
               content: Text('Link: $link'),
@@ -138,6 +170,46 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
           }
         },
         onOpenWith: _openWithNativeApp,
+      ),
+    );
+  }
+
+  void _confirmDelete(BuildContext context, CloudFile file) {
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        backgroundColor: AppTheme.surface,
+        title: const Text('Delete Image'),
+        content: Text('Permanently delete "${file.name}"? This cannot be undone.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogCtx), child: const Text('Cancel')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.error),
+            onPressed: () {
+              Navigator.pop(dialogCtx);
+              // Remove from local list first for snappy UX
+              final deletedIndex = _currentIndex;
+              ref.read(driveProvider.notifier).deleteFile(file);
+              if (_allFiles.length <= 1) {
+                // Last image - exit viewer
+                if (mounted) Navigator.pop(context);
+              } else {
+                // Navigate away from deleted image
+                setState(() {
+                  _allFiles.removeAt(deletedIndex);
+                  _localFiles.remove(deletedIndex);
+                  _loading.remove(deletedIndex);
+                  _error.remove(deletedIndex);
+                  if (_currentIndex >= _allFiles.length) {
+                    _currentIndex = _allFiles.length - 1;
+                  }
+                });
+                _pageController.jumpToPage(_currentIndex);
+              }
+            },
+            child: const Text('Delete', style: TextStyle(color: Colors.white)),
+          ),
+        ],
       ),
     );
   }
@@ -159,11 +231,10 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
       }
       final dir = await _publicDownloadsDir();
       final dest = File('${dir.path}/${_file.name}');
-
-      if (_localFile != null) {
-        await _localFile!.copy(dest.path);
+      final localFile = _localFiles[_currentIndex];
+      if (localFile != null) {
+        await localFile.copy(dest.path);
       } else {
-        // Download first
         final authService = ref.read(telegramAuthServiceProvider);
         final tg = TelegramStorageService(authService);
         final downloaded = await tg.downloadFile(_file.telegramMessageId, _file.name);
@@ -175,16 +246,34 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
     }
   }
 
+  // ── Share image file to other apps ──────────────────────────────────
+
+  Future<void> _shareImageFile() async {
+    Navigator.pop(context); // close actions sheet
+    final localFile = _localFiles[_currentIndex];
+    if (localFile == null) {
+      _showSnack('Image still loading…');
+      return;
+    }
+    try {
+      final xFile = XFile(localFile.path, mimeType: _file.mimeType ?? 'image/*');
+      await Share.shareXFiles([xFile], text: _file.name);
+    } catch (e) {
+      _showSnack('Could not share: $e');
+    }
+  }
+
   Future<void> _openWithNativeApp() async {
     Navigator.pop(context); // close actions sheet
-    if (_localFile == null) {
+    final localFile = _localFiles[_currentIndex];
+    if (localFile == null) {
       _showSnack('Image still loading…');
       return;
     }
     try {
       final tmpDir = await getTemporaryDirectory();
       final tmpFile = File('${tmpDir.path}/${_file.name}');
-      await _localFile!.copy(tmpFile.path);
+      await localFile.copy(tmpFile.path);
       final result = await OpenFilex.open(tmpFile.path, type: _file.mimeType);
       if (result.type == ResultType.noAppToOpen) {
         _showSnack('No app found to open .${_file.extension}');
@@ -239,7 +328,6 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
                 overflow: TextOverflow.ellipsis,
               ),
               actions: [
-                // Three-dot hint for discoverability
                 IconButton(
                   icon: const Icon(Icons.more_vert_rounded),
                   tooltip: 'More options',
@@ -248,28 +336,66 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
               ],
             )
           : null,
-      body: GestureDetector(
-        onTap: () => setState(() => _barsVisible = !_barsVisible),
-        onDoubleTapDown: _onDoubleTapDown,
-        onDoubleTap: _onDoubleTap,
-        onLongPress: _showActions,
-        child: _loading
-            ? const Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    CircularProgressIndicator(color: Colors.white),
-                    SizedBox(height: 16),
-                    Text('Loading image…',
-                        style: TextStyle(color: Colors.white54, fontSize: 13)),
-                  ],
-                ),
-              )
-            : _error
-                ? _buildError()
-                : _buildImageViewer(),
+      body: PageView.builder(
+        controller: _pageController,
+        physics: _transformFor(_currentIndex).value.getMaxScaleOnAxis() > 1.1
+            ? const NeverScrollableScrollPhysics()
+            : const BouncingScrollPhysics(),
+        onPageChanged: (index) {
+          setState(() => _currentIndex = index);
+          // Preload adjacent images
+          if (index + 1 < _allFiles.length) _loadImage(index + 1);
+          if (index - 1 >= 0) _loadImage(index - 1);
+        },
+        itemCount: _allFiles.length,
+        itemBuilder: (_, index) {
+          final isLoading = _loading[index] == true;
+          final hasError = _error[index] == true;
+          final localFile = _localFiles[index];
+
+          return GestureDetector(
+            onTap: () => setState(() => _barsVisible = !_barsVisible),
+            onDoubleTapDown: _onDoubleTapDown,
+            onDoubleTap: () => _onDoubleTap(index),
+            onLongPress: index == _currentIndex ? _showActions : null,
+            child: isLoading
+                ? const Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        CircularProgressIndicator(color: Colors.white),
+                        SizedBox(height: 16),
+                        Text('Loading image…',
+                            style: TextStyle(color: Colors.white54, fontSize: 13)),
+                      ],
+                    ),
+                  )
+                : hasError
+                    ? _buildError(index)
+                    : localFile != null
+                        ? InteractiveViewer(
+                            transformationController: _transformFor(index),
+                            minScale: 0.5,
+                            maxScale: 8.0,
+                            onInteractionUpdate: (_) => setState(() {}),
+                            child: Center(
+                              child: Image.file(
+                                localFile,
+                                fit: BoxFit.contain,
+                                filterQuality: FilterQuality.high,
+                                errorBuilder: (_, __, ___) => const Icon(
+                                  Icons.broken_image_rounded,
+                                  color: Colors.white30,
+                                  size: 80,
+                                ),
+                              ),
+                            ),
+                          )
+                        : const SizedBox.shrink(),
+          );
+        },
       ),
-      bottomNavigationBar: _barsVisible && !_loading && !_error
+      bottomNavigationBar: _barsVisible
           ? Container(
               color: Colors.black87,
               padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
@@ -285,11 +411,18 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
                       style: const TextStyle(color: Colors.white54, fontSize: 12),
                     ),
                   ]),
-                  Text(
-                    'Long press for options',
-                    style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.3), fontSize: 11),
-                  ),
+                  // Page indicator (only shown when multiple images)
+                  if (_allFiles.length > 1)
+                    Text(
+                      '${_currentIndex + 1} / ${_allFiles.length}',
+                      style: const TextStyle(color: Colors.white54, fontSize: 12),
+                    )
+                  else
+                    Text(
+                      'Long press for options',
+                      style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.3), fontSize: 11),
+                    ),
                 ],
               ),
             )
@@ -297,7 +430,7 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
     );
   }
 
-  Widget _buildError() {
+  Widget _buildError(int index) {
     return Center(
       child: Column(mainAxisSize: MainAxisSize.min, children: [
         const Icon(Icons.broken_image_rounded, color: Colors.white30, size: 80),
@@ -307,34 +440,18 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
         const SizedBox(height: 16),
         ElevatedButton.icon(
           onPressed: () {
-            setState(() { _loading = true; _error = false; });
-            _loadImage();
+            setState(() {
+              _loading.remove(index);
+              _error.remove(index);
+              _localFiles.remove(index);
+            });
+            _loadImage(index);
           },
           icon: const Icon(Icons.refresh_rounded),
           label: const Text('Retry'),
           style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primary),
         ),
       ]),
-    );
-  }
-
-  Widget _buildImageViewer() {
-    return InteractiveViewer(
-      transformationController: _transformController,
-      minScale: 0.5,
-      maxScale: 8.0,
-      child: Center(
-        child: Image.file(
-          _localFile!,
-          fit: BoxFit.contain,
-          filterQuality: FilterQuality.high,
-          errorBuilder: (_, __, ___) => const Icon(
-            Icons.broken_image_rounded,
-            color: Colors.white30,
-            size: 80,
-          ),
-        ),
-      ),
     );
   }
 }
@@ -347,7 +464,8 @@ class _ImageActionsSheet extends StatelessWidget {
   final VoidCallback onSave;
   final VoidCallback onDelete;
   final VoidCallback onStar;
-  final VoidCallback onShare;
+  final VoidCallback onShareImage;
+  final VoidCallback onShareLink;
   final VoidCallback onOpenWith;
 
   const _ImageActionsSheet({
@@ -356,7 +474,8 @@ class _ImageActionsSheet extends StatelessWidget {
     required this.onSave,
     required this.onDelete,
     required this.onStar,
-    required this.onShare,
+    required this.onShareImage,
+    required this.onShareLink,
     required this.onOpenWith,
   });
 
@@ -417,13 +536,22 @@ class _ImageActionsSheet extends StatelessWidget {
               onTap: onStar,
             ),
             ListTile(
-              leading: const Icon(Icons.share_rounded, color: AppTheme.textSecondary),
-              title: const Text('Share Link'),
-              onTap: onShare,
+              leading: const Icon(Icons.share_rounded, color: AppTheme.accent),
+              title: const Text('Share'),
+              subtitle: const Text('Send image to other apps',
+                  style: TextStyle(fontSize: 11)),
+              onTap: onShareImage,
             ),
             ListTile(
-              leading: const Icon(Icons.delete_outline_rounded, color: AppTheme.error),
-              title: const Text('Move to Trash',
+              leading: const Icon(Icons.link_rounded, color: AppTheme.textSecondary),
+              title: const Text('Share Link'),
+              subtitle: const Text('Copy Telegram link',
+                  style: TextStyle(fontSize: 11)),
+              onTap: onShareLink,
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_forever_rounded, color: AppTheme.error),
+              title: const Text('Delete Permanently',
                   style: TextStyle(color: AppTheme.error)),
               onTap: onDelete,
             ),
