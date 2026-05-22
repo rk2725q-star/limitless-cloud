@@ -48,6 +48,11 @@ const Duration _kPollInterval  = Duration(seconds: 5);
 // ≥ 2 GB files may take 45 min.  We wait 60 min to be safe.
 const Duration _kFinalizeMaxWait = Duration(hours: 1);
 
+// Maximum outer retries when server reports "error" during finalize polling.
+// Each retry re-calls /upload/finalize (server reuses assembled file on disk).
+// Back-off: 30 s, 60 s, 120 s between retries.
+const int _kFinalizeAutoRetries = 3;
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 int _numTelegramChunks(int fileSize) {
@@ -325,6 +330,10 @@ class TelegramStorageService {
   //  Step 3  POST /upload/finalize   → trigger background Telegram send (instant)
   //  Step 4  GET  /upload/status/{}  → poll every 5 s until done
   //
+  //  v4.1 addition: If polling sees "error", automatically re-calls
+  //  /upload/finalize up to _kFinalizeAutoRetries times.  The server keeps
+  //  all chunk files on disk so no data is re-uploaded.
+  //
   //  Progress reporting:
   //    0.00 → 0.90  during chunk uploads   (smooth, byte-accurate)
   //    0.90 → 0.99  during server→Telegram transfer (pulsed 0.5 s increments)
@@ -391,8 +400,11 @@ class TelegramStorageService {
 
     // ── Step 4: poll until Telegram confirms receipt ──────────────────────────
     // Progress 0.91 → 0.99 during polling (visual pulse so user knows it's live)
+    // v4.1: auto-retries finalize if server reports "error" (no re-upload needed)
     return await _pollUntilDone(
-      uploadId:  uploadId,
+      uploadId:   uploadId,
+      session:    session,
+      caption:    caption,
       onProgress: onProgress,
     );
   }
@@ -440,10 +452,10 @@ class TelegramStorageService {
   // ── Chunk upload ──────────────────────────────────────────────────────────
 
   Future<void> _uploadChunkWithRetry({
-    required String   uploadId,
-    required int      chunkIndex,
+    required String    uploadId,
+    required int       chunkIndex,
     required Uint8List data,
-    required int      maxRetries,
+    required int       maxRetries,
   }) async {
     Exception? last;
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
@@ -518,7 +530,9 @@ class TelegramStorageService {
     Exception? last;
 
     // Finalize just triggers the background task — returns in < 1 s.
-    // No retry limit needed because the server is idempotent on re-calls.
+    // Server is idempotent: accepts "chunks_pending", "finalizing", or "error"
+    // sessions.  Re-calling on "error" re-triggers the background task without
+    // re-uploading any data (server keeps chunk files on disk).
     for (int attempt = 1; attempt <= 5; attempt++) {
       try {
         final req = http.MultipartRequest('POST', uri)
@@ -548,15 +562,25 @@ class TelegramStorageService {
   /// Telegram upload is done.  Progress is held at 0.91→0.99 during this
   /// phase so the user sees that work is still happening.
   ///
+  /// v4.1 FIX: When the server reports "error" status (e.g. FloodWait or
+  /// network drop during send_file), this method automatically re-calls
+  /// POST /upload/finalize up to [_kFinalizeAutoRetries] times before
+  /// surfacing the error to the user.  The server keeps all chunk files on
+  /// disk so no data is re-uploaded — the user sees the progress bar stay
+  /// at 91-99% while retrying, instead of restarting from 91%.
+  ///
   /// Returns the Telegram message_id when status == "done".
-  /// Throws if status == "error" or timeout exceeds [_kFinalizeMaxWait].
+  /// Throws if all retries are exhausted or a hard error occurs.
   Future<int> _pollUntilDone({
-    required String          uploadId,
+    required String           uploadId,
+    required String           session,
+    required String           caption,
     required ProgressCallback onProgress,
   }) async {
-    final uri      = Uri.parse('$_base/upload/status/$uploadId');
-    final deadline = DateTime.now().add(_kFinalizeMaxWait);
-    int   ticks    = 0;
+    final statusUri  = Uri.parse('$_base/upload/status/$uploadId');
+    final deadline   = DateTime.now().add(_kFinalizeMaxWait);
+    int   ticks      = 0;
+    int   autoRetries = 0;  // outer retries when server reports "error"
 
     while (DateTime.now().isBefore(deadline)) {
       await Future.delayed(_kPollInterval);
@@ -567,7 +591,7 @@ class TelegramStorageService {
       onProgress(pulse.clamp(0.91, 0.99));
 
       try {
-        final resp = await http.get(uri).timeout(const Duration(seconds: 10));
+        final resp = await http.get(statusUri).timeout(const Duration(seconds: 10));
 
         if (resp.statusCode == 404) {
           // Session cleaned up — should not happen within TTL, but handle gracefully
@@ -591,20 +615,55 @@ class TelegramStorageService {
         }
 
         if (status == 'error') {
+          // ── Auto-retry finalize (THE CORE FIX) ───────────────────────────
+          //
+          // The server marked "error" because send_file() to Telegram failed
+          // (FloodWait, network drop, etc.).  However all chunk files are
+          // still on disk.  Re-calling /upload/finalize (which now accepts
+          // "error" sessions) re-triggers the background task without any
+          // data re-upload.  The user's progress bar stays at 91-99%.
+          //
+          if (autoRetries < _kFinalizeAutoRetries) {
+            autoRetries++;
+            // Back-off before retry: 30 s, 60 s, 120 s
+            final backoffSecs = 30 * autoRetries;
+            for (int s = 0; s < backoffSecs; s += 5) {
+              await Future.delayed(const Duration(seconds: 5));
+              ticks++;
+              onProgress((0.91 + (ticks % 8) * 0.01).clamp(0.91, 0.99));
+              if (DateTime.now().isAfter(deadline)) break;
+            }
+            // Re-trigger the background task on the server
+            try {
+              await _uploadFinalizeRequest(
+                uploadId: uploadId,
+                session:  session,
+                caption:  caption,
+              );
+            } catch (_) {
+              // If re-finalize itself fails transiently, keep polling —
+              // the server status poll will tell us the true state.
+            }
+            // Continue polling loop — server is finalizing again
+            continue;
+          }
+
+          // All auto-retries exhausted — surface the error to the user
           final errMsg = body['error'] as String? ?? 'Unknown server error during upload.';
-          throw Exception(errMsg);
+          throw Exception('Upload failed after $autoRetries retries: $errMsg');
         }
 
-        // status == 'finalizing' → keep polling
+        // status == 'finalizing' → keep polling (normal path)
       } catch (e) {
-        // Re-throw only real errors; transient network hiccups during polling
-        // should not abort the upload — the server is still working.
-        if (e.toString().contains('Upload session expired') ||
-            e.toString().contains('Unknown server error') ||
-            e.toString().contains('message_id')) {
+        // Re-throw hard errors that indicate we should give up immediately.
+        final msg = e.toString();
+        if (msg.contains('Upload session expired') ||
+            msg.contains('no message_id') ||
+            msg.contains('Upload failed after')) {
           rethrow;
         }
-        // Network glitch — continue polling
+        // Transient network hiccup during polling — continue polling.
+        // The server is still working in the background.
       }
     }
 

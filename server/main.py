@@ -1,20 +1,36 @@
 """
-Limitless Cloud — Telegram Backend Server  (Production Build v4.0)
+Limitless Cloud — Telegram Backend Server  (Production Build v4.1)
 
-── What's new in v4.0 ──────────────────────────────────────────────────────────
+── What's new in v4.1 ──────────────────────────────────────────────────────────
 
-  ASYNC FINALIZE + STATUS POLLING  (critical fix for 30–45 min uploads)
-  ─────────────────────────────────────────────────────────────────────
+  FINALIZE RETRY FIX  (critical fix for 91%→restart upload loop)
+  ────────────────────────────────────────────────────────────────
+  Problem: send_file() to Telegram fails at ~98% with FloodWaitError,
+           network drop, or transient Telegram error.  Previously this
+           marked the session "error" and the client had to restart the
+           ENTIRE upload from 0% — re-uploading gigabytes of data.
+
+  Fix 1:   _finalize_background now retries send_file() up to 5 times
+           with proper FloodWaitError sleep + exponential back-off for
+           other transient errors.  Only hard failures (bad session,
+           file missing) give up immediately.
+
+  Fix 2:   /upload/finalize now accepts sessions in "error" state and
+           re-triggers the background task.  All chunk files are kept on
+           disk until confirmed "done", so a retry costs zero re-upload.
+
+  Fix 3:   Assembled temp file is NOT deleted on error — it is reused by
+           the retry attempt, saving reassembly time for large files.
+
+  ASYNC FINALIZE + STATUS POLLING  (from v4.0)
+  ─────────────────────────────────────────────
   Problem: Railway drops HTTP connections that are idle for > 100 s.
            Uploading a 1.8 GB file to Telegram takes 20–45 minutes.
-           Old /upload/finalize held the HTTP connection open during the
-           entire Telegram send — Railway killed it every time.
 
-  Fix:     /upload/finalize now returns IMMEDIATELY with {status:"finalizing"}.
+  Fix:     /upload/finalize returns IMMEDIATELY with {status:"finalizing"}.
            The actual send_file() runs in a background asyncio Task.
            Flutter polls GET /upload/status/{upload_id} every 5 s until
-           status == "done" (or "error").  Each poll is a tiny request that
-           completes in milliseconds — Railway never sees an idle connection.
+           status == "done" (or "error").
 
   UPLOAD PROTOCOL OVERVIEW
   ────────────────────────
@@ -22,6 +38,7 @@ Limitless Cloud — Telegram Backend Server  (Production Build v4.0)
     POST /upload/chunk  ×N       receive 16 MB slices (pure disk I/O, fast)
     POST /upload/finalize         kick off background Telegram upload, return now
     GET  /upload/status/{id}      Flutter polls until "done"
+    POST /upload/finalize  (again) retry if status == "error" (no re-upload!)
 
   TELEGRAM CHUNKING RULES  (unchanged)
   ─────────────────────────────────────
@@ -99,23 +116,28 @@ META_LIMIT      = 200
 # ── Upload session store ──────────────────────────────────────────────────────
 # Each session:
 # {
-#   "dir":          str              temp directory for chunk files
-#   "filename":     str
-#   "mime_type":    str
-#   "total_size":   int              bytes
-#   "total_chunks": int              number of 16 MB HTTP chunks
-#   "created_at":   float            monotonic timestamp
-#   "received":     set[int]         chunk indices received so far
-#   "status":       str              chunks_pending | finalizing | done | error
-#   "message_id":   int | None       filled when status == done
-#   "error":        str | None       filled when status == error
-#   "done_at":      float | None     monotonic timestamp when done/error
+#   "dir":           str              temp directory for chunk files
+#   "filename":      str
+#   "mime_type":     str
+#   "total_size":    int              bytes
+#   "total_chunks":  int              number of 16 MB HTTP chunks
+#   "created_at":    float            monotonic timestamp
+#   "received":      set[int]         chunk indices received so far
+#   "status":        str              chunks_pending | finalizing | done | error
+#   "message_id":    int | None       filled when status == done
+#   "error":         str | None       filled when status == error
+#   "done_at":       float | None     monotonic timestamp when done/error
+#   "assembled_path":str | None       path to assembled temp file (kept for retry)
+#   "finalize_tries":int              number of finalize attempts so far
 # }
 _upload_sessions: dict[str, dict] = {}
 _sessions_lock = asyncio.Lock()
 
 UPLOAD_SESSION_TTL   = 2 * 60 * 60   # 2 h for in-progress sessions
 DONE_SESSION_TTL     = 15 * 60       # 15 min keep after done/error
+
+# Maximum outer retries Flutter will trigger via re-calling /upload/finalize
+_FINALIZE_INNER_RETRIES = 5   # retries inside _finalize_background for send_file
 
 
 # ── Stale-session cleanup task ────────────────────────────────────────────────
@@ -172,8 +194,8 @@ async def _lifespan(app: FastAPI):
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Limitless Cloud API",
-    description="Telegram-powered cloud storage backend (production v4)",
-    version="4.0.0",
+    description="Telegram-powered cloud storage backend (production v4.1)",
+    version="4.1.0",
     docs_url=None,
     redoc_url=None,
     lifespan=_lifespan,
@@ -430,17 +452,19 @@ async def upload_init(
 
     async with _sessions_lock:
         _upload_sessions[upload_id] = {
-            "dir":          tmp_dir,
-            "filename":     filename,
-            "mime_type":    mime_type,
-            "total_size":   total_size,
-            "total_chunks": total_chunks,
-            "created_at":   time.monotonic(),
-            "received":     set(),
-            "status":       "chunks_pending",
-            "message_id":   None,
-            "error":        None,
-            "done_at":      None,
+            "dir":            tmp_dir,
+            "filename":       filename,
+            "mime_type":      mime_type,
+            "total_size":     total_size,
+            "total_chunks":   total_chunks,
+            "created_at":     time.monotonic(),
+            "received":       set(),
+            "status":         "chunks_pending",
+            "message_id":     None,
+            "error":          None,
+            "done_at":        None,
+            "assembled_path": None,
+            "finalize_tries": 0,
         }
 
     return {"upload_id": upload_id, "total_chunks": total_chunks}
@@ -502,18 +526,15 @@ async def upload_finalize(
     caption: str = Form(default=""),
 ):
     """
-    Trigger the background Telegram upload and return IMMEDIATELY.
+    Trigger (or re-trigger) the background Telegram upload and return IMMEDIATELY.
 
-    This endpoint does NOT wait for Telegram.  It verifies that all chunks
-    are present, marks the session as 'finalizing', spawns an asyncio.Task
-    for the actual assembly + send_file(), and returns at once.
+    v4.1 change: This endpoint now also accepts sessions in "error" state.
+    When the background send_file() fails (FloodWait, network drop, etc.) the
+    session is marked "error" but ALL chunk files are kept on disk.  The Flutter
+    client can call this endpoint again to re-trigger the background task without
+    re-uploading any bytes — the assembled file (or raw chunks) are reused.
 
-    The client then polls GET /upload/status/{upload_id} every 5 s.
-    This design bypasses Railway's 100 s HTTP idle timeout entirely because:
-      - This request returns in < 1 s
-      - Each status poll returns in < 1 s
-      - The actual Telegram upload (which can take 45 min) runs in the
-        background without holding any HTTP connection open.
+    The client polls GET /upload/status/{upload_id} every 5 s.
     """
     async with _sessions_lock:
         session = _upload_sessions.get(upload_id)
@@ -529,9 +550,28 @@ async def upload_finalize(
         }
     if session["status"] == "finalizing":
         return {"status": "finalizing", "upload_id": upload_id}
-    if session["status"] == "error":
-        raise HTTPException(500, session.get("error", "Upload failed."))
 
+    # ── NEW in v4.1: allow retry from "error" state ────────────────────────────
+    # All chunk files are still on disk.  Just reset status and re-fire the task.
+    # Flutter calls this after polling sees "error" — avoids full re-upload.
+    if session["status"] == "error":
+        async with _sessions_lock:
+            if upload_id in _upload_sessions:
+                _upload_sessions[upload_id]["status"]  = "finalizing"
+                _upload_sessions[upload_id]["error"]   = None
+                _upload_sessions[upload_id]["done_at"] = None
+                _upload_sessions[upload_id]["finalize_tries"] = \
+                    _upload_sessions[upload_id].get("finalize_tries", 0) + 1
+        asyncio.create_task(
+            _finalize_background(
+                upload_id=upload_id,
+                session_string=session_string,
+                caption=caption,
+            )
+        )
+        return {"status": "finalizing", "upload_id": upload_id}
+
+    # ── Normal path: first finalize call ─────────────────────────────────────
     # Verify all chunks are present
     async with _sessions_lock:
         received = set(_upload_sessions[upload_id]["received"])
@@ -546,7 +586,8 @@ async def upload_finalize(
 
     # Mark as finalizing and fire background task
     async with _sessions_lock:
-        _upload_sessions[upload_id]["status"] = "finalizing"
+        _upload_sessions[upload_id]["status"]        = "finalizing"
+        _upload_sessions[upload_id]["finalize_tries"] = 1
 
     asyncio.create_task(
         _finalize_background(
@@ -595,10 +636,16 @@ async def _finalize_background(
     """
     Background task: assembles chunks → send_file() to Telegram.
 
+    v4.1: send_file() is now retried up to _FINALIZE_INNER_RETRIES times.
+      • FloodWaitError  → sleep exactly as long as Telegram says, then retry.
+      • Other errors    → exponential back-off (5 s, 10 s, 20 s, 40 s, 60 s).
+      • Hard errors (session expired, file missing) → give up immediately.
+
+    The assembled temp file is kept on disk when the task ends in "error" so
+    that /upload/finalize can re-trigger this task without re-assembling.
+
     Runs under _HEAVY_SEM to cap concurrent Telegram uploads at 2.
-    Updates _upload_sessions[upload_id] with 'done' or 'error' when finished.
-    May run for 30–45 minutes for very large files — that is expected and fine
-    because it holds no HTTP connection open.
+    May run for 30–45 minutes for very large files — that is expected.
     """
     async with _HEAVY_SEM:
         async with _sessions_lock:
@@ -610,41 +657,111 @@ async def _finalize_background(
         total_chunks = session["total_chunks"]
         tmp_dir      = session["dir"]
 
-        assembled_path = None
+        # ── Reuse existing assembled file if available (retry path) ───────────
+        async with _sessions_lock:
+            assembled_path = _upload_sessions.get(upload_id, {}).get("assembled_path")
+
         client = make_client(session_string, for_upload=True)
+        last_error: str = "Unknown error"
+
         try:
             await client.connect()
             if not await client.is_user_authorized():
+                # Hard failure — no point retrying
                 raise RuntimeError("Telegram session expired.")
 
-            # ── Assemble all chunk files into one temp file ────────────────────
-            # Reads one 64 KB block at a time — peak RAM is O(UPLOAD_BUF_SIZE)
-            with tempfile.NamedTemporaryFile(
-                delete=False, suffix=f"_{filename}", dir=tmp_dir
-            ) as assembled:
-                assembled_path = assembled.name
-                for i in range(total_chunks):
-                    chunk_path = os.path.join(tmp_dir, f"chunk_{i:06d}")
-                    with open(chunk_path, "rb") as cf:
-                        while True:
-                            block = cf.read(UPLOAD_BUF_SIZE)
-                            if not block:
-                                break
-                            assembled.write(block)
+            # ── Assemble chunk files → single temp file (skip if already done) ─
+            if assembled_path and os.path.isfile(assembled_path):
+                # Reusing previously assembled file from a failed attempt
+                pass
+            else:
+                # Reads one 64 KB block at a time — peak RAM is O(UPLOAD_BUF_SIZE)
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=f"_{filename}", dir=tmp_dir
+                ) as assembled:
+                    assembled_path = assembled.name
+                    for i in range(total_chunks):
+                        chunk_path = os.path.join(tmp_dir, f"chunk_{i:06d}")
+                        if not os.path.isfile(chunk_path):
+                            raise RuntimeError(
+                                f"Chunk file missing: chunk_{i:06d}. "
+                                "This upload session is corrupt — please start a new upload."
+                            )
+                        with open(chunk_path, "rb") as cf:
+                            while True:
+                                block = cf.read(UPLOAD_BUF_SIZE)
+                                if not block:
+                                    break
+                                assembled.write(block)
 
-            file_size = os.path.getsize(assembled_path)
+                # Persist the assembled path so retries can skip re-assembly
+                async with _sessions_lock:
+                    if upload_id in _upload_sessions:
+                        _upload_sessions[upload_id]["assembled_path"] = assembled_path
 
-            # ── Send to Telegram ───────────────────────────────────────────────
-            # This is where the time goes: 5 min for 300 MB, 45 min for 1.8 GB.
-            # With connection_retries=10 and auto_reconnect=True Telethon will
-            # survive brief network drops and retry internally.
-            message = await client.send_file(
-                "me",
-                assembled_path,
-                caption=caption or filename,
-                force_document=True,
-                attributes=[DocumentAttributeFilename(file_name=filename)],
-            )
+            # ── Send to Telegram with retry ────────────────────────────────────
+            # send_file() can take 5 min (300 MB) to 45 min (1.8 GB).
+            # Telethon internally handles partial retransmits — we only need to
+            # retry at the top level for FloodWait / transient connection errors.
+            message = None
+            for attempt in range(1, _FINALIZE_INNER_RETRIES + 1):
+                try:
+                    message = await client.send_file(
+                        "me",
+                        assembled_path,
+                        caption=caption or filename,
+                        force_document=True,
+                        attributes=[DocumentAttributeFilename(file_name=filename)],
+                    )
+                    break  # success — exit retry loop
+
+                except FloodWaitError as flood:
+                    # Telegram rate-limit: sleep exactly the required seconds
+                    wait_secs = flood.seconds + 5  # add a 5 s safety buffer
+                    last_error = f"FloodWait {flood.seconds}s (attempt {attempt})"
+                    if attempt < _FINALIZE_INNER_RETRIES:
+                        await asyncio.sleep(wait_secs)
+                        # Reconnect after long sleep — connection may have dropped
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2)
+                        await client.connect()
+                    else:
+                        raise RuntimeError(
+                            f"Telegram flood-wait exceeded retry limit "
+                            f"({_FINALIZE_INNER_RETRIES} attempts). "
+                            "Please try again in a few minutes."
+                        )
+
+                except (ConnectionError, OSError, asyncio.TimeoutError) as net_err:
+                    # Transient network error — reconnect and retry
+                    last_error = f"Network error attempt {attempt}: {net_err}"
+                    if attempt < _FINALIZE_INNER_RETRIES:
+                        backoff = min(60, 5 * (2 ** (attempt - 1)))  # 5,10,20,40,60
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(backoff)
+                        await client.connect()
+                    else:
+                        raise RuntimeError(
+                            f"Network error after {_FINALIZE_INNER_RETRIES} attempts: {net_err}"
+                        )
+
+                except Exception as other_err:
+                    # Unknown error — retry with back-off
+                    last_error = f"Error attempt {attempt}: {other_err}"
+                    if attempt < _FINALIZE_INNER_RETRIES:
+                        backoff = min(60, 5 * (2 ** (attempt - 1)))
+                        await asyncio.sleep(backoff)
+                    else:
+                        raise
+
+            if message is None:
+                raise RuntimeError(f"send_file failed after all retries. Last: {last_error}")
 
             # ── Mark done ─────────────────────────────────────────────────────
             async with _sessions_lock:
@@ -655,10 +772,13 @@ async def _finalize_background(
                         "done_at":    time.monotonic(),
                     })
 
-            # Clean up assembled file and chunk files now that Telegram has them
+            # Clean up ALL temp files now that Telegram has the data
             _remove_upload_dir(tmp_dir)
 
         except Exception as e:
+            # ── Mark error but KEEP chunk files on disk ────────────────────────
+            # The Flutter client can call /upload/finalize again to retry
+            # without re-uploading any bytes.
             async with _sessions_lock:
                 if upload_id in _upload_sessions:
                     _upload_sessions[upload_id].update({
