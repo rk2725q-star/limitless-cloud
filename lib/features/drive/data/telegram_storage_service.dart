@@ -322,22 +322,21 @@ class TelegramStorageService {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  //  RESUMABLE UPLOAD — 4 steps per Telegram message
+  //  RESUMABLE UPLOAD — 4 steps per Telegram message  (v5.0 streaming relay)
   // ══════════════════════════════════════════════════════════════════════════
   //
-  //  Step 1  POST /upload/init       → get upload_id
-  //  Step 2  POST /upload/chunk × N  → upload 16 MB slices (retried per slice)
-  //  Step 3  POST /upload/finalize   → trigger background Telegram send (instant)
-  //  Step 4  GET  /upload/status/{}  → poll every 5 s until done
-  //
-  //  v4.1 addition: If polling sees "error", automatically re-calls
-  //  /upload/finalize up to _kFinalizeAutoRetries times.  The server keeps
-  //  all chunk files on disk so no data is re-uploaded.
+  //  Step 1  POST /upload/init       → get upload_id + Telegram file_id
+  //  Step 2  POST /upload/chunk × N  → relay 512KB parts to Telegram NOW
+  //                                    (Telegram already has the bytes when
+  //                                     this call returns 200)
+  //  Step 3  POST /upload/finalize   → calls sendMedia (INSTANT <500ms)
+  //                                    returns {status:"done", message_id:X}
+  //  Step 4  [optional] poll         → only needed for old server; v5.0
+  //                                    finalize returns message_id directly
   //
   //  Progress reporting:
-  //    0.00 → 0.90  during chunk uploads   (smooth, byte-accurate)
-  //    0.90 → 0.99  during server→Telegram transfer (pulsed 0.5 s increments)
-  //    1.00          when server confirms 'done'
+  //    0.00 → 0.90  during chunk uploads + live Telegram relay
+  //    0.90 → 1.00  finalize (instant on v5.0 — no more 91%→restart!)
   //
   // ══════════════════════════════════════════════════════════════════════════
 
@@ -390,17 +389,24 @@ class TelegramStorageService {
       await raf.close();
     }
 
-    // ── Step 3: finalize (returns instantly) ─────────────────────────────────
+    // ── Step 3: finalize ─────────────────────────────────────────────────────
+    // v5.0 server: finalize is INSTANT — parts already on Telegram.
+    //              Returns message_id directly; no polling needed.
+    // v4.x server: returns "finalizing"; poll until done.
     onProgress(0.91);
-    await _uploadFinalizeRequest(
-      uploadId:  uploadId,
-      session:   session,
-      caption:   caption,
+    final directMsgId = await _uploadFinalizeRequest(
+      uploadId: uploadId,
+      session:  session,
+      caption:  caption,
     );
 
-    // ── Step 4: poll until Telegram confirms receipt ──────────────────────────
-    // Progress 0.91 → 0.99 during polling (visual pulse so user knows it's live)
-    // v4.1: auto-retries finalize if server reports "error" (no re-upload needed)
+    if (directMsgId != null) {
+      // v5.0 server: finalize returned message_id immediately. Done!
+      onProgress(1.0);
+      return directMsgId;
+    }
+
+    // ── Step 4: poll (v4.x server fallback) ──────────────────────────────────
     return await _pollUntilDone(
       uploadId:   uploadId,
       session:    session,
@@ -519,9 +525,17 @@ class TelegramStorageService {
     }
   }
 
-  // ── Finalize (fire-and-forget request) ────────────────────────────────────
+  // ── Finalize ──────────────────────────────────────────────────────────────
 
-  Future<void> _uploadFinalizeRequest({
+  /// Calls POST /upload/finalize.
+  ///
+  /// v5.0 server: returns {status:"done", message_id:X} immediately because
+  ///   all bytes are already on Telegram (uploaded during chunk relay).
+  ///   Returns the message_id directly — no polling needed.
+  ///
+  /// v4.x server: returns {status:"finalizing"} — caller must poll.
+  ///   Returns null to signal that polling is required.
+  Future<int?> _uploadFinalizeRequest({
     required String uploadId,
     required String session,
     required String caption,
@@ -529,10 +543,6 @@ class TelegramStorageService {
     final uri = Uri.parse('$_base/upload/finalize');
     Exception? last;
 
-    // Finalize just triggers the background task — returns in < 1 s.
-    // Server is idempotent: accepts "chunks_pending", "finalizing", or "error"
-    // sessions.  Re-calling on "error" re-triggers the background task without
-    // re-uploading any data (server keeps chunk files on disk).
     for (int attempt = 1; attempt <= 5; attempt++) {
       try {
         final req = http.MultipartRequest('POST', uri)
@@ -544,10 +554,21 @@ class TelegramStorageService {
         final resp     = await http.Response.fromStream(streamed);
 
         if (resp.statusCode >= 400) {
-          final msg = _parseError(resp.body, resp.statusCode);
-          throw Exception(msg);
+          throw Exception(_parseError(resp.body, resp.statusCode));
         }
-        return; // success
+
+        // v5.0: check if server returned message_id immediately
+        try {
+          final body   = jsonDecode(resp.body) as Map<String, dynamic>;
+          final status = body['status'] as String? ?? '';
+          if (status == 'done') {
+            final mid = body['message_id'];
+            if (mid != null) return mid as int; // done immediately!
+          }
+        } catch (_) {}
+
+        // v4.x: status == 'finalizing' → caller will poll
+        return null;
       } catch (e) {
         last = e is Exception ? e : Exception(e.toString());
         if (attempt < 5) await Future.delayed(_backoff(attempt));
