@@ -30,27 +30,26 @@ typedef ProgressCallback = void Function(double progress);
 const int    _kTelegramLimit  = 2  * 1024 * 1024 * 1024; // 2 GB
 const double _kMaxChunkBytes  = 1.95 * 1024 * 1024 * 1024; // 1.95 GB per Telegram msg
 
-// ── HTTP chunk size for /upload/chunk requests ────────────────────────────────
-// 16 MB keeps each individual HTTP request short (< 30 s on any connection).
-// Railway's idle timeout is 100 s.  Bytes are flowing during upload so the
-// idle timeout does NOT apply to chunk requests — but keeping chunks small
-// ensures reliable completion even on very slow connections.
-const int _kHttpChunkSize = 16 * 1024 * 1024; // 16 MB per HTTP chunk
+// ── HTTP chunk size for /upload/chunk requests ────────────────────────────────────
+// 4 MB matches the server's HTTP_CHUNK_SIZE (was 16 MB in v5.0).
+// Smaller chunks = more granular progress + faster relay per chunk.
+// Must be kept in sync with server's HTTP_CHUNK_SIZE constant.
+const int _kHttpChunkSize = 4 * 1024 * 1024; // 4 MB per HTTP chunk
 
 // ── Retry / timeout configuration ────────────────────────────────────────────
-const int _kChunkMaxRetries    = 8;  // retries per 16 MB chunk
+// v5.1: chunk sendTimeout increased (4MB at slow connection + relay time)
+const int _kChunkMaxRetries    = 8;  // retries per 4 MB chunk
 const int _kInitMaxRetries     = 5;  // retries for /upload/init
 
 // Polling interval while waiting for server to finish Telegram upload
 const Duration _kPollInterval  = Duration(seconds: 5);
 
 // Maximum time we wait for server to finish sending a Telegram message.
-// ≥ 2 GB files may take 45 min.  We wait 60 min to be safe.
+// v5.1: finalize is synchronous but waits for relay_worker to drain.
+// The relay drain can take up to a few minutes for very large queues.
 const Duration _kFinalizeMaxWait = Duration(hours: 1);
 
 // Maximum outer retries when server reports "error" during finalize polling.
-// Each retry re-calls /upload/finalize (server reuses assembled file on disk).
-// Back-off: 30 s, 60 s, 120 s between retries.
 const int _kFinalizeAutoRetries = 3;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -510,9 +509,10 @@ class TelegramStorageService {
       '$_base/upload/chunk',
       data: formData,
       options: Options(
-        // Each 16 MB chunk at 0.5 Mbps = ~256 s.
-        // Give 5 minutes to handle even very slow connections.
-        sendTimeout:    const Duration(minutes: 5),
+        // v5.1: 4 MB chunk at slow speed (500 kbps) = ~64 s upload
+        // + server queues immediately so no relay wait.
+        // 3 min is generous enough for any real-world connection.
+        sendTimeout:    const Duration(minutes: 3),
         receiveTimeout: const Duration(minutes: 2),
         responseType: ResponseType.json,
       ),
@@ -550,25 +550,26 @@ class TelegramStorageService {
           ..fields['session_string'] = session
           ..fields['caption']        = caption;
 
-        final streamed = await req.send().timeout(const Duration(seconds: 30));
+        // v5.1: finalize waits for relay_worker drain which can take
+        // minutes if many chunks are still queued. 3 min timeout.
+        final streamed = await req.send().timeout(const Duration(minutes: 3));
         final resp     = await http.Response.fromStream(streamed);
 
         if (resp.statusCode >= 400) {
           throw Exception(_parseError(resp.body, resp.statusCode));
         }
 
-        // v5.0: check if server returned message_id immediately
+        // v5.1/v5.0: check if server returned message_id immediately
         try {
           final body   = jsonDecode(resp.body) as Map<String, dynamic>;
           final status = body['status'] as String? ?? '';
           if (status == 'done') {
             final mid = body['message_id'];
-            if (mid != null) return mid as int; // done immediately!
+            if (mid != null) return mid as int;
           }
         } catch (_) {}
 
-        // v4.x: status == 'finalizing' → caller will poll
-        return null;
+        return null; // finalizing — caller will poll
       } catch (e) {
         last = e is Exception ? e : Exception(e.toString());
         if (attempt < 5) await Future.delayed(_backoff(attempt));
