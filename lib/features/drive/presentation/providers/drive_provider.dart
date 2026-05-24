@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
@@ -11,6 +12,7 @@ import '../../data/firestore_metadata_service.dart';
 import '../../data/telegram_storage_service.dart';
 import '../../../../core/constants/app_constants.dart';
 import '../../../../core/utils/file_utils.dart';
+import '../../../../core/services/upload_background_service.dart';
 import 'package:mime/mime.dart';
 
 // ── Upload State ──────────────────────────────────────────────────────────────
@@ -336,6 +338,9 @@ class DriveNotifier extends StateNotifier<DriveState> {
     );
     if (mounted) state = state.copyWith(uploadTasks: [...state.uploadTasks, task]);
 
+    // ── Start background foreground service so upload continues when app is closed
+    await UploadBackgroundService.startUpload(fileName);
+
     try {
       final uploadResult = await _telegramService.uploadFileChunked(
         file,
@@ -355,6 +360,8 @@ class DriveNotifier extends StateNotifier<DriveState> {
             );
             state = state.copyWith(uploadTasks: tasks);
           }
+          // Update foreground service notification with current %
+          UploadBackgroundService.updateProgress(fileName, progress);
         },
       );
 
@@ -392,6 +399,8 @@ class DriveNotifier extends StateNotifier<DriveState> {
       if (isCacheFile) {
         try { await file.delete(); } catch (_) {}
       }
+      // Stop background service notification (all done)
+      await UploadBackgroundService.stopUpload();
     } catch (e) {
       // Clean up temp cache file even on failure.
       if (isCacheFile) {
@@ -409,6 +418,8 @@ class DriveNotifier extends StateNotifier<DriveState> {
           state = state.copyWith(uploadTasks: tasks);
         }
       }
+      // Stop background service notification on failure too
+      await UploadBackgroundService.stopUpload();
     }
   }
 
@@ -689,10 +700,15 @@ class DriveNotifier extends StateNotifier<DriveState> {
     );
   }
 
-  Future<void> renameFile(String fileId, String newName) async {
+  Future<void> renameFile(CloudFile file, String newName) async {
     final userId = await _userId;
     if (userId == null) return;
-    await _firestoreService.renameFile(userId: userId, fileId: fileId, newName: newName);
+    // 1. Update local SQLite immediately
+    await _firestoreService.renameFile(userId: userId, fileId: file.id, newName: newName);
+    // 2. Refresh all providers so the UI updates instantly (no app restart needed)
+    _invalidateAll(file.folderId);
+    // 3. Fire-and-forget Telegram caption update so Saved Messages also shows new name
+    unawaited(_telegramService.renameFileTelegram(file.telegramMessageId, newName));
   }
 
   Future<void> moveFile(CloudFile file, CloudFolder destinationFolder) async {

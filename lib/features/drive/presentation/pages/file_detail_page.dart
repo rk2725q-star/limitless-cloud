@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart';
 
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
@@ -13,6 +12,8 @@ import '../../data/models/cloud_folder.dart';
 import '../../data/telegram_storage_service.dart';
 import '../../../auth/data/telegram_auth_service.dart';
 import '../providers/drive_provider.dart';
+import './download_manager_page.dart';
+import './home_page.dart' show homeNavIndexProvider;
 
 /// File detail page.
 /// ▶ Open   → streams to temp dir → native "Open With" chooser (zero permanent storage)
@@ -29,11 +30,7 @@ class _FileDetailPageState extends ConsumerState<FileDetailPage> {
   CloudFile get _file => widget.args['file'] as CloudFile;
 
   bool _opening  = false;
-  bool _saving   = false;
-  double _saveProgress = 0;
   String? _openError;
-  String? _saveError;
-  bool _savedOk = false;
 
   // ── Temp stream → native app (zero permanent storage) ─────────────────────
 
@@ -66,57 +63,43 @@ class _FileDetailPageState extends ConsumerState<FileDetailPage> {
     }
   }
 
-  // ── Save to public Downloads/LimitlessCloud (visible in Gallery & Files) ──
+  // ── Save to public Downloads/LimitlessCloud via Download Manager ──────────
 
   Future<void> _saveToDevice() async {
-    setState(() { _saving = true; _saveError = null; _savedOk = false; _saveProgress = 0; });
-    try {
-      // Permission check
-      if (Platform.isAndroid) {
-        final sdk = await _androidSdk();
-        if (sdk < 33) {
-          final status = await Permission.storage.request();
-          if (!status.isGranted) throw Exception('Storage permission denied');
-        }
-      }
+    // Kick off download through the Download Manager (shows progress in DL tab)
+    final auth = ref.read(telegramAuthServiceProvider);
+    final tg   = TelegramStorageService(auth);
+    ref.read(dlManagerProvider.notifier).downloadCloudFile(_file, tg);
 
-      // Public Downloads folder — visible in Files & Gallery
-      final dir = await _publicDownloadsDir();
-      final dest = File('${dir.path}/${_file.name}');
+    if (!mounted) return;
 
-      final auth = ref.read(telegramAuthServiceProvider);
-      final tg   = TelegramStorageService(auth);
-
-      setState(() => _saveProgress = 0.1);
-      final downloaded = await tg.downloadFile(_file.telegramMessageId, _file.name);
-      setState(() => _saveProgress = 0.6);
-      await downloaded.copy(dest.path);
-      setState(() { _saveProgress = 1.0; _savedOk = true; });
-
-    } catch (e) {
-      setState(() => _saveError = 'Save failed: $e');
-    } finally {
-      if (mounted) setState(() => _saving = false);
-    }
-  }
-
-  Future<Directory> _publicDownloadsDir() async {
-    if (Platform.isAndroid) {
-      final d = Directory('/storage/emulated/0/Download/LimitlessCloud');
-      if (!await d.exists()) await d.create(recursive: true);
-      return d;
-    }
-    final docs = await getApplicationDocumentsDirectory();
-    final d = Directory('${docs.path}/Downloads');
-    if (!await d.exists()) await d.create(recursive: true);
-    return d;
-  }
-
-  Future<int> _androidSdk() async {
-    try {
-      final r = await Process.run('getprop', ['ro.build.version.sdk']);
-      return int.tryParse(r.stdout.toString().trim()) ?? 30;
-    } catch (_) { return 30; }
+    // Show a brief snackbar with a "View" button
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(children: [
+          const Icon(Icons.download_rounded, color: Colors.white, size: 16),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Downloading ${_file.name}…',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ]),
+        backgroundColor: AppTheme.primary,
+        duration: const Duration(seconds: 6),
+        action: SnackBarAction(
+          label: 'View',
+          textColor: Colors.white,
+          onPressed: () {
+            ScaffoldMessenger.of(context).hideCurrentSnackBar();
+            ref.read(homeNavIndexProvider.notifier).state = 3;
+            Navigator.of(context).popUntil((r) => r.isFirst);
+          },
+        ),
+      ),
+    );
   }
 
   // ── Share ─────────────────────────────────────────────────────────────────
@@ -178,11 +161,7 @@ class _FileDetailPageState extends ConsumerState<FileDetailPage> {
           // ── Primary action buttons ─────────────────────────────────────────
           _ActionButtons(
             isOpening: _opening,
-            isSaving: _saving,
-            saveProgress: _saveProgress,
-            savedOk: _savedOk,
             openError: _openError,
-            saveError: _saveError,
             fileExt: _file.extension,
             onOpen: _openWithNativeApp,
             onSave: _saveToDevice,
@@ -343,15 +322,13 @@ class _FileDetailPageState extends ConsumerState<FileDetailPage> {
 // ── Action Buttons (Open + Save) ──────────────────────────────────────────────
 
 class _ActionButtons extends StatelessWidget {
-  final bool isOpening, isSaving, savedOk;
-  final double saveProgress;
-  final String? openError, saveError, fileExt;
+  final bool isOpening;
+  final String? openError, fileExt;
   final VoidCallback onOpen, onSave;
 
   const _ActionButtons({
-    required this.isOpening, required this.isSaving,
-    required this.saveProgress, required this.savedOk,
-    required this.openError, required this.saveError,
+    required this.isOpening,
+    required this.openError,
     required this.fileExt,
     required this.onOpen, required this.onSave,
   });
@@ -359,8 +336,7 @@ class _ActionButtons extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-
-      // ── Open button ─────────────────────────────────────────────────────
+      // ── Open button ─────────────────────────────────────────────────────────
       SizedBox(
         height: 52,
         child: ElevatedButton.icon(
@@ -374,7 +350,7 @@ class _ActionButtons extends StatelessWidget {
               ? const SizedBox(width: 18, height: 18,
                   child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
               : const Icon(Icons.play_circle_rounded, color: Colors.white),
-          label: Text(isOpening ? 'Streaming…' : 'Open  (stream, zero storage)',
+          label: Text(isOpening ? 'Streaming\u2026' : 'Open  (stream, zero storage)',
               style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
         ),
       ),
@@ -386,65 +362,27 @@ class _ActionButtons extends StatelessWidget {
 
       const SizedBox(height: 10),
 
-      // ── Save to device button ────────────────────────────────────────────
+      // ── Save to device button (queues in Download Manager) ───────────────────
       SizedBox(
         height: 52,
         child: ElevatedButton.icon(
-          onPressed: isSaving || savedOk ? null : onSave,
+          onPressed: onSave,
           style: ElevatedButton.styleFrom(
-            backgroundColor: savedOk ? AppTheme.success : AppTheme.accent,
-            disabledBackgroundColor: savedOk
-                ? AppTheme.success.withValues(alpha: 0.7)
-                : AppTheme.accent.withValues(alpha: 0.4),
+            backgroundColor: AppTheme.accent,
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
           ),
-          icon: isSaving
-              ? const SizedBox(width: 18, height: 18,
-                  child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-              : Icon(savedOk ? Icons.check_circle_rounded : Icons.download_rounded,
-                  color: Colors.white),
-          label: Text(
-            savedOk
-                ? 'Saved to Downloads ✓'
-                : isSaving
-                    ? 'Saving… ${(saveProgress * 100).toInt()}%'
-                    : 'Save to Device (Gallery / Files)',
-            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+          icon: const Icon(Icons.download_rounded, color: Colors.white),
+          label: const Text(
+            'Save to Device (Gallery / Files)',
+            style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
           ),
         ),
       ),
 
-      if (isSaving) ...[
-        const SizedBox(height: 8),
-        ClipRRect(
-          borderRadius: BorderRadius.circular(4),
-          child: LinearProgressIndicator(
-            value: saveProgress,
-            backgroundColor: AppTheme.surfaceVariant,
-            valueColor: const AlwaysStoppedAnimation(AppTheme.accent),
-            minHeight: 4,
-          ),
-        ),
-      ],
-
-      if (saveError != null) ...[
-        const SizedBox(height: 8),
-        _ErrorBanner(saveError!),
-      ],
-
-      if (savedOk) ...[
-        const SizedBox(height: 6),
-        const Text(
-          'File saved to Downloads/LimitlessCloud\nVisible in your Files app & Gallery',
-          style: TextStyle(color: AppTheme.success, fontSize: 11, height: 1.5),
-          textAlign: TextAlign.center,
-        ),
-      ],
-
       const SizedBox(height: 6),
       Text(
         '"Open" streams the file and opens it in your ${_appHint(fileExt ?? '')}\n'
-        '"Save" copies it permanently to your device storage.',
+        '"Save" downloads it to your device via the Download Manager.',
         style: const TextStyle(color: AppTheme.textHint, fontSize: 11, height: 1.5),
         textAlign: TextAlign.center,
       ),
@@ -460,6 +398,7 @@ class _ActionButtons extends StatelessWidget {
     return 'default app';
   }
 }
+
 
 class _ErrorBanner extends StatelessWidget {
   final String message;

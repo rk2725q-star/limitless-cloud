@@ -103,10 +103,15 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
     }
   }
 
-  /// Download a Telegram cloud file to public Downloads folder
+  /// Download a Telegram cloud file to public Downloads folder.
+  /// Uses the backend streaming endpoint with Dio so progress is reported live.
   Future<void> downloadCloudFile(CloudFile file, TelegramStorageService tg) async {
     final taskId = file.id;
+    // Skip if already actively downloading this file
     if (state.any((t) => t.id == taskId && t.status == DlStatus.downloading)) return;
+
+    // Remove any previous failed/done task with the same id before re-queuing
+    state = state.where((t) => t.id != taskId || t.status == DlStatus.downloading).toList();
 
     final task = DlTask(
       id: taskId,
@@ -116,27 +121,48 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
       totalBytes: file.sizeBytes,
     );
     state = [...state, task];
-    _updateTask(taskId, status: DlStatus.downloading);
+    _updateTask(taskId, status: DlStatus.downloading, progress: 0);
 
     try {
       final ok = await _requestPermission();
       if (!ok) throw Exception('Storage permission denied');
 
-      final dir = await _downloadsDir();
-      // Use unique path so re-downloading the same file doesn't crash
-      final dest = File(_uniquePath(dir.path, file.name));
+      final dir  = await _downloadsDir();
+      final dest = _uniquePath(dir.path, file.name);
 
-      // Stream download from Telegram
-      final downloaded = await tg.downloadFile(file.telegramMessageId, file.name);
-      await downloaded.copy(dest.path);
+      final session = await tg.authService.getSession();
+      final base    = tg.backendBaseUrl;
 
-      _updateTask(taskId, status: DlStatus.done, progress: 1.0, savedPath: dest.path);
+      // Use Dio streaming so we get real-time onReceiveProgress
+      await _dio.download(
+        '$base/files/download/${file.telegramMessageId}',
+        dest,
+        deleteOnError: true,
+        queryParameters: {'session_string': session},
+        options: Options(
+          receiveTimeout: const Duration(minutes: 60),
+          sendTimeout: const Duration(seconds: 30),
+        ),
+        onReceiveProgress: (received, total) {
+          if (total > 0) {
+            _updateTask(taskId, progress: received / total, totalBytes: total);
+          } else {
+            // Content-Length unknown — show indeterminate but update received bytes
+            _updateTask(taskId, progress: -1, totalBytes: received);
+          }
+        },
+      );
+
+      _updateTask(taskId, status: DlStatus.done, progress: 1.0, savedPath: dest);
+    } on DioException catch (e) {
+      _updateTask(taskId, status: DlStatus.failed,
+          error: e.message ?? 'Download failed (${e.type.name})');
     } catch (e) {
       _updateTask(taskId, status: DlStatus.failed, error: e.toString());
     }
   }
 
-  /// Download any URL (browser link, image, video, etc.)
+  /// Download any URL to device with max speed Dio settings.
   Future<void> downloadUrl(String url) async {
     final uri = Uri.tryParse(url.trim());
     if (uri == null) return;
@@ -156,19 +182,20 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
       if (!ok) throw Exception('Storage permission denied');
 
       final dir = await _downloadsDir();
-      // Unique path prevents PathExistsException on duplicate URLs
       final dest = _uniquePath(dir.path, name);
 
+      // Max speed: large receive buffer, no timeout on receive
       await _dio.download(
         url,
         dest,
         deleteOnError: true,
         options: Options(
-          receiveTimeout: const Duration(minutes: 30),
+          receiveTimeout: const Duration(minutes: 60),
           sendTimeout: const Duration(seconds: 30),
+          responseType: ResponseType.stream,
           headers: {
-            'User-Agent':
-                'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0',
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0',
+            'Accept-Encoding': 'identity', // don't gzip — we want raw bytes at full speed
           },
         ),
         onReceiveProgress: (received, total) {
@@ -181,14 +208,20 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
       );
       _updateTask(taskId, status: DlStatus.done, progress: 1.0, savedPath: dest);
     } on DioException catch (e) {
-      _updateTask(taskId,
-          status: DlStatus.failed, error: e.message ?? 'Download failed');
+      _updateTask(taskId, status: DlStatus.failed,
+          error: e.message ?? 'Download failed (${e.type.name})');
     } catch (e) {
       _updateTask(taskId, status: DlStatus.failed, error: e.toString());
     }
   }
 
-  /// Upload URL → Telegram Saved Messages (cloud-to-cloud, phone stores nothing)
+  /// Upload URL content → Telegram Saved Messages via chunked upload with live % progress.
+  ///
+  /// Flow:
+  ///   1. HTTP HEAD to get Content-Length (for progress calc)
+  ///   2. Stream-download URL to a temp file with progress (0%→50%)
+  ///   3. Chunked-upload temp file to Telegram with progress (50%→100%)
+  ///   4. Delete temp file
   Future<void> uploadUrl(String url, TelegramStorageService tg) async {
     final uri = Uri.tryParse(url.trim());
     if (uri == null) return;
@@ -204,19 +237,59 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
     state = [...state, DlTask(
       id: taskId, name: '☁ $name', url: url, ext: ext,
     )];
-    _updateTask(taskId, status: DlStatus.downloading, progress: -1);
+    _updateTask(taskId, status: DlStatus.downloading, progress: 0);
+
+    // Temp file named with the REAL filename so Telegram stores it correctly
+    final tmpDir = Directory.systemTemp;
+    final tmpFile = File('${tmpDir.path}/$name');
 
     try {
-      await tg.uploadFileFromUrl(url);
+      // ── Phase 1: stream-download URL → temp file (progress 0%→50%) ──────
+      await _dio.download(
+        url,
+        tmpFile.path,
+        deleteOnError: true,
+        options: Options(
+          receiveTimeout: const Duration(minutes: 60),
+          sendTimeout: const Duration(seconds: 30),
+          responseType: ResponseType.stream,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0',
+            'Accept-Encoding': 'identity',
+          },
+        ),
+        onReceiveProgress: (received, total) {
+          if (total > 0) {
+            // Map phase 1 to 0→50%
+            _updateTask(taskId, progress: (received / total) * 0.5, totalBytes: total);
+          } else {
+            _updateTask(taskId, progress: -1, totalBytes: received);
+          }
+        },
+      );
+
+      _updateTask(taskId, progress: 0.5);
+
+      // ── Phase 2: chunked-upload temp file → Telegram (progress 50%→100%) ──
+      await tg.uploadFileChunked(
+        tmpFile,
+        onProgress: (p) {
+          // Map phase 2 to 50→100%
+          _updateTask(taskId, progress: 0.5 + p * 0.5);
+        },
+      );
+
       _updateTask(taskId, status: DlStatus.done, progress: 1.0,
           savedPath: 'telegram://saved');
+    } on DioException catch (e) {
+      _updateTask(taskId, status: DlStatus.failed,
+          error: e.message ?? 'Download failed (${e.type.name})');
     } catch (e) {
-      final msg = e.toString();
-      // 405 = server deployment doesn't have this endpoint yet
-      final friendlyError = msg.contains('405') || msg.toLowerCase().contains('method not allowed')
-          ? 'Server needs update — redeploy Railway to enable URL uploads'
-          : msg.replaceFirst('Exception: ', '');
-      _updateTask(taskId, status: DlStatus.failed, error: friendlyError);
+      final msg = e.toString().replaceFirst('Exception: ', '');
+      _updateTask(taskId, status: DlStatus.failed, error: msg);
+    } finally {
+      // Clean up temp file regardless of success/failure
+      try { await tmpFile.delete(); } catch (_) {}
     }
   }
 
@@ -245,6 +318,10 @@ final dlManagerProvider =
   (_) => DlManagerNotifier(),
 );
 
+/// Set this to true to signal the DownloadManagerPage to jump to the Active tab.
+/// Automatically resets to false after the jump.
+final dlManagerJumpToActiveProvider = StateProvider<bool>((_) => false);
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 class DownloadManagerPage extends ConsumerStatefulWidget {
@@ -268,6 +345,17 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage>
     if (file != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _startCloudDownload(file));
     }
+
+    // Check if we should jump to Active tab immediately on build
+    // (dlManagerJumpToActiveProvider may already be true before this widget builds)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final shouldJump = ref.read(dlManagerJumpToActiveProvider);
+      if (shouldJump) {
+        _tab.animateTo(1);
+        ref.read(dlManagerJumpToActiveProvider.notifier).state = false;
+      }
+    });
   }
 
   Map<String, dynamic>? get args => widget.args;
@@ -284,6 +372,19 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage>
 
   @override
   Widget build(BuildContext context) {
+    // Also listen for changes WHILE widget is already visible
+    // (e.g. user starts a download and taps View while already on Downloads page)
+    ref.listen<bool>(dlManagerJumpToActiveProvider, (_, shouldJump) {
+      if (shouldJump) {
+        _tab.animateTo(1);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            ref.read(dlManagerJumpToActiveProvider.notifier).state = false;
+          }
+        });
+      }
+    });
+
     final tasks = ref.watch(dlManagerProvider);
     final active   = tasks.where((t) => t.status == DlStatus.downloading || t.status == DlStatus.queued).length;
     final done     = tasks.where((t) => t.status == DlStatus.done).length;
@@ -347,6 +448,7 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage>
             SizedBox(width: 8),
             Text('URL Action', style: TextStyle(color: Colors.white, fontSize: 16)),
           ]),
+          actions: null,
           content: Column(mainAxisSize: MainAxisSize.min, children: [
             const Text(
               'Paste a direct URL. Choose where the file goes:',
@@ -363,44 +465,57 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage>
               ),
               keyboardType: TextInputType.url,
             ),
-          ]),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx),
-                child: const Text('Cancel')),
-            // ── Upload to Telegram ────────────────────────────────────────────
-            OutlinedButton.icon(
-              icon: const Icon(Icons.cloud_upload_rounded, size: 16),
-              label: const Text('→ Telegram'),
-              style: OutlinedButton.styleFrom(
-                foregroundColor: Colors.lightBlueAccent,
-                side: const BorderSide(color: Colors.lightBlueAccent),
+            const SizedBox(height: 16),
+            // ── Upload to Telegram ──────────────────────────────────────
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                icon: const Icon(Icons.cloud_upload_rounded, size: 16),
+                label: const Text('Save to Telegram  (progress shown live)'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.lightBlueAccent,
+                  side: const BorderSide(color: Colors.lightBlueAccent),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+                onPressed: () {
+                  final url = ctrl.text.trim();
+                  if (url.isNotEmpty) {
+                    final auth = ref.read(telegramAuthServiceProvider);
+                    final tg = TelegramStorageService(auth);
+                    ref.read(dlManagerProvider.notifier).uploadUrl(url, tg);
+                    Navigator.pop(ctx);
+                    _tab.animateTo(1);
+                  }
+                },
               ),
-              onPressed: () {
-                final url = ctrl.text.trim();
-                if (url.isNotEmpty) {
-                  final auth = ref.read(telegramAuthServiceProvider);
-                  final tg = TelegramStorageService(auth);
-                  ref.read(dlManagerProvider.notifier).uploadUrl(url, tg);
-                  Navigator.pop(ctx);
-                  _tab.animateTo(1);
-                }
-              },
             ),
-            // ── Download to device ────────────────────────────────────────────
-            ElevatedButton.icon(
-              icon: const Icon(Icons.download_rounded, size: 16),
-              label: const Text('→ Device'),
-              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primary),
-              onPressed: () {
-                final url = ctrl.text.trim();
-                if (url.isNotEmpty) {
-                  ref.read(dlManagerProvider.notifier).downloadUrl(url);
-                  Navigator.pop(ctx);
-                  _tab.animateTo(1);
-                }
-              },
+            const SizedBox(height: 8),
+            // ── Download to device ──────────────────────────────────────
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                icon: const Icon(Icons.download_rounded, size: 16),
+                label: const Text('Save to Device Downloads'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppTheme.primary,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+                onPressed: () {
+                  final url = ctrl.text.trim();
+                  if (url.isNotEmpty) {
+                    ref.read(dlManagerProvider.notifier).downloadUrl(url);
+                    Navigator.pop(ctx);
+                    _tab.animateTo(1);
+                  }
+                },
+              ),
             ),
-          ],
+            const SizedBox(height: 4),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+          ]),
         ),
       ),
     ).whenComplete(() => ctrl.dispose());
@@ -611,12 +726,16 @@ class _TaskTile extends StatelessWidget {
                   ? task.error ?? 'Failed'
                   : isDone
                       ? (task.savedPath == 'telegram://saved'
-                          ? 'Saved to Telegram ☁'
-                          : 'Saved to device ✓')
+                          ? '✓ Saved to Telegram Saved Messages'
+                          : '✓ Saved to device Downloads')
                       : task.progress < 0
-                          ? 'Receiving…${task.totalBytes > 0 ? '  ${FileUtils.formatFileSize(task.totalBytes)}' : ''}'
-                          : '${(task.progress * 100).toInt()}%'
-                              '${task.totalBytes > 0 ? '  ·  ${FileUtils.formatFileSize(task.totalBytes)}' : ''}',
+                          ? 'Fetching…${task.totalBytes > 0 ? '  ${FileUtils.formatFileSize(task.totalBytes)}' : ''}'
+                          : task.name.startsWith('☁')
+                              ? task.progress < 0.5
+                                  ? 'Fetching URL… ${(task.progress * 200).toInt()}%'
+                                  : 'Uploading to Telegram… ${((task.progress - 0.5) * 200).toInt()}%'
+                              : '${(task.progress * 100).toInt()}%'
+                                  '${task.totalBytes > 0 ? '  ·  ${FileUtils.formatFileSize(task.totalBytes)}' : ''}',
               style: TextStyle(
                   color: isFailed
                       ? AppTheme.error

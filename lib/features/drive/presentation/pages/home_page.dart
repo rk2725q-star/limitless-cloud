@@ -9,12 +9,16 @@ import '../../../auth/data/telegram_auth_service.dart';
 import '../../data/models/cloud_file.dart';
 import '../../data/models/cloud_folder.dart';
 import '../../data/firestore_metadata_service.dart';
+import '../../data/telegram_storage_service.dart';
 import '../providers/drive_provider.dart';
 import '../widgets/file_grid_item.dart';
 import '../widgets/file_list_item.dart';
 import '../widgets/folder_item.dart';
 import './download_manager_page.dart';
 import '../widgets/upload_progress_card.dart';
+
+// ── Global nav-index provider — lets any widget switch the HomePage tab ────────
+final homeNavIndexProvider = StateProvider<int>((ref) => 0);
 
 class HomePage extends ConsumerStatefulWidget {
   const HomePage({super.key});
@@ -23,10 +27,9 @@ class HomePage extends ConsumerStatefulWidget {
 }
 
 class _HomePageState extends ConsumerState<HomePage> {
-  int _navIndex = 0;
-
   @override
   Widget build(BuildContext context) {
+    final navIndex = ref.watch(homeNavIndexProvider);
     final pages = [
       const _DriveTab(),
       const _StarredTab(),
@@ -36,13 +39,16 @@ class _HomePageState extends ConsumerState<HomePage> {
 
     return Scaffold(
       backgroundColor: AppTheme.background,
-      body: pages[_navIndex],
-      floatingActionButton: _navIndex == 0 ? _buildFAB(context) : null,
-      bottomNavigationBar: _buildBottomNav(),
+      body: pages[navIndex],
+      floatingActionButton: navIndex == 0 ? _buildFAB(context) : null,
+      bottomNavigationBar: _buildBottomNav(navIndex),
     );
   }
 
   Widget _buildFAB(BuildContext context) {
+    // Watch selection mode — hide FAB when user is selecting files
+    final isSelecting = ref.watch(driveProvider.select((s) => s.isSelectionMode));
+    if (isSelecting) return const SizedBox.shrink();
     return FloatingActionButton.extended(
       onPressed: () => _showUploadOptions(context),
       backgroundColor: AppTheme.primary,
@@ -51,15 +57,15 @@ class _HomePageState extends ConsumerState<HomePage> {
     );
   }
 
-  Widget _buildBottomNav() {
+  Widget _buildBottomNav(int navIndex) {
     return Container(
       decoration: const BoxDecoration(
         color: AppTheme.surface,
         border: Border(top: BorderSide(color: AppTheme.cardBorder)),
       ),
       child: BottomNavigationBar(
-        currentIndex: _navIndex,
-        onTap: (i) => setState(() => _navIndex = i),
+        currentIndex: navIndex,
+        onTap: (i) => ref.read(homeNavIndexProvider.notifier).state = i,
         backgroundColor: Colors.transparent,
         elevation: 0,
         type: BottomNavigationBarType.fixed,
@@ -178,7 +184,7 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
       children: [
         CustomScrollView(
       slivers: [
-        // â”€â”€ App Bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // ── App Bar ───────────────────────────────────────────────────────
         SliverAppBar(
           floating: true,
           backgroundColor: AppTheme.background,
@@ -254,7 +260,9 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
 
         SliverPadding(
           padding: EdgeInsets.only(
-            bottom: drive.uploadTasks.isNotEmpty ? 200 : 100,
+            bottom: drive.isSelectionMode
+                ? 86
+                : drive.uploadTasks.isNotEmpty ? 200 : 100,
           ),
         ),
       ],
@@ -273,7 +281,7 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      'Synced: $_syncedFolders folder(s) Â· $_syncedFiles file(s)',
+                      'Synced: $_syncedFolders folder(s) · $_syncedFiles file(s)',
                       style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
                     ),
                   ),
@@ -282,8 +290,23 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
             ),
           ),
 
-        // ── Animated upload progress cards (bottom overlay) ──────────────────
-        const UploadProgressOverlay(),
+        // ── Persistent multi-select action bar (slides up when files selected) ──
+        if (drive.isSelectionMode && drive.selectedFileIds.isNotEmpty)
+          Positioned(
+            left: 0, right: 0, bottom: 0,
+            child: _SelectionActionBar(
+              selectedCount: drive.selectedFileIds.length,
+              onAction: (action) => _handleSelectionAction(
+                context, ref, action, drive,
+                filesAsync.valueOrNull ?? [],
+              ),
+              onClearSelection: () => ref.read(driveProvider.notifier).clearSelection(),
+            ),
+          ),
+
+        // ── Animated upload progress cards (bottom overlay) ────────────────────
+        if (!drive.isSelectionMode)
+          const UploadProgressOverlay(),
       ],
     );
   }
@@ -399,13 +422,154 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
     );
   }
 
-  void _showFileOptions(BuildContext context, WidgetRef ref, CloudFile file) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: AppTheme.surface,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
-      builder: (_) => _FileOptionsSheet(file: file, ref: ref),
-    );
+  void _showFileOptions(BuildContext context, WidgetRef ref, CloudFile tappedFile) {
+    final drive = ref.read(driveProvider);
+    // If multiple files are selected, show bulk action sheet
+    if (drive.isSelectionMode && drive.selectedFileIds.length > 1) {
+      final filesAsync = ref.read(filesProvider((
+        folderId: null,
+        sortBy: drive.sortBy,
+        descending: drive.sortDescending,
+      )));
+      final allFiles = filesAsync.valueOrNull ?? <CloudFile>[];
+      final selectedFiles = allFiles
+          .where((f) => drive.selectedFileIds.contains(f.id))
+          .toList();
+      showModalBottomSheet(
+        context: context,
+        backgroundColor: AppTheme.surface,
+        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
+        builder: (_) => _MultiFileOptionsSheet(
+          selectedFiles: selectedFiles,
+          outerScaffoldContext: context,
+        ),
+      );
+    } else {
+      showModalBottomSheet(
+        context: context,
+        backgroundColor: AppTheme.surface,
+        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
+        builder: (_) => _FileOptionsSheet(file: tappedFile, ref: ref),
+      );
+    }
+  }
+
+  /// Called by the persistent selection bar for each action tap.
+  void _handleSelectionAction(
+    BuildContext context,
+    WidgetRef ref,
+    String action,
+    DriveState drive,
+    List<CloudFile> allFiles,
+  ) {
+    final selectedFiles = allFiles
+        .where((f) => drive.selectedFileIds.contains(f.id))
+        .toList();
+    if (selectedFiles.isEmpty) return;
+
+    switch (action) {
+      case 'download':
+        final auth = ref.read(telegramAuthServiceProvider);
+        final tg = TelegramStorageService(auth);
+        for (final f in selectedFiles) {
+          ref.read(dlManagerProvider.notifier).downloadCloudFile(f, tg);
+        }
+        ref.read(driveProvider.notifier).clearSelection();
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Row(children: [
+            const Icon(Icons.download_rounded, color: Colors.white, size: 16),
+            const SizedBox(width: 8),
+            Text('Queued ${selectedFiles.length} file${selectedFiles.length == 1 ? '' : 's'} for download'),
+          ]),
+          backgroundColor: AppTheme.primary,
+          duration: const Duration(seconds: 4),
+          action: SnackBarAction(
+            label: 'View',
+            textColor: Colors.white,
+            onPressed: () {
+              ScaffoldMessenger.of(context).hideCurrentSnackBar();
+              ref.read(homeNavIndexProvider.notifier).state = 3;
+            },
+          ),
+        ));
+        break;
+
+      case 'star':
+        final allStarred = selectedFiles.every((f) => f.isStarred);
+        for (final f in selectedFiles) {
+          if (f.isStarred == allStarred) {
+            ref.read(driveProvider.notifier).toggleStar(f);
+          }
+        }
+        ref.read(driveProvider.notifier).clearSelection();
+        break;
+
+      case 'move':
+        showDialog(
+          context: context,
+          builder: (_) => _MultiFolderPickerDialog(
+            files: selectedFiles,
+            ref: ref,
+            mode: 'move',
+          ),
+        );
+        break;
+
+      case 'copy':
+        showDialog(
+          context: context,
+          builder: (_) => _MultiFolderPickerDialog(
+            files: selectedFiles,
+            ref: ref,
+            mode: 'copy',
+          ),
+        );
+        break;
+
+      case 'delete':
+        final count = selectedFiles.length;
+        showDialog(
+          context: context,
+          builder: (dialogCtx) => AlertDialog(
+            backgroundColor: AppTheme.surface,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+            title: Row(children: [
+              Container(
+                width: 36, height: 36,
+                decoration: BoxDecoration(
+                  color: AppTheme.error.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Icon(Icons.delete_forever_rounded, color: AppTheme.error, size: 20),
+              ),
+              const SizedBox(width: 10),
+              const Text('Delete Files'),
+            ]),
+            content: Text(
+              'Permanently delete $count file${count == 1 ? '' : 's'}?\nThis cannot be undone.',
+              style: AppTheme.bodyMedium.copyWith(height: 1.5),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(dialogCtx), child: const Text('Cancel')),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppTheme.error,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+                onPressed: () async {
+                  Navigator.pop(dialogCtx);
+                  for (final f in selectedFiles) {
+                    await ref.read(driveProvider.notifier).deleteFile(f);
+                  }
+                  ref.read(driveProvider.notifier).clearSelection();
+                },
+                child: const Text('Delete All', style: TextStyle(color: Colors.white)),
+              ),
+            ],
+          ),
+        );
+        break;
+    }
   }
 }
 
@@ -1076,10 +1240,48 @@ class _FileOptionsSheet extends StatelessWidget {
           children: [
             Container(width: 40, height: 4, decoration: BoxDecoration(color: AppTheme.cardBorder, borderRadius: BorderRadius.circular(2))),
             const SizedBox(height: 4),
-            ListTile(leading: const Icon(Icons.download_rounded, color: AppTheme.primary), title: const Text('Download'), onTap: () { Navigator.pop(context); ref.read(driveProvider.notifier).downloadFile(file, onProgress: (_) {}); }),
+            ListTile(
+              leading: const Icon(Icons.download_rounded, color: AppTheme.primary),
+              title: const Text('Download'),
+              onTap: () {
+                Navigator.pop(context);
+                final auth = ref.read(telegramAuthServiceProvider);
+                final tg = TelegramStorageService(auth);
+                ref.read(dlManagerProvider.notifier).downloadCloudFile(file, tg);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Row(children: [
+                      const Icon(Icons.download_rounded, color: Colors.white, size: 16),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text('Downloading ${file.name}…', maxLines: 1, overflow: TextOverflow.ellipsis)),
+                    ]),
+                    backgroundColor: AppTheme.primary,
+                    duration: const Duration(seconds: 5),
+                    action: SnackBarAction(
+                      label: 'View',
+                      textColor: Colors.white,
+                      onPressed: () {
+                        ScaffoldMessenger.of(context).hideCurrentSnackBar();
+                        // Set jump signal FIRST, then switch tab — so when
+                        // DownloadManagerPage builds, initState already reads true
+                        ref.read(dlManagerJumpToActiveProvider.notifier).state = true;
+                        ref.read(homeNavIndexProvider.notifier).state = 3;
+                      },
+                    ),
+                  ),
+                );
+              },
+            ),
             ListTile(leading: Icon(file.isStarred ? Icons.star_border_rounded : Icons.star_rounded, color: AppTheme.warning), title: Text(file.isStarred ? 'Remove Star' : 'Star'), onTap: () { Navigator.pop(context); ref.read(driveProvider.notifier).toggleStar(file); }),
             ListTile(leading: const Icon(Icons.share_rounded, color: AppTheme.accent), title: const Text('Share'), onTap: () { Navigator.pop(context); }),
-            ListTile(leading: const Icon(Icons.drive_file_rename_outline_rounded), title: const Text('Rename'), onTap: () { Navigator.pop(context); }),
+            ListTile(
+              leading: const Icon(Icons.drive_file_rename_outline_rounded),
+              title: const Text('Rename'),
+              onTap: () {
+                Navigator.pop(context);
+                _showRenameDialog(context, file);
+              },
+            ),
             ListTile(
               leading: const Icon(Icons.drive_file_move_rounded, color: AppTheme.secondary),
               title: const Text('Move to Folder'),
@@ -1133,6 +1335,76 @@ class _FileOptionsSheet extends StatelessWidget {
     );
   }
 
+  void _showRenameDialog(BuildContext context, CloudFile file) {
+    final ctrl = TextEditingController(text: file.name);
+    // Capture the outer scaffold context before opening the dialog
+    final outerCtx = context;
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        backgroundColor: AppTheme.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Row(children: [
+          Container(
+            width: 36, height: 36,
+            decoration: BoxDecoration(
+              color: AppTheme.primary.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: const Icon(Icons.drive_file_rename_outline_rounded, color: AppTheme.primary, size: 20),
+          ),
+          const SizedBox(width: 10),
+          const Text('Rename File'),
+        ]),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          style: const TextStyle(color: Colors.white),
+          decoration: const InputDecoration(
+            hintText: 'New file name',
+            prefixIcon: Icon(Icons.edit_rounded, color: AppTheme.textHint),
+          ),
+          onSubmitted: (_) => _doRename(dialogCtx, outerCtx, file, ctrl.text.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.primary,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            ),
+            onPressed: () => _doRename(dialogCtx, outerCtx, file, ctrl.text.trim()),
+            child: const Text('Rename', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    ).whenComplete(() => ctrl.dispose());
+  }
+
+  Future<void> _doRename(BuildContext dialogCtx, BuildContext scaffoldCtx, CloudFile file, String newName) async {
+    if (newName.isEmpty || newName == file.name) {
+      Navigator.pop(dialogCtx);
+      return;
+    }
+    Navigator.pop(dialogCtx);
+    try {
+      await ref.read(driveProvider.notifier).renameFile(file, newName);
+      ScaffoldMessenger.of(scaffoldCtx).showSnackBar(SnackBar(
+        content: Text('Renamed to "$newName"'),
+        backgroundColor: AppTheme.success,
+        duration: const Duration(seconds: 3),
+      ));
+    } catch (e) {
+      ScaffoldMessenger.of(scaffoldCtx).showSnackBar(SnackBar(
+        content: Text('Rename failed: $e'),
+        backgroundColor: AppTheme.error,
+      ));
+    }
+  }
+
   void _showFolderPicker(BuildContext context, {required String mode}) {
     showDialog(
       context: context,
@@ -1145,11 +1417,634 @@ class _FileOptionsSheet extends StatelessWidget {
   }
 }
 
-// â”€â”€ Folder Picker Dialog (for Move / Copy) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-//
-// Browse-style picker: navigate into folders by tapping them, go back with
-// the back arrow, and press "Move Here" / "Copy Here" to paste at the
-// current browsed location.
+// ── Multi File Options Sheet (stunning design, shown when ≥2 files selected) ──
+
+class _MultiFileOptionsSheet extends ConsumerWidget {
+  final List<CloudFile> selectedFiles;
+  final BuildContext outerScaffoldContext;
+
+  const _MultiFileOptionsSheet({
+    required this.selectedFiles,
+    required this.outerScaffoldContext,
+  });
+
+  void _queueDownloads(WidgetRef ref) {
+    final auth = ref.read(telegramAuthServiceProvider);
+    final tg = TelegramStorageService(auth);
+    for (final f in selectedFiles) {
+      ref.read(dlManagerProvider.notifier).downloadCloudFile(f, tg);
+    }
+    ref.read(driveProvider.notifier).clearSelection();
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final count = selectedFiles.length;
+    final allStarred = selectedFiles.every((f) => f.isStarred);
+
+    return Container(
+      decoration: const BoxDecoration(
+        color: AppTheme.surface,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      child: SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+
+          // ── Drag handle ──────────────────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.only(top: 12, bottom: 4),
+            child: Container(
+              width: 40, height: 4,
+              decoration: BoxDecoration(
+                color: AppTheme.cardBorder,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          ),
+
+          // ── Gradient header ───────────────────────────────────────────────────
+          Container(
+            margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [
+                  AppTheme.primary.withValues(alpha: 0.18),
+                  const Color(0xFF6C3FFF).withValues(alpha: 0.12),
+                ],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: AppTheme.primary.withValues(alpha: 0.3)),
+            ),
+            child: Row(children: [
+              Container(
+                width: 44, height: 44,
+                decoration: BoxDecoration(
+                  gradient: AppTheme.primaryGradient,
+                  borderRadius: BorderRadius.circular(12),
+                  boxShadow: [BoxShadow(color: AppTheme.primary.withValues(alpha: 0.4), blurRadius: 10, offset: const Offset(0, 4))],
+                ),
+                child: const Icon(Icons.checklist_rounded, color: Colors.white, size: 22),
+              ),
+              const SizedBox(width: 14),
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(
+                  '$count File${count == 1 ? '' : 's'} Selected',
+                  style: AppTheme.titleMedium.copyWith(color: Colors.white, fontWeight: FontWeight.w700),
+                ),
+                Text(
+                  'Choose an action to apply to all',
+                  style: AppTheme.bodyMedium.copyWith(color: AppTheme.textSecondary, fontSize: 11),
+                ),
+              ])),
+            ]),
+          ),
+
+          const SizedBox(height: 16),
+
+          // ── Quick action icon buttons row ─────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                _QuickAction(
+                  icon: Icons.download_rounded,
+                  label: 'Download',
+                  gradient: LinearGradient(colors: [const Color(0xFF4F8CFF), const Color(0xFF6C3FFF)]),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _queueDownloads(ref);
+                    ScaffoldMessenger.of(outerScaffoldContext).showSnackBar(SnackBar(
+                      content: Row(children: [
+                        const Icon(Icons.download_rounded, color: Colors.white, size: 16),
+                        const SizedBox(width: 8),
+                        Text('Queued $count file${count == 1 ? '' : 's'} for download'),
+                      ]),
+                      backgroundColor: AppTheme.primary,
+                      duration: const Duration(seconds: 4),
+                      action: SnackBarAction(
+                        label: 'View',
+                        textColor: Colors.white,
+                        onPressed: () {
+                          ScaffoldMessenger.of(outerScaffoldContext).hideCurrentSnackBar();
+                          ref.read(homeNavIndexProvider.notifier).state = 3;
+                        },
+                      ),
+                    ));
+                  },
+                ),
+                _QuickAction(
+                  icon: allStarred ? Icons.star_border_rounded : Icons.star_rounded,
+                  label: allStarred ? 'Unstar' : 'Star',
+                  gradient: LinearGradient(colors: [const Color(0xFFFFB800), const Color(0xFFFF6B00)]),
+                  onTap: () {
+                    Navigator.pop(context);
+                    for (final f in selectedFiles) {
+                      if (f.isStarred == allStarred) {
+                        ref.read(driveProvider.notifier).toggleStar(f);
+                      }
+                    }
+                    ref.read(driveProvider.notifier).clearSelection();
+                  },
+                ),
+                _QuickAction(
+                  icon: Icons.drive_file_move_rounded,
+                  label: 'Move',
+                  gradient: LinearGradient(colors: [const Color(0xFF00C8A0), const Color(0xFF00A0C8)]),
+                  onTap: () {
+                    Navigator.pop(context);
+                    showDialog(
+                      context: outerScaffoldContext,
+                      builder: (_) => _MultiFolderPickerDialog(files: selectedFiles, ref: ref, mode: 'move'),
+                    );
+                  },
+                ),
+                _QuickAction(
+                  icon: Icons.copy_rounded,
+                  label: 'Copy',
+                  gradient: LinearGradient(colors: [const Color(0xFFFF6CC8), const Color(0xFFAA4FFF)]),
+                  onTap: () {
+                    Navigator.pop(context);
+                    showDialog(
+                      context: outerScaffoldContext,
+                      builder: (_) => _MultiFolderPickerDialog(files: selectedFiles, ref: ref, mode: 'copy'),
+                    );
+                  },
+                ),
+                _QuickAction(
+                  icon: Icons.delete_forever_rounded,
+                  label: 'Delete',
+                  gradient: const LinearGradient(colors: [Color(0xFFFF4F4F), Color(0xFFCC1111)]),
+                  onTap: () {
+                    Navigator.pop(context);
+                    showDialog(
+                      context: outerScaffoldContext,
+                      builder: (dialogCtx) => AlertDialog(
+                        backgroundColor: AppTheme.surface,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                        title: Row(children: [
+                          Container(
+                            width: 36, height: 36,
+                            decoration: BoxDecoration(color: AppTheme.error.withValues(alpha: 0.15), borderRadius: BorderRadius.circular(10)),
+                            child: const Icon(Icons.delete_forever_rounded, color: AppTheme.error, size: 20),
+                          ),
+                          const SizedBox(width: 10),
+                          const Text('Delete Files'),
+                        ]),
+                        content: Text(
+                          'Permanently delete $count file${count == 1 ? '' : 's'}?\nThis will remove them from Telegram and cannot be undone.',
+                          style: AppTheme.bodyMedium.copyWith(height: 1.5),
+                        ),
+                        actions: [
+                          TextButton(onPressed: () => Navigator.pop(dialogCtx), child: const Text('Cancel')),
+                          ElevatedButton(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AppTheme.error,
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                            ),
+                            onPressed: () async {
+                              Navigator.pop(dialogCtx);
+                              for (final f in selectedFiles) {
+                                await ref.read(driveProvider.notifier).deleteFile(f);
+                              }
+                              ref.read(driveProvider.notifier).clearSelection();
+                            },
+                            child: const Text('Delete All', style: TextStyle(color: Colors.white)),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 12),
+
+          // ── Divider ───────────────────────────────────────────────────────────
+          Divider(height: 1, color: AppTheme.cardBorder, indent: 16, endIndent: 16),
+          const SizedBox(height: 4),
+
+          // ── Cancel ────────────────────────────────────────────────────────────
+          ListTile(
+            leading: Container(
+              width: 38, height: 38,
+              decoration: BoxDecoration(
+                color: AppTheme.textHint.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: const Icon(Icons.close_rounded, color: AppTheme.textSecondary, size: 20),
+            ),
+            title: const Text('Cancel Selection', style: TextStyle(color: AppTheme.textSecondary)),
+            onTap: () {
+              Navigator.pop(context);
+              ref.read(driveProvider.notifier).clearSelection();
+            },
+          ),
+          const SizedBox(height: 4),
+        ]),
+      ),
+    );
+  }
+}
+
+// ── Quick Action Icon Button ──────────────────────────────────────────────────
+
+class _QuickAction extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Gradient gradient;
+  final VoidCallback onTap;
+
+  const _QuickAction({
+    required this.icon,
+    required this.label,
+    required this.gradient,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Container(
+          width: 56, height: 56,
+          decoration: BoxDecoration(
+            gradient: gradient,
+            borderRadius: BorderRadius.circular(16),
+            boxShadow: [
+              BoxShadow(
+                color: (gradient as LinearGradient).colors.first.withValues(alpha: 0.35),
+                blurRadius: 12,
+                offset: const Offset(0, 4),
+              ),
+            ],
+          ),
+          child: Icon(icon, color: Colors.white, size: 26),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          label,
+          style: const TextStyle(color: AppTheme.textSecondary, fontSize: 11, fontWeight: FontWeight.w500),
+        ),
+      ]),
+    );
+  }
+}
+
+// ── Persistent Selection Action Bar ─────────────────────────────────────────
+// Slides up from the bottom whenever isSelectionMode is true.
+// Shows: count badge | Download | Star | Move | Copy | Delete | Close
+
+class _SelectionActionBar extends StatelessWidget {
+  final int selectedCount;
+  final void Function(String action) onAction;
+  final VoidCallback onClearSelection;
+
+  const _SelectionActionBar({
+    required this.selectedCount,
+    required this.onAction,
+    required this.onClearSelection,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+        child: Container(
+          height: 62,
+          decoration: BoxDecoration(
+            color: const Color(0xFF1A1E2E).withValues(alpha: 0.97),
+            borderRadius: BorderRadius.circular(32),
+            border: Border.all(
+              color: AppTheme.primary.withValues(alpha: 0.35),
+              width: 1.2,
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: AppTheme.primary.withValues(alpha: 0.18),
+                blurRadius: 24,
+                spreadRadius: 0,
+                offset: const Offset(0, 4),
+              ),
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.5),
+                blurRadius: 16,
+                offset: const Offset(0, 6),
+              ),
+            ],
+          ),
+          child: Row(
+            children: [
+              // ── Count badge ──────────────────────────────────────────
+              const SizedBox(width: 14),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  gradient: AppTheme.primaryGradient,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
+                  '$selectedCount',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+              const Spacer(),
+
+              // ── Action buttons ────────────────────────────────────────
+              _CompactActionBtn(
+                icon: Icons.download_rounded,
+                color: const Color(0xFF4F8CFF),
+                tooltip: 'Download',
+                onTap: () => onAction('download'),
+              ),
+              _CompactActionBtn(
+                icon: Icons.star_rounded,
+                color: const Color(0xFFFFB800),
+                tooltip: 'Star',
+                onTap: () => onAction('star'),
+              ),
+              _CompactActionBtn(
+                icon: Icons.drive_file_move_rounded,
+                color: const Color(0xFF00C8A0),
+                tooltip: 'Move',
+                onTap: () => onAction('move'),
+              ),
+              _CompactActionBtn(
+                icon: Icons.copy_rounded,
+                color: const Color(0xFFD16FFF),
+                tooltip: 'Copy',
+                onTap: () => onAction('copy'),
+              ),
+              _CompactActionBtn(
+                icon: Icons.delete_forever_rounded,
+                color: const Color(0xFFFF4F4F),
+                tooltip: 'Delete',
+                onTap: () => onAction('delete'),
+              ),
+
+              // ── Close ─────────────────────────────────────────────────
+              const SizedBox(width: 4),
+              GestureDetector(
+                onTap: onClearSelection,
+                child: Container(
+                  width: 30, height: 30,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.08),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.close_rounded, color: AppTheme.textSecondary, size: 16),
+                ),
+              ),
+              const SizedBox(width: 10),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CompactActionBtn extends StatelessWidget {
+  final IconData icon;
+  final Color color;
+  final String tooltip;
+  final VoidCallback onTap;
+
+  const _CompactActionBtn({
+    required this.icon,
+    required this.color,
+    required this.tooltip,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: GestureDetector(
+        onTap: onTap,
+        child: Container(
+          width: 40, height: 40,
+          margin: const EdgeInsets.symmetric(horizontal: 3),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.15),
+            shape: BoxShape.circle,
+            border: Border.all(color: color.withValues(alpha: 0.3), width: 1),
+          ),
+          child: Icon(icon, color: color, size: 19),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Multi Folder Picker Dialog (Move/Copy for multiple files) ─────────────────
+
+
+class _MultiFolderPickerDialog extends ConsumerStatefulWidget {
+  final List<CloudFile> files;
+  final WidgetRef ref;
+  final String mode;
+  const _MultiFolderPickerDialog({required this.files, required this.ref, required this.mode});
+
+  @override
+  ConsumerState<_MultiFolderPickerDialog> createState() => _MultiFolderPickerDialogState();
+}
+
+class _MultiFolderPickerDialogState extends ConsumerState<_MultiFolderPickerDialog> {
+  final List<CloudFolder?> _navStack = [null];
+  List<CloudFolder> _subfolders = [];
+  bool _loadingSubfolders = true;
+  bool _busy = false;
+
+  CloudFolder? get _currentFolder => _navStack.last;
+
+  @override
+  void initState() { super.initState(); _loadSubfolders(); }
+
+  Future<void> _loadSubfolders() async {
+    if (mounted) setState(() => _loadingSubfolders = true);
+    try {
+      final authService = ref.read(telegramAuthServiceProvider);
+      final profile = await authService.getProfile();
+      final userId = profile['userId'] ?? '';
+      if (userId.isEmpty) {
+        if (mounted) setState(() { _subfolders = []; _loadingSubfolders = false; });
+        return;
+      }
+      final service = ref.read(firestoreServiceProvider);
+      final folders = await service.getFolders(userId: userId, parentFolderId: _currentFolder?.id).first;
+      if (mounted) setState(() { _subfolders = folders; _loadingSubfolders = false; });
+    } catch (_) {
+      if (mounted) setState(() { _subfolders = []; _loadingSubfolders = false; });
+    }
+  }
+
+  void _enterFolder(CloudFolder f) { _navStack.add(f); _loadSubfolders(); }
+  void _goUp() { if (_navStack.length > 1) { _navStack.removeLast(); _loadSubfolders(); } }
+
+  String get _breadcrumb => _navStack.length == 1 ? 'My Drive' : _navStack.skip(1).map((f) => f!.name).join(' / ');
+
+  @override
+  Widget build(BuildContext context) {
+    final isMove = widget.mode == 'move';
+    final accent = isMove ? AppTheme.secondary : AppTheme.accent;
+    final count = widget.files.length;
+
+    return Dialog(
+      backgroundColor: AppTheme.surface,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 40),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.fromLTRB(18, 20, 18, 14),
+          decoration: BoxDecoration(
+            color: accent.withValues(alpha: 0.07),
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Icon(isMove ? Icons.drive_file_move_rounded : Icons.copy_rounded, color: accent, size: 22),
+              const SizedBox(width: 10),
+              Text(isMove ? 'Move $count Files' : 'Copy $count Files',
+                  style: AppTheme.titleMedium.copyWith(color: accent)),
+            ]),
+            const SizedBox(height: 4),
+            Text('Select destination folder', style: AppTheme.bodyMedium.copyWith(color: AppTheme.textSecondary)),
+          ]),
+        ),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: AppTheme.cardBorder, width: 0.5))),
+          child: Row(children: [
+            IconButton(
+              icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 18),
+              onPressed: _navStack.length > 1 ? _goUp : null,
+              color: _navStack.length > 1 ? AppTheme.textPrimary : AppTheme.textHint,
+              padding: const EdgeInsets.all(6),
+              constraints: const BoxConstraints(),
+            ),
+            const SizedBox(width: 6),
+            Expanded(child: Text(_breadcrumb, style: AppTheme.bodyMedium.copyWith(fontWeight: FontWeight.w600), maxLines: 1, overflow: TextOverflow.ellipsis)),
+          ]),
+        ),
+        SizedBox(
+          height: 270,
+          child: _loadingSubfolders
+              ? const Center(child: CircularProgressIndicator())
+              : _subfolders.isEmpty
+                  ? Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                      const Icon(Icons.folder_open_rounded, size: 42, color: AppTheme.textHint),
+                      const SizedBox(height: 8),
+                      Text('No subfolders here', style: AppTheme.bodyMedium.copyWith(color: AppTheme.textHint)),
+                    ]))
+                  : ListView.builder(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      itemCount: _subfolders.length,
+                      itemBuilder: (_, i) {
+                        final f = _subfolders[i];
+                        return ListTile(
+                          leading: Container(
+                            width: 40, height: 40,
+                            decoration: BoxDecoration(color: const Color(0xFF4F8CFF).withValues(alpha: 0.12), borderRadius: BorderRadius.circular(10)),
+                            child: const Icon(Icons.folder_rounded, color: Color(0xFF4F8CFF), size: 22),
+                          ),
+                          title: Text(f.name, style: AppTheme.bodyMedium.copyWith(fontWeight: FontWeight.w600)),
+                          subtitle: Text('${f.itemCount} item${f.itemCount == 1 ? '' : 's'}', style: const TextStyle(fontSize: 11)),
+                          trailing: const Icon(Icons.chevron_right_rounded, color: AppTheme.textSecondary),
+                          onTap: () => _enterFolder(f),
+                        );
+                      },
+                    ),
+        ),
+        Container(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
+          decoration: const BoxDecoration(
+            border: Border(top: BorderSide(color: AppTheme.cardBorder, width: 0.5)),
+            borderRadius: BorderRadius.vertical(bottom: Radius.circular(20)),
+          ),
+          child: Row(children: [
+            TextButton(onPressed: _busy ? null : () => Navigator.pop(context), child: const Text('Cancel')),
+            const Spacer(),
+            if (_busy) const Padding(padding: EdgeInsets.only(right: 10), child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))),
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: accent,
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 11),
+              ),
+              icon: Icon(isMove ? Icons.drive_file_move_rounded : Icons.copy_rounded, size: 18),
+              label: Text(isMove ? 'Move Here' : 'Copy Here', style: const TextStyle(fontWeight: FontWeight.w600)),
+              onPressed: _busy ? null : _executeHere,
+            ),
+          ]),
+        ),
+      ]),
+    );
+  }
+
+  Future<void> _executeHere() async {
+    setState(() => _busy = true);
+    final destination = _currentFolder;
+    try {
+      final destId   = destination?.id;
+      final destPath = destination?.path ?? '/';
+      final destName = destination?.name ?? 'My Drive';
+
+      final destFolder = CloudFolder(
+        id: destId ?? '', name: destName,
+        parentFolderId: destination?.parentFolderId, path: destPath,
+        color: destination?.color ?? '#4F8CFF',
+        metaMessageId: destination?.metaMessageId ?? 0,
+        createdAt: destination?.createdAt ?? DateTime.now(),
+        updatedAt: destination?.updatedAt ?? DateTime.now(),
+      );
+
+      for (final file in widget.files) {
+        if (widget.mode == 'move') {
+          await widget.ref.read(driveProvider.notifier).moveFile(file, destFolder);
+        } else {
+          await widget.ref.read(driveProvider.notifier).copyFile(file, destFolder);
+        }
+      }
+      widget.ref.read(driveProvider.notifier).clearSelection();
+
+      if (mounted) {
+        Navigator.pop(context);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(widget.mode == 'move'
+              ? '${widget.files.length} files moved to $destName'
+              : '${widget.files.length} files copied to $destName'),
+          backgroundColor: widget.mode == 'move' ? AppTheme.secondary : AppTheme.accent,
+        ));
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _busy = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Failed: $e'),
+          backgroundColor: AppTheme.error,
+        ));
+      }
+    }
+  }
+}
+
+// ── Folder Picker Dialog (for Move / Copy) ────────────────────────────────────
 
 class _FolderPickerDialog extends ConsumerStatefulWidget {
   final CloudFile file;

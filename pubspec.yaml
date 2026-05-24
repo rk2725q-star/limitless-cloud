@@ -53,6 +53,10 @@ dependencies:
   # Animations
   flutter_animate: ^4.5.0
 
+  # Background upload service (keeps uploads alive when app is closed)
+  flutter_background_service: ^5.0.10
+  flutter_local_notifications: ^18.0.1
+
   cupertino_icons: ^1.0.8
 
 dev_dependencies:

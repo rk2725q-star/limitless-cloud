@@ -155,6 +155,12 @@ class TelegramStorageService {
 
   TelegramStorageService(this._auth);
 
+  // Public accessors used by DlManagerNotifier for streaming downloads
+  TelegramAuthService get authService => _auth;
+  String get backendBaseUrl => _base;
+
+
+
   // ── Dio (chunk uploads only) ──────────────────────────────────────────────
   late final Dio _dio = Dio(BaseOptions(
     connectTimeout: const Duration(seconds: 30),
@@ -189,6 +195,33 @@ class TelegramStorageService {
         .timeout(const Duration(seconds: 30));
     if (resp.statusCode >= 400) throw Exception(_parseError(resp.body, resp.statusCode));
     return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> _post(
+      String path, Map<String, dynamic> body) async {
+    final session = await _session;
+    final uri = Uri.parse('$_base$path');
+    final resp = await http
+        .post(uri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({...body, 'session_string': session}))
+        .timeout(const Duration(seconds: 30));
+    if (resp.statusCode >= 400) throw Exception(_parseError(resp.body, resp.statusCode));
+    return jsonDecode(resp.body) as Map<String, dynamic>;
+  }
+
+  /// Rename a file's caption in Telegram Saved Messages.
+  /// This updates the display name the user sees in Telegram.
+  /// Silently ignores errors — the local rename still succeeds even if this fails.
+  Future<void> renameFileTelegram(int messageId, String newName) async {
+    try {
+      await _post('/files/rename', {
+        'message_id': messageId,
+        'new_name': newName,
+      });
+    } catch (_) {
+      // Non-fatal — local DB rename is the source of truth
+    }
   }
 
   Future<Map<String, dynamic>> _postMultipart(
