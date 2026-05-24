@@ -1390,15 +1390,17 @@ class _FileOptionsSheet extends StatelessWidget {
       return;
     }
     Navigator.pop(dialogCtx);
+    // Capture messenger before async gap to avoid BuildContext-across-async warning
+    final messenger = ScaffoldMessenger.of(scaffoldCtx);
     try {
       await ref.read(driveProvider.notifier).renameFile(file, newName);
-      ScaffoldMessenger.of(scaffoldCtx).showSnackBar(SnackBar(
+      messenger.showSnackBar(SnackBar(
         content: Text('Renamed to "$newName"'),
         backgroundColor: AppTheme.success,
         duration: const Duration(seconds: 3),
       ));
     } catch (e) {
-      ScaffoldMessenger.of(scaffoldCtx).showSnackBar(SnackBar(
+      messenger.showSnackBar(SnackBar(
         content: Text('Rename failed: $e'),
         backgroundColor: AppTheme.error,
       ));
@@ -1513,7 +1515,7 @@ class _MultiFileOptionsSheet extends ConsumerWidget {
                 _QuickAction(
                   icon: Icons.download_rounded,
                   label: 'Download',
-                  gradient: LinearGradient(colors: [const Color(0xFF4F8CFF), const Color(0xFF6C3FFF)]),
+                  gradient: const LinearGradient(colors: [Color(0xFF4F8CFF), Color(0xFF6C3FFF)]),
                   onTap: () {
                     Navigator.pop(context);
                     _queueDownloads(ref);
@@ -1539,7 +1541,7 @@ class _MultiFileOptionsSheet extends ConsumerWidget {
                 _QuickAction(
                   icon: allStarred ? Icons.star_border_rounded : Icons.star_rounded,
                   label: allStarred ? 'Unstar' : 'Star',
-                  gradient: LinearGradient(colors: [const Color(0xFFFFB800), const Color(0xFFFF6B00)]),
+                  gradient: const LinearGradient(colors: [Color(0xFFFFB800), Color(0xFFFF6B00)]),
                   onTap: () {
                     Navigator.pop(context);
                     for (final f in selectedFiles) {
@@ -1553,7 +1555,7 @@ class _MultiFileOptionsSheet extends ConsumerWidget {
                 _QuickAction(
                   icon: Icons.drive_file_move_rounded,
                   label: 'Move',
-                  gradient: LinearGradient(colors: [const Color(0xFF00C8A0), const Color(0xFF00A0C8)]),
+                  gradient: const LinearGradient(colors: [Color(0xFF00C8A0), Color(0xFF00A0C8)]),
                   onTap: () {
                     Navigator.pop(context);
                     showDialog(
@@ -1565,7 +1567,7 @@ class _MultiFileOptionsSheet extends ConsumerWidget {
                 _QuickAction(
                   icon: Icons.copy_rounded,
                   label: 'Copy',
-                  gradient: LinearGradient(colors: [const Color(0xFFFF6CC8), const Color(0xFFAA4FFF)]),
+                  gradient: const LinearGradient(colors: [Color(0xFFFF6CC8), Color(0xFFAA4FFF)]),
                   onTap: () {
                     Navigator.pop(context);
                     showDialog(
@@ -1626,7 +1628,7 @@ class _MultiFileOptionsSheet extends ConsumerWidget {
           const SizedBox(height: 12),
 
           // ── Divider ───────────────────────────────────────────────────────────
-          Divider(height: 1, color: AppTheme.cardBorder, indent: 16, endIndent: 16),
+          const Divider(height: 1, color: AppTheme.cardBorder, indent: 16, endIndent: 16),
           const SizedBox(height: 4),
 
           // ── Cancel ────────────────────────────────────────────────────────────

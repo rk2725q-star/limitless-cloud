@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
@@ -8,6 +10,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
+import '../../../../core/services/upload_background_service.dart';
 import '../../data/models/cloud_file.dart';
 import '../../data/telegram_storage_service.dart';
 import '../../../auth/data/telegram_auth_service.dart';
@@ -31,6 +34,7 @@ class DlTask {
   String? savedPath;
   String? error;
   int totalBytes;
+  final CloudFile? cloudFile; // stored for retry on failed cloud downloads
 
   DlTask({
     required this.id,
@@ -42,6 +46,7 @@ class DlTask {
     this.savedPath,
     this.error,
     this.totalBytes = 0,
+    this.cloudFile,
   });
 }
 
@@ -104,61 +109,144 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
   }
 
   /// Download a Telegram cloud file to public Downloads folder.
-  /// Uses the backend streaming endpoint with Dio so progress is reported live.
+  ///
+  /// Routing:
+  ///   • Single-message file (sizeBytes < 2 GB or chunkMessageIds empty)
+  ///     → GET  /files/download/{message_id}          (parallel stream)
+  ///   • Multi-part file (chunkMessageIds has 2+ IDs)
+  ///     → POST /files/download-chunked               (stitched stream)
+  ///
+  /// Reliability:
+  ///   • receiveTimeout = Duration.zero (no timeout — large files take time)
+  ///   • Up to 3 automatic retries with 5 s / 15 s / 30 s back-off
+  ///   • Foreground notification keeps download alive when app is closed
   Future<void> downloadCloudFile(CloudFile file, TelegramStorageService tg) async {
     final taskId = file.id;
-    // Skip if already actively downloading this file
     if (state.any((t) => t.id == taskId && t.status == DlStatus.downloading)) return;
-
-    // Remove any previous failed/done task with the same id before re-queuing
     state = state.where((t) => t.id != taskId || t.status == DlStatus.downloading).toList();
 
-    final task = DlTask(
-      id: taskId,
-      name: file.name,
-      url: '',
-      ext: file.extension,
-      totalBytes: file.sizeBytes,
-    );
-    state = [...state, task];
+    state = [...state, DlTask(
+      id: taskId, name: file.name, url: '', ext: file.extension,
+      totalBytes: file.sizeBytes, cloudFile: file,
+    )];
     _updateTask(taskId, status: DlStatus.downloading, progress: 0);
 
-    try {
-      final ok = await _requestPermission();
-      if (!ok) throw Exception('Storage permission denied');
+    const maxRetries = 3;
+    final backoffs = [5, 15, 30]; // seconds between retries
 
-      final dir  = await _downloadsDir();
-      final dest = _uniquePath(dir.path, file.name);
+    // Start foreground service so download continues when app is closed
+    await UploadBackgroundService.startUpload('Downloading ${file.name}');
 
-      final session = await tg.authService.getSession();
-      final base    = tg.backendBaseUrl;
+    for (var attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        final ok = await _requestPermission();
+        if (!ok) throw Exception('Storage permission denied');
 
-      // Use Dio streaming so we get real-time onReceiveProgress
-      await _dio.download(
-        '$base/files/download/${file.telegramMessageId}',
-        dest,
-        deleteOnError: true,
-        queryParameters: {'session_string': session},
-        options: Options(
-          receiveTimeout: const Duration(minutes: 60),
-          sendTimeout: const Duration(seconds: 30),
-        ),
-        onReceiveProgress: (received, total) {
-          if (total > 0) {
-            _updateTask(taskId, progress: received / total, totalBytes: total);
-          } else {
-            // Content-Length unknown — show indeterminate but update received bytes
-            _updateTask(taskId, progress: -1, totalBytes: received);
-          }
-        },
-      );
+        final dir  = await _downloadsDir();
+        final dest = _uniquePath(dir.path, file.name);
+        final session = await tg.authService.getSession();
+        final base    = tg.backendBaseUrl;
 
-      _updateTask(taskId, status: DlStatus.done, progress: 1.0, savedPath: dest);
-    } on DioException catch (e) {
-      _updateTask(taskId, status: DlStatus.failed,
-          error: e.message ?? 'Download failed (${e.type.name})');
-    } catch (e) {
-      _updateTask(taskId, status: DlStatus.failed, error: e.toString());
+        // ── Route: chunked (>2 GB multi-part) vs single message ──────────────
+        if (file.isChunked && file.chunkMessageIds.length > 1) {
+          // POST /files/download-chunked with all part message IDs
+          await _dio.download(
+            '$base/files/download-chunked',
+            dest,
+            deleteOnError: true,
+            data: jsonEncode({
+              'session_string': session,
+              'message_ids': file.chunkMessageIds,
+            }),
+            options: Options(
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              receiveTimeout: Duration.zero,   // no timeout — large files
+              sendTimeout: const Duration(seconds: 30),
+              responseType: ResponseType.stream,
+            ),
+            onReceiveProgress: (received, total) {
+              final t = total > 0 ? total : file.sizeBytes;
+              _updateTask(taskId,
+                progress: t > 0 ? received / t : -1,
+                totalBytes: t > 0 ? t : received);
+              UploadBackgroundService.updateProgress(file.name, t > 0 ? received / t : 0);
+            },
+          );
+        } else {
+          // GET /files/download/{message_id} — single Telegram message
+          await _dio.download(
+            '$base/files/download/${file.telegramMessageId}',
+            dest,
+            deleteOnError: true,
+            queryParameters: {'session_string': session},
+            options: Options(
+              receiveTimeout: Duration.zero,   // no timeout — large files
+              sendTimeout: const Duration(seconds: 30),
+              responseType: ResponseType.stream,
+            ),
+            onReceiveProgress: (received, total) {
+              final t = total > 0 ? total : file.sizeBytes;
+              _updateTask(taskId,
+                progress: t > 0 ? received / t : -1,
+                totalBytes: t > 0 ? t : received);
+              UploadBackgroundService.updateProgress(file.name, t > 0 ? received / t : 0);
+            },
+          );
+        }
+
+        _updateTask(taskId, status: DlStatus.done, progress: 1.0, savedPath: dest);
+        await UploadBackgroundService.stopUpload();
+        return; // success — exit retry loop
+
+      } on DioException catch (e) {
+        final isLast = attempt == maxRetries;
+        if (isLast) {
+          final msg = _friendlyDlError(e);
+          _updateTask(taskId, status: DlStatus.failed, error: msg);
+          await UploadBackgroundService.stopUpload();
+          return;
+        }
+        // Wait then retry
+        _updateTask(taskId,
+          status: DlStatus.downloading,
+          error: 'Retrying ($attempt/$maxRetries)…');
+        await Future.delayed(Duration(seconds: backoffs[attempt - 1]));
+
+      } catch (e) {
+        final isLast = attempt == maxRetries;
+        if (isLast) {
+          _updateTask(taskId, status: DlStatus.failed,
+            error: e.toString().replaceFirst('Exception: ', ''));
+          await UploadBackgroundService.stopUpload();
+          return;
+        }
+        _updateTask(taskId,
+          status: DlStatus.downloading,
+          error: 'Retrying ($attempt/$maxRetries)…');
+        await Future.delayed(Duration(seconds: backoffs[attempt - 1]));
+      }
+    }
+  }
+
+  /// Human-friendly download error message
+  String _friendlyDlError(DioException e) {
+    switch (e.type) {
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.sendTimeout:
+        return 'Connection timed out. Check internet and retry.';
+      case DioExceptionType.receiveTimeout:
+        return 'Download timed out mid-stream. Tap retry.';
+      case DioExceptionType.connectionError:
+        return 'Connection lost. Tap retry when back online.';
+      case DioExceptionType.badResponse:
+        final code = e.response?.statusCode ?? 0;
+        if (code == 404) return 'File not found on server (404).';
+        if (code == 401) return 'Session expired. Please log out and log in again.';
+        if (code >= 500) return 'Server error ($code). Try again in a moment.';
+        return 'Server returned $code.';
+      default:
+        return e.message ?? 'Download failed. Tap retry.';
     }
   }
 
@@ -173,47 +261,67 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
     final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
 
     final taskId = DateTime.now().microsecondsSinceEpoch.toString();
-    final task = DlTask(id: taskId, name: name, url: url, ext: ext);
-    state = [...state, task];
+    state = [...state, DlTask(id: taskId, name: name, url: url, ext: ext)];
     _updateTask(taskId, status: DlStatus.downloading);
 
-    try {
-      final ok = await _requestPermission();
-      if (!ok) throw Exception('Storage permission denied');
+    const maxRetries = 3;
+    final backoffs = [5, 15, 30];
 
-      final dir = await _downloadsDir();
-      final dest = _uniquePath(dir.path, name);
+    await UploadBackgroundService.startUpload('Downloading $name');
 
-      // Max speed: large receive buffer, no timeout on receive
-      await _dio.download(
-        url,
-        dest,
-        deleteOnError: true,
-        options: Options(
-          receiveTimeout: const Duration(minutes: 60),
-          sendTimeout: const Duration(seconds: 30),
-          responseType: ResponseType.stream,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0',
-            'Accept-Encoding': 'identity', // don't gzip — we want raw bytes at full speed
+    for (var attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        final ok = await _requestPermission();
+        if (!ok) throw Exception('Storage permission denied');
+
+        final dir  = await _downloadsDir();
+        final dest = _uniquePath(dir.path, name);
+
+        await _dio.download(
+          url, dest,
+          deleteOnError: true,
+          options: Options(
+            receiveTimeout: Duration.zero, // no timeout — large files
+            sendTimeout: const Duration(seconds: 30),
+            responseType: ResponseType.stream,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0',
+              'Accept-Encoding': 'identity',
+            },
+          ),
+          onReceiveProgress: (received, total) {
+            if (total > 0) {
+              _updateTask(taskId, progress: received / total, totalBytes: total);
+              UploadBackgroundService.updateProgress(name, received / total);
+            } else {
+              _updateTask(taskId, progress: -1, totalBytes: received);
+            }
           },
-        ),
-        onReceiveProgress: (received, total) {
-          if (total > 0) {
-            _updateTask(taskId, progress: received / total, totalBytes: total);
-          } else {
-            _updateTask(taskId, progress: -1, totalBytes: received);
-          }
-        },
-      );
-      _updateTask(taskId, status: DlStatus.done, progress: 1.0, savedPath: dest);
-    } on DioException catch (e) {
-      _updateTask(taskId, status: DlStatus.failed,
-          error: e.message ?? 'Download failed (${e.type.name})');
-    } catch (e) {
-      _updateTask(taskId, status: DlStatus.failed, error: e.toString());
+        );
+        _updateTask(taskId, status: DlStatus.done, progress: 1.0, savedPath: dest);
+        await UploadBackgroundService.stopUpload();
+        return;
+
+      } on DioException catch (e) {
+        if (attempt == maxRetries) {
+          _updateTask(taskId, status: DlStatus.failed, error: _friendlyDlError(e));
+          await UploadBackgroundService.stopUpload();
+          return;
+        }
+        _updateTask(taskId, status: DlStatus.downloading, error: 'Retrying ($attempt/$maxRetries)…');
+        await Future.delayed(Duration(seconds: backoffs[attempt - 1]));
+      } catch (e) {
+        if (attempt == maxRetries) {
+          _updateTask(taskId, status: DlStatus.failed, error: e.toString().replaceFirst('Exception: ', ''));
+          await UploadBackgroundService.stopUpload();
+          return;
+        }
+        _updateTask(taskId, status: DlStatus.downloading, error: 'Retrying ($attempt/$maxRetries)…');
+        await Future.delayed(Duration(seconds: backoffs[attempt - 1]));
+      }
     }
   }
+
 
   /// Upload URL content → Telegram Saved Messages via chunked upload with live % progress.
   ///
@@ -621,6 +729,20 @@ class _ActiveTab extends ConsumerWidget {
         task: t,
         onCancel: () => ref.read(dlManagerProvider.notifier).removeTask(t.id),
         showProgress: true,
+        onRetry: t.status == DlStatus.failed
+            ? () {
+                ref.read(dlManagerProvider.notifier).removeTask(t.id);
+                if (t.cloudFile != null) {
+                  // Retry cloud file download
+                  final auth = ref.read(telegramAuthServiceProvider);
+                  final tg = TelegramStorageService(auth);
+                  ref.read(dlManagerProvider.notifier).downloadCloudFile(t.cloudFile!, tg);
+                } else if (t.url.isNotEmpty) {
+                  // Retry URL download
+                  ref.read(dlManagerProvider.notifier).downloadUrl(t.url);
+                }
+              }
+            : null,
       )).toList(),
     );
   }
@@ -685,9 +807,10 @@ class _TaskTile extends StatelessWidget {
   final DlTask task;
   final VoidCallback onCancel;
   final VoidCallback? onOpen;
+  final VoidCallback? onRetry;
   final bool showProgress;
   const _TaskTile({required this.task, required this.onCancel,
-      this.onOpen, required this.showProgress});
+      this.onOpen, this.onRetry, required this.showProgress});
 
   @override
   Widget build(BuildContext context) {
@@ -748,6 +871,12 @@ class _TaskTile extends StatelessWidget {
               icon: const Icon(Icons.open_in_new_rounded, size: 20, color: AppTheme.primary),
               onPressed: onOpen,
               tooltip: 'Open file',
+            ),
+          if (onRetry != null)
+            IconButton(
+              icon: const Icon(Icons.refresh_rounded, size: 20, color: AppTheme.warning),
+              onPressed: onRetry,
+              tooltip: 'Retry download',
             ),
           IconButton(
             icon: Icon(
