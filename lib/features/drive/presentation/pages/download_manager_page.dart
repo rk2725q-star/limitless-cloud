@@ -57,6 +57,10 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
 
   final _dio = Dio();
 
+  /// Active cancel tokens — keyed by task ID.
+  /// Cancelling the token aborts the Dio request immediately.
+  final _cancelTokens = <String, CancelToken>{};
+
   /// Get public Downloads directory (visible in file manager & gallery)
   Future<Directory> _downloadsDir() async {
     if (Platform.isAndroid) {
@@ -132,12 +136,15 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
     _updateTask(taskId, status: DlStatus.downloading, progress: 0);
 
     const maxRetries = 3;
-    final backoffs = [5, 15, 30]; // seconds between retries
+    final backoffs = [5, 15, 30];
 
-    // Start foreground service so download continues when app is closed
     await UploadBackgroundService.startUpload('Downloading ${file.name}');
 
     for (var attempt = 1; attempt <= maxRetries; attempt++) {
+      // Create a fresh CancelToken for each attempt
+      final cancelToken = CancelToken();
+      _cancelTokens[taskId] = cancelToken;
+
       try {
         final ok = await _requestPermission();
         if (!ok) throw Exception('Storage permission denied');
@@ -149,11 +156,11 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
 
         // ── Route: chunked (>2 GB multi-part) vs single message ──────────────
         if (file.isChunked && file.chunkMessageIds.length > 1) {
-          // POST /files/download-chunked with all part message IDs
           await _dio.download(
             '$base/files/download-chunked',
             dest,
             deleteOnError: true,
+            cancelToken: cancelToken,
             data: jsonEncode({
               'session_string': session,
               'message_ids': file.chunkMessageIds,
@@ -161,7 +168,7 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
             options: Options(
               method: 'POST',
               headers: {'Content-Type': 'application/json'},
-              receiveTimeout: Duration.zero,   // no timeout — large files
+              receiveTimeout: Duration.zero,
               sendTimeout: const Duration(seconds: 30),
               responseType: ResponseType.stream,
             ),
@@ -174,14 +181,14 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
             },
           );
         } else {
-          // GET /files/download/{message_id} — single Telegram message
           await _dio.download(
             '$base/files/download/${file.telegramMessageId}',
             dest,
             deleteOnError: true,
+            cancelToken: cancelToken,
             queryParameters: {'session_string': session},
             options: Options(
-              receiveTimeout: Duration.zero,   // no timeout — large files
+              receiveTimeout: Duration.zero,
               sendTimeout: const Duration(seconds: 30),
               responseType: ResponseType.stream,
             ),
@@ -195,25 +202,29 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
           );
         }
 
+        _cancelTokens.remove(taskId);
         _updateTask(taskId, status: DlStatus.done, progress: 1.0, savedPath: dest);
         await UploadBackgroundService.stopUpload();
-        return; // success — exit retry loop
+        return;
 
       } on DioException catch (e) {
-        final isLast = attempt == maxRetries;
-        if (isLast) {
-          final msg = _friendlyDlError(e);
-          _updateTask(taskId, status: DlStatus.failed, error: msg);
+        _cancelTokens.remove(taskId);
+        // Cancelled by user — silently stop (task already removed from UI)
+        if (CancelToken.isCancel(e)) {
           await UploadBackgroundService.stopUpload();
           return;
         }
-        // Wait then retry
-        _updateTask(taskId,
-          status: DlStatus.downloading,
-          error: 'Retrying ($attempt/$maxRetries)…');
+        final isLast = attempt == maxRetries;
+        if (isLast) {
+          _updateTask(taskId, status: DlStatus.failed, error: _friendlyDlError(e));
+          await UploadBackgroundService.stopUpload();
+          return;
+        }
+        _updateTask(taskId, status: DlStatus.downloading, error: 'Retrying ($attempt/$maxRetries)…');
         await Future.delayed(Duration(seconds: backoffs[attempt - 1]));
 
       } catch (e) {
+        _cancelTokens.remove(taskId);
         final isLast = attempt == maxRetries;
         if (isLast) {
           _updateTask(taskId, status: DlStatus.failed,
@@ -221,9 +232,7 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
           await UploadBackgroundService.stopUpload();
           return;
         }
-        _updateTask(taskId,
-          status: DlStatus.downloading,
-          error: 'Retrying ($attempt/$maxRetries)…');
+        _updateTask(taskId, status: DlStatus.downloading, error: 'Retrying ($attempt/$maxRetries)…');
         await Future.delayed(Duration(seconds: backoffs[attempt - 1]));
       }
     }
@@ -270,6 +279,9 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
     await UploadBackgroundService.startUpload('Downloading $name');
 
     for (var attempt = 1; attempt <= maxRetries; attempt++) {
+      final cancelToken = CancelToken();
+      _cancelTokens[taskId] = cancelToken;
+
       try {
         final ok = await _requestPermission();
         if (!ok) throw Exception('Storage permission denied');
@@ -280,8 +292,9 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
         await _dio.download(
           url, dest,
           deleteOnError: true,
+          cancelToken: cancelToken,
           options: Options(
-            receiveTimeout: Duration.zero, // no timeout — large files
+            receiveTimeout: Duration.zero,
             sendTimeout: const Duration(seconds: 30),
             responseType: ResponseType.stream,
             headers: {
@@ -298,11 +311,17 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
             }
           },
         );
+        _cancelTokens.remove(taskId);
         _updateTask(taskId, status: DlStatus.done, progress: 1.0, savedPath: dest);
         await UploadBackgroundService.stopUpload();
         return;
 
       } on DioException catch (e) {
+        _cancelTokens.remove(taskId);
+        if (CancelToken.isCancel(e)) {
+          await UploadBackgroundService.stopUpload();
+          return;
+        }
         if (attempt == maxRetries) {
           _updateTask(taskId, status: DlStatus.failed, error: _friendlyDlError(e));
           await UploadBackgroundService.stopUpload();
@@ -311,7 +330,9 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
         _updateTask(taskId, status: DlStatus.downloading, error: 'Retrying ($attempt/$maxRetries)…');
         await Future.delayed(Duration(seconds: backoffs[attempt - 1]));
       } catch (e) {
-        if (attempt == maxRetries) {
+        _cancelTokens.remove(taskId);
+        final isLast = attempt == maxRetries;
+        if (isLast) {
           _updateTask(taskId, status: DlStatus.failed, error: e.toString().replaceFirst('Exception: ', ''));
           await UploadBackgroundService.stopUpload();
           return;
@@ -401,7 +422,14 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
     }
   }
 
+  /// Cancel a task: abort Dio stream, dismiss notification, remove from list.
   void removeTask(String id) {
+    // 1. Abort the Dio request immediately
+    final token = _cancelTokens.remove(id);
+    token?.cancel('User cancelled');
+    // 2. Dismiss the progress notification
+    UploadBackgroundService.stopUpload();
+    // 3. Remove from UI list
     state = state.where((t) => t.id != id).toList();
   }
 
