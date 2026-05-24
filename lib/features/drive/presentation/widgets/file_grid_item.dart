@@ -30,12 +30,17 @@ class FileGridItem extends StatelessWidget {
 
   bool get _isImage => _imageExts.contains(file.extension.toLowerCase());
 
-  /// Backend streaming URL for the file — authenticated via session query-param.
+  /// Backend streaming URL — clean URL, NO session in query params.
   String? get _streamUrl {
     if (sessionString == null || sessionString!.isEmpty) return null;
-    final encoded = Uri.encodeQueryComponent(sessionString!);
-    return '${AppConstants.backendBaseUrl}/files/download'
-        '/${file.telegramMessageId}?session_string=$encoded';
+    return '${AppConstants.backendBaseUrl}/files/download/${file.telegramMessageId}';
+  }
+
+  /// Authorization header sent with every thumbnail request.
+  /// Session travels in the encrypted HTTPS header, never in the URL.
+  Map<String, String>? get _authHeaders {
+    if (sessionString == null || sessionString!.isEmpty) return null;
+    return {'Authorization': 'Bearer $sessionString'};
   }
 
   @override
@@ -75,15 +80,16 @@ class FileGridItem extends StatelessWidget {
                       borderRadius: const BorderRadius.vertical(top: Radius.circular(15)),
                       child: CachedNetworkImage(
                         imageUrl: _streamUrl!,
+                        httpHeaders: _authHeaders,  // ✅ Auth in header, not URL
                         fit: BoxFit.cover,
                         placeholder: (_, __) => _IconBackground(color: color, icon: icon),
                         errorWidget: (_, __, ___) => _IconBackground(color: color, icon: icon),
-                        // Thumbnails are small, use low quality for speed
                         memCacheWidth: 300,
                       ),
                     )
                   else
                     _IconBackground(color: color, icon: icon),
+
 
                   // Gradient overlay for image items (readability)
                   if (_isImage && _streamUrl != null)

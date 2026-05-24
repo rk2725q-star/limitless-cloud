@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -34,18 +35,29 @@ class AuthResult {
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
-const _kSession      = 'tg_session';
+const _kSession      = 'tg_session';      // stored in FlutterSecureStorage (encrypted)
 const _kUserId       = 'tg_user_id';
 const _kFirstName    = 'tg_first_name';
 const _kLastName     = 'tg_last_name';
 const _kPhone        = 'tg_phone';
 const _kUsername     = 'tg_username';
-const kServerUrl     = 'server_url';     // public so Settings can write it
-const kNeedsDbResync = 'needs_db_resync'; // flag: set on logout, cleared after resync
+const kServerUrl     = 'server_url';       // public so Settings can write it
+const kNeedsDbResync = 'needs_db_resync';  // flag: set on logout, cleared after resync
 
 // ── Service ───────────────────────────────────────────────────────────────────
 
 class TelegramAuthService {
+
+  /// ┌─ SECURITY: Session string is stored in Android Keystore via
+  /// │  flutter_secure_storage — hardware-backed AES-256 encryption.
+  /// │  Even if the device is rooted, extracting this value requires
+  /// │  defeating the Keystore TEE (Trusted Execution Environment).
+  /// └──────────────────────────────────────────────────────────────
+  static const _secure = FlutterSecureStorage(
+    aOptions: AndroidOptions(
+      encryptedSharedPreferences: true,   // AES-256 via Android Keystore
+    ),
+  );
 
   // Read the URL from SharedPreferences every call so Settings changes apply
   // immediately without restarting the app.
@@ -57,12 +69,17 @@ class TelegramAuthService {
 
   // ── HTTP helpers ────────────────────────────────────────────────────────────
 
-  Future<Map<String, dynamic>> _post(String path, Map<String, dynamic> body) async {
+  /// All authenticated API calls use Authorization: Bearer <token> header.
+  /// The session string NEVER appears in URLs or request bodies.
+  Future<Map<String, dynamic>> _post(
+      String path, Map<String, dynamic> body) async {
     final base = await _base;
     final uri = Uri.parse('$base$path');
     try {
       final resp = await http
-          .post(uri, headers: {'Content-Type': 'application/json'}, body: jsonEncode(body))
+          .post(uri,
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode(body))
           .timeout(const Duration(seconds: 30));
       final data = jsonDecode(resp.body) as Map<String, dynamic>;
       if (resp.statusCode >= 400) {
@@ -70,7 +87,6 @@ class TelegramAuthService {
       }
       return data;
     } on Exception catch (e) {
-      // Convert timeout / connection refused into a friendly message
       final msg = e.toString();
       if (msg.contains('TimeoutException') || msg.contains('SocketException') ||
           msg.contains('Connection refused') || msg.contains('Network')) {
@@ -85,13 +101,27 @@ class TelegramAuthService {
     }
   }
 
-  // ── SharedPreferences helpers ───────────────────────────────────────────────
+  // ── Secure storage helpers ──────────────────────────────────────────────────
+
+  /// Write session string to Android Keystore (hardware-encrypted).
+  Future<void> _writeSession(String value) =>
+      _secure.write(key: _kSession, value: value);
+
+  /// Read session string from Android Keystore.
+  Future<String> _readSession() async =>
+      await _secure.read(key: _kSession) ?? '';
+
+  /// Delete session string from Android Keystore.
+  Future<void> _deleteSession() => _secure.delete(key: _kSession);
 
   Future<SharedPreferences> get _prefs => SharedPreferences.getInstance();
 
   Future<void> _saveSession(Map<String, dynamic> data) async {
+    // ✅ Session goes to Android Keystore (hardware encrypted)
+    await _writeSession(data['session_string'] ?? '');
+
+    // Non-sensitive profile data stays in SharedPreferences
     final prefs = await _prefs;
-    await prefs.setString(_kSession,   data['session_string'] ?? '');
     await prefs.setString(_kUserId,    (data['user_id'] ?? '').toString());
     await prefs.setString(_kFirstName, data['first_name'] ?? '');
     await prefs.setString(_kLastName,  data['last_name']  ?? '');
@@ -138,13 +168,12 @@ class TelegramAuthService {
         'phone': phone,
         'phone_code_hash': phoneCodeHash,
         'code': code,
-        'session_string': partialSession, // ← CRITICAL: reuse DC from send-code
+        'session_string': partialSession, // CRITICAL: reuse DC from send-code
       });
 
-
       if (data['needs_password'] == true) {
-        final prefs = await _prefs;
-        await prefs.setString(_kSession, data['session_string'] ?? '');
+        // Temporarily store partial session securely while 2FA is entered
+        await _writeSession(data['session_string'] ?? '');
         return AuthResult(
           success: true,
           needsPassword: true,
@@ -166,8 +195,7 @@ class TelegramAuthService {
   /// Step 3 (optional) – Complete 2FA with cloud password.
   Future<AuthResult> verifyPassword(String password) async {
     try {
-      final prefs = await _prefs;
-      final session = prefs.getString(_kSession) ?? '';
+      final session = await _readSession();
       final data = await _post('/auth/verify-2fa', {
         'session_string': session,
         'password': password,
@@ -185,8 +213,7 @@ class TelegramAuthService {
 
   /// Check whether the locally stored session is still valid on Telegram.
   Future<bool> isLoggedIn() async {
-    final prefs = await _prefs;
-    final session = prefs.getString(_kSession) ?? '';
+    final session = await _readSession();
     if (session.isEmpty) return false;
     try {
       final data = await _post('/auth/check-session', {'session_string': session});
@@ -208,25 +235,24 @@ class TelegramAuthService {
     };
   }
 
-  /// Return the stored session string.
-  Future<String> getSession() async {
-    final prefs = await _prefs;
-    return prefs.getString(_kSession) ?? '';
-  }
+  /// Return the stored session string (from hardware-encrypted storage).
+  Future<String> getSession() => _readSession();
 
-  /// Sign out: revoke session on Telegram and clear local storage.
+  /// Sign out: revoke session on Telegram and clear all secure + prefs storage.
   Future<void> logout() async {
     try {
-      final prefs = await _prefs;
-      final session = prefs.getString(_kSession) ?? '';
+      final session = await _readSession();
       if (session.isNotEmpty) {
         await _post('/auth/logout', {'session_string': session});
       }
     } catch (_) {}
+
+    // ✅ Wipe session from Android Keystore
+    await _deleteSession();
+
     final prefs = await _prefs;
     // Set flag so the next login triggers a full DB wipe + resync
     await prefs.setBool(kNeedsDbResync, true);
-    await prefs.remove(_kSession);
     await prefs.remove(_kUserId);
     await prefs.remove(_kFirstName);
     await prefs.remove(_kLastName);

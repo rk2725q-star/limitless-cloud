@@ -872,12 +872,14 @@ class _GalleryThumbnail extends StatelessWidget {
   final String session;
   const _GalleryThumbnail({required this.file, required this.session});
 
+  /// Clean URL — session NOT in query params (security fix).
   String? get _streamUrl {
     if (session.isEmpty) return null;
-    final encoded = Uri.encodeQueryComponent(session);
-    return '${AppConstants.backendBaseUrl}/files/download'
-        '/${file.telegramMessageId}?session_string=$encoded';
+    return '${AppConstants.backendBaseUrl}/files/download/${file.telegramMessageId}';
   }
+
+  /// Session sent as Authorization header — never visible in logs or URLs.
+  Map<String, String> get _authHeaders => {'Authorization': 'Bearer $session'};
 
   @override
   Widget build(BuildContext context) {
@@ -888,11 +890,13 @@ class _GalleryThumbnail extends StatelessWidget {
     if (url != null) {
       content = CachedNetworkImage(
         imageUrl: url,
+        httpHeaders: _authHeaders,   // ✅ Auth in header, not URL
         fit: BoxFit.cover,
         memCacheWidth: 300,
         placeholder: (_, __) => _imgPlaceholder(color),
         errorWidget: (_, __, ___) => _imgPlaceholder(color),
       );
+
     } else {
       content = _imgPlaceholder(color);
     }

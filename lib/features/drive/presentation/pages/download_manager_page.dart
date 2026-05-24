@@ -161,13 +161,13 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
             dest,
             deleteOnError: true,
             cancelToken: cancelToken,
-            data: jsonEncode({
-              'session_string': session,
-              'message_ids': file.chunkMessageIds,
-            }),
+            data: jsonEncode({'message_ids': file.chunkMessageIds}), // no session in body
             options: Options(
               method: 'POST',
-              headers: {'Content-Type': 'application/json'},
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer $session',  // ✅ header only
+              },
               receiveTimeout: Duration.zero,
               sendTimeout: const Duration(seconds: 30),
               responseType: ResponseType.stream,
@@ -186,11 +186,11 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
             dest,
             deleteOnError: true,
             cancelToken: cancelToken,
-            queryParameters: {'session_string': session},
             options: Options(
               receiveTimeout: Duration.zero,
               sendTimeout: const Duration(seconds: 30),
               responseType: ResponseType.stream,
+              headers: {'Authorization': 'Bearer $session'},  // ✅ header, not URL
             ),
             onReceiveProgress: (received, total) {
               final t = total > 0 ? total : file.sizeBytes;

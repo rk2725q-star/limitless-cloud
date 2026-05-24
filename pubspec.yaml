@@ -34,6 +34,10 @@ dependencies:
   # Storage / Cache
   shared_preferences: ^2.3.2
 
+  # Secure hardware-encrypted storage (Android Keystore) for session token
+  flutter_secure_storage: ^9.2.2
+
+
   # Networking
   http: ^1.2.2
   http_parser: ^4.0.2

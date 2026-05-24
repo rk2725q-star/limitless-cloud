@@ -58,12 +58,12 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Annotated, AsyncIterator, Optional
 from urllib.parse import urlparse, unquote
 
 import aiohttp
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -280,6 +280,34 @@ class UploadFromUrlRequest(BaseModel):
     session_string: str
     url: str
     caption: str = ""
+
+
+# ── Security: Session extraction ─────────────────────────────────────────────
+#
+# Session string travels ONLY in the Authorization: Bearer <token> header.
+# It is NEVER accepted in URL query params or request bodies on authenticated
+# routes.  This means it will NEVER appear in:
+#   • Server access logs (which log the URL)
+#   • Browser history / URL bars
+#   • Proxy / CDN logs
+#   • Referrer headers from third-party resources
+
+async def _get_session(
+    authorization: Annotated[Optional[str], Header()] = None
+) -> str:
+    """
+    FastAPI dependency — extracts the Telegram session token from the
+    Authorization header.  Raises HTTP 401 if header is missing or malformed.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization header required. Format: Bearer <session_token>",
+        )
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty session token")
+    return token
 
 
 # ── Telethon client factory ───────────────────────────────────────────────────
@@ -561,7 +589,7 @@ async def _relay_worker(
 
 @app.post("/upload/init")
 async def upload_init(
-    session_string: str = Form(...),
+    session_string: str = Depends(_get_session),
     filename: str = Form(...),
     total_size: int = Form(...),
     total_chunks: int = Form(...),
@@ -640,6 +668,7 @@ async def upload_init(
 
 @app.post("/upload/chunk")
 async def upload_chunk(
+    session_string: str = Depends(_get_session),
     upload_id: str = Form(...),
     chunk_index: int = Form(...),
     chunk_data: UploadFile = File(...),
@@ -710,8 +739,8 @@ async def upload_chunk(
 
 @app.post("/upload/finalize")
 async def upload_finalize(
+    session_string: str = Depends(_get_session),
     upload_id: str = Form(...),
-    session_string: str = Form(...),
     caption: str = Form(default=""),
 ):
     """
@@ -888,7 +917,7 @@ async def upload_status(upload_id: str):
 
 @app.post("/files/upload")
 async def upload_file(
-    session_string: str = Form(...),
+    session_string: str = Depends(_get_session),
     file: UploadFile = File(...),
     caption: str = Form(default=""),
 ):
@@ -940,9 +969,10 @@ async def upload_file(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/files/upload-from-url")
-async def upload_file_from_url(req: UploadFromUrlRequest):
+async def upload_file_from_url(req: UploadFromUrlRequest,
+                               session_string: str = Depends(_get_session)):
     async with _HEAVY_SEM:
-        client = make_client(req.session_string, for_upload=True)
+        client = make_client(session_string, for_upload=True)
         tmp_path = None
         try:
             await client.connect()
@@ -1000,7 +1030,7 @@ async def upload_file_from_url(req: UploadFromUrlRequest):
 
 
 @app.get("/files/list")
-async def list_files(session_string: str):
+async def list_files(session_string: str = Depends(_get_session)):
     async with _LIGHT_SEM:
         client = make_client(session_string)
         try:
@@ -1206,7 +1236,8 @@ async def _parallel_stream(
 
 
 @app.get("/files/download/{message_id}")
-async def download_file(message_id: int, session_string: str):
+async def download_file(message_id: int,
+                        session_string: str = Depends(_get_session)):
     """
     Parallel download endpoint (v5.2).
     Uses DL_WORKERS concurrent Telegram connections to saturate bandwidth.
@@ -1258,7 +1289,8 @@ async def download_file(message_id: int, session_string: str):
 
 
 @app.post("/files/download-chunked")
-async def download_chunked_file(req: DownloadChunkedRequest):
+async def download_chunked_file(req: DownloadChunkedRequest,
+                                session_string: str = Depends(_get_session)):
     """
     Multi-part file download (v5.2 parallel engine).
     Each .part message is streamed in order using the parallel download engine.
@@ -1268,7 +1300,7 @@ async def download_chunked_file(req: DownloadChunkedRequest):
             raise HTTPException(400, "message_ids must not be empty.")
 
         # Metadata lookup using a pool client
-        client, slot = await _acquire_dl_client(req.session_string)
+        client, slot = await _acquire_dl_client(session_string)
         try:
             if not await client.is_user_authorized():
                 raise HTTPException(401, "Session expired.")
@@ -1306,7 +1338,7 @@ async def download_chunked_file(req: DownloadChunkedRequest):
             for msg in messages:
                 doc       = msg.document
                 part_size = doc.size or 0
-                async for chunk in _parallel_stream(req.session_string, doc, part_size):
+                async for chunk in _parallel_stream(session_string, doc, part_size):
                     yield chunk
 
         headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
@@ -1318,9 +1350,10 @@ async def download_chunked_file(req: DownloadChunkedRequest):
 
 
 @app.delete("/files/{message_id}")
-async def delete_file(message_id: int, req: DeleteFileRequest):
+async def delete_file(message_id: int, req: DeleteFileRequest,
+                      session_string: str = Depends(_get_session)):
     async with _LIGHT_SEM:
-        client = make_client(req.session_string)
+        client = make_client(session_string)
         try:
             await client.connect()
             if not await client.is_user_authorized():
@@ -1343,12 +1376,11 @@ class RenameFileRequest(BaseModel):
 
 
 @app.post("/files/rename")
-async def rename_file(req: RenameFileRequest):
-    """Edit the caption of a Telegram message to reflect the new filename.
-    The caption format is kept as-is — only the display name in Saved Messages
-    is updated so the user sees the renamed file when they open Telegram."""
+async def rename_file(req: RenameFileRequest,
+                      session_string: str = Depends(_get_session)):
+    """Edit the caption of a Telegram message to reflect the new filename."""
     async with _LIGHT_SEM:
-        client = make_client(req.session_string)
+        client = make_client(session_string)
         try:
             await client.connect()
             if not await client.is_user_authorized():
@@ -1370,7 +1402,8 @@ async def rename_file(req: RenameFileRequest):
 
 
 @app.get("/files/info/{message_id}")
-async def file_info(message_id: int, session_string: str):
+async def file_info(message_id: int,
+                    session_string: str = Depends(_get_session)):
     async with _LIGHT_SEM:
         client = make_client(session_string)
         try:
@@ -1403,7 +1436,8 @@ async def file_info(message_id: int, session_string: str):
 
 
 @app.post("/meta/save")
-async def save_metadata(session_string: str = Form(...), data: str = Form(...)):
+async def save_metadata(session_string: str = Depends(_get_session),
+                        data: str = Form(...)):
     async with _LIGHT_SEM:
         client = make_client(session_string)
         try:
@@ -1422,7 +1456,8 @@ async def save_metadata(session_string: str = Form(...), data: str = Form(...)):
 
 
 @app.get("/meta/list")
-async def list_metadata(session_string: str, prefix: str = "LIMITLESS_"):
+async def list_metadata(session_string: str = Depends(_get_session),
+                        prefix: str = "LIMITLESS_"):
     async with _LIGHT_SEM:
         client = make_client(session_string)
         try:
@@ -1448,9 +1483,10 @@ async def list_metadata(session_string: str, prefix: str = "LIMITLESS_"):
 
 
 @app.delete("/meta/{message_id}")
-async def delete_metadata(message_id: int, req: DeleteFileRequest):
+async def delete_metadata(message_id: int, req: DeleteFileRequest,
+                          session_string: str = Depends(_get_session)):
     async with _LIGHT_SEM:
-        client = make_client(req.session_string)
+        client = make_client(session_string)
         try:
             await client.connect()
             if not await client.is_user_authorized():

@@ -172,14 +172,19 @@ class TelegramStorageService {
 
   Future<String> get _session => _auth.getSession();
 
+  /// ── Security: session sent as Authorization header ────────────────────────
+  /// Session string NEVER goes into URLs (query params) or request bodies.
+  /// It travels only in the encrypted HTTPS Authorization header, invisible
+  /// to server logs, proxies, and browser history.
+
   Future<Map<String, dynamic>> _get(
       String path, [Map<String, String>? params]) async {
     final session = await _session;
-    final uri = Uri.parse('$_base$path').replace(queryParameters: {
-      'session_string': session,
-      ...?params,
-    });
-    final resp = await http.get(uri).timeout(const Duration(seconds: 60));
+    final uri = Uri.parse('$_base$path')
+        .replace(queryParameters: params?.isNotEmpty == true ? params : null);
+    final resp = await http.get(uri, headers: {
+      'Authorization': 'Bearer $session',
+    }).timeout(const Duration(seconds: 60));
     if (resp.statusCode >= 400) throw Exception(_parseError(resp.body, resp.statusCode));
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
@@ -190,8 +195,11 @@ class TelegramStorageService {
     final uri = Uri.parse('$_base$path');
     final resp = await http
         .delete(uri,
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({...body, 'session_string': session}))
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $session',   // ✅ header, not body
+            },
+            body: jsonEncode(body))                 // body has NO session_string
         .timeout(const Duration(seconds: 30));
     if (resp.statusCode >= 400) throw Exception(_parseError(resp.body, resp.statusCode));
     return jsonDecode(resp.body) as Map<String, dynamic>;
@@ -203,16 +211,17 @@ class TelegramStorageService {
     final uri = Uri.parse('$_base$path');
     final resp = await http
         .post(uri,
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({...body, 'session_string': session}))
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $session',   // ✅ header, not body
+            },
+            body: jsonEncode(body))                 // body has NO session_string
         .timeout(const Duration(seconds: 30));
     if (resp.statusCode >= 400) throw Exception(_parseError(resp.body, resp.statusCode));
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
 
   /// Rename a file's caption in Telegram Saved Messages.
-  /// This updates the display name the user sees in Telegram.
-  /// Silently ignores errors — the local rename still succeeds even if this fails.
   Future<void> renameFileTelegram(int messageId, String newName) async {
     try {
       await _post('/files/rename', {
@@ -229,8 +238,8 @@ class TelegramStorageService {
     final session = await _session;
     final uri = Uri.parse('$_base$path');
     final request = http.MultipartRequest('POST', uri)
-      ..fields['session_string'] = session
-      ..fields.addAll(fields);
+      ..headers['Authorization'] = 'Bearer $session'  // ✅ header, not form field
+      ..fields.addAll(fields);                         // fields have NO session_string
     final streamed = await request.send().timeout(const Duration(seconds: 30));
     final resp = await http.Response.fromStream(streamed);
     if (resp.statusCode >= 400) throw Exception(_parseError(resp.body, resp.statusCode));
@@ -769,15 +778,15 @@ class TelegramStorageService {
   /// Download a single-message file (< 2 GB), streamed to local filesystem.
   Future<File> downloadFile(int messageId, String fileName) async {
     final session   = await _session;
-    final uri       = Uri.parse('$_base/files/download/$messageId')
-        .replace(queryParameters: {'session_string': session});
+    final uri       = Uri.parse('$_base/files/download/$messageId');
     final dir       = await getApplicationDocumentsDirectory();
     final localFile = File('${dir.path}/$fileName');
 
     final client = http.Client();
     final sink   = localFile.openWrite();
     try {
-      final request  = http.Request('GET', uri);
+      final request  = http.Request('GET', uri)
+        ..headers['Authorization'] = 'Bearer $session';  // ✅ header, not URL
       final response = await client.send(request);
       if (response.statusCode >= 400) {
         final body = await response.stream.bytesToString();
@@ -803,10 +812,7 @@ class TelegramStorageService {
   }) async {
     final session = await _session;
     final uri     = Uri.parse('$_base/files/download-chunked');
-    final body    = jsonEncode({
-      'session_string': session,
-      'message_ids':    chunkMessageIds,
-    });
+    final body    = jsonEncode({'message_ids': chunkMessageIds});
     final dir     = await getApplicationDocumentsDirectory();
     final outFile = File('${dir.path}/$fileName');
     final sink    = outFile.openWrite();
@@ -814,6 +820,7 @@ class TelegramStorageService {
     try {
       final request = http.Request('POST', uri)
         ..headers['Content-Type'] = 'application/json'
+        ..headers['Authorization'] = 'Bearer $session'  // ✅ header, not body
         ..body = body;
       final response = await client.send(request);
       if (response.statusCode >= 400) {
@@ -842,13 +849,17 @@ class TelegramStorageService {
   Future<int> uploadFileFromUrl(String url, {String caption = ''}) async {
     final session = await _session;
     final uri     = Uri.parse('$_base/files/upload-from-url');
-    final body    = jsonEncode({'session_string': session, 'url': url, 'caption': caption});
+    final body    = jsonEncode({'url': url, 'caption': caption}); // no session in body
     final resp    = await http
-        .post(uri, headers: {'Content-Type': 'application/json'}, body: body)
+        .post(uri, headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $session',   // ✅ header only
+        }, body: body)
         .timeout(const Duration(minutes: 60));
     if (resp.statusCode >= 400) throw Exception(_parseError(resp.body, resp.statusCode));
     return (jsonDecode(resp.body) as Map<String, dynamic>)['message_id'] as int;
   }
+
 
   Future<void> deleteFile(int messageId) async {
     await _delete('/files/$messageId', {'message_id': messageId});
