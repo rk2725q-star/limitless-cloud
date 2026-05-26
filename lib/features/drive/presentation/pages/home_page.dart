@@ -736,7 +736,7 @@ class _CategoryListState extends ConsumerState<_CategoryList> {
           children: [
             // â”€â”€ Stats header + view toggle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             Container(
-              margin: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+              margin: const EdgeInsets.fromLTRB(16, 4, 16, 8),
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
               decoration: BoxDecoration(
                 color: widget.accentColor.withValues(alpha: 0.08),
