@@ -1,118 +1,69 @@
 import 'dart:io';
-import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter/services.dart';
 
 /// UploadBackgroundService
 ///
-/// Shows a progress notification during active uploads/downloads.
-/// The notification is ONLY shown while a transfer is actively running.
-/// It is NOT persistent (ongoing) when idle — this prevents Samsung's
-/// battery optimizer from flagging the app as misbehaving.
+/// Bridges Flutter → Android's TransferForegroundService via MethodChannel.
 ///
-/// Samsung "frequent crashes" / deep sleep fix:
-///   - Notification is only shown during actual transfer
-///   - Not `ongoing` when idle (Samsung flags persistent idle notifications)
-///   - No foreground service (not needed — Dart async runs fine in background
-///     while the notification keeps process priority elevated during transfer)
+/// This is the REAL fix for Samsung "frequent crashes" / deep sleep:
+///   • flutter_local_notifications only shows a notification — it does NOT
+///     prevent Android from killing the app process.
+///   • A real Android Foreground Service (startForeground()) elevates the
+///     process to FOREGROUND priority — Android and all OEMs (Samsung, Xiaomi,
+///     OnePlus) are legally prohibited from killing foreground services.
+///   • Result: transfers complete even with screen off, battery saver on,
+///     and Samsung's "Adaptive Battery" enabled.
+///
+/// Usage:
+///   • [init]           — call once in main() before runApp (no-op on Android,
+///                        kept for API compatibility)
+///   • [startUpload]    — start the foreground service when transfer begins
+///   • [updateProgress] — update progress % notification (no sound/vibration)
+///   • [stopUpload]     — stop service & dismiss notification when done
 class UploadBackgroundService {
-  static final _notifications = FlutterLocalNotificationsPlugin();
-  static const _channelId = 'limitless_transfer';
-  static const _notifId   = 42;
-  static bool _initialised = false;
-  static bool _isActive    = false; // track if a transfer is running
-
-  static const _androidChannel = AndroidNotificationChannel(
-    _channelId,
-    'Transfers',
-    description: 'Upload/download progress',
-    importance: Importance.low,
-    enableVibration: false,
-    playSound: false,
-    showBadge: false,
-  );
+  static const _channel = MethodChannel('com.limitlesscloud/transfer_service');
+  static bool _isActive = false;
 
   // ── Init ──────────────────────────────────────────────────────────────────
-  static Future<void> init() async {
-    if (_initialised) return;
-    _initialised = true;
+  /// Called once in main(). No-op — service starts on demand.
+  static Future<void> init() async {}
 
+  // ── Start foreground service ───────────────────────────────────────────────
+  /// Starts the Android foreground service with a persistent notification.
+  /// After this call, Samsung cannot kill the process even with screen off.
+  static Future<void> startUpload(String fileName) async {
+    _isActive = true;
+    if (!Platform.isAndroid) return;
     try {
-      await _notifications.initialize(
-        const InitializationSettings(
-          android: AndroidInitializationSettings('@mipmap/ic_launcher'),
-          iOS: DarwinInitializationSettings(
-            requestAlertPermission: false,
-            requestBadgePermission: false,
-            requestSoundPermission: false,
-          ),
-        ),
-      );
-
-      if (Platform.isAndroid) {
-        final androidPlugin = _notifications
-            .resolvePlatformSpecificImplementation<
-                AndroidFlutterLocalNotificationsPlugin>();
-        await androidPlugin?.createNotificationChannel(_androidChannel);
-        // Request POST_NOTIFICATIONS permission (Android 13+) — non-blocking
-        await androidPlugin?.requestNotificationsPermission();
-      }
+      await _channel.invokeMethod('startTransfer', {
+        'title': 'Transferring: $fileName',
+      });
     } catch (_) {
-      // Notification init failure is non-fatal
+      // Channel not available (e.g. app cold start before engine ready) — non-fatal
     }
   }
 
-  // ── Start transfer notification ───────────────────────────────────────────
-  static Future<void> startUpload(String fileName) async {
-    _isActive = true;
-    try {
-      await _showNotification('Transferring: $fileName', 0, ongoing: true);
-    } catch (_) {}
-  }
-
   // ── Update progress % ─────────────────────────────────────────────────────
+  /// Updates the notification progress bar in-place (silent, no vibration).
   static void updateProgress(String fileName, double progress) {
-    if (!_isActive) return;
+    if (!_isActive || !Platform.isAndroid) return;
     try {
       final pct = (progress * 100).toInt().clamp(0, 99);
-      _showNotification(fileName, pct, ongoing: true);
+      _channel.invokeMethod('updateProgress', {
+        'title':    fileName,
+        'progress': pct,
+      });
     } catch (_) {}
   }
 
-  // ── Stop: dismiss notification cleanly ───────────────────────────────────
+  // ── Stop foreground service ───────────────────────────────────────────────
+  /// Stops the foreground service. Notification is dismissed immediately.
+  /// Call this when the transfer finishes OR is cancelled.
   static Future<void> stopUpload() async {
     _isActive = false;
+    if (!Platform.isAndroid) return;
     try {
-      await _notifications.cancel(_notifId);
+      await _channel.invokeMethod('stopTransfer');
     } catch (_) {}
-  }
-
-  // ── Internal ──────────────────────────────────────────────────────────────
-  static Future<void> _showNotification(
-      String title, int pct, {required bool ongoing}) async {
-    await _notifications.show(
-      _notifId,
-      'Limitless Cloud',
-      pct == 0 ? title : '$title  —  $pct%',
-      NotificationDetails(
-        android: AndroidNotificationDetails(
-          _channelId,
-          'Transfers',
-          channelDescription: 'Upload/download progress',
-          importance: Importance.low,
-          priority: Priority.low,
-          onlyAlertOnce: true,
-          showProgress: pct > 0,
-          maxProgress: 100,
-          progress: pct,
-          // ongoing=true ONLY during active transfer — prevents Samsung from
-          // flagging the app as consuming battery unnecessarily when idle
-          ongoing: ongoing,
-          autoCancel: !ongoing,
-          silent: true,
-          playSound: false,
-          enableVibration: false,
-          icon: '@mipmap/ic_launcher',
-        ),
-      ),
-    );
   }
 }

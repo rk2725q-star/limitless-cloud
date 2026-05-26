@@ -420,6 +420,7 @@ class TelegramStorageService {
           chunkIndex: ci,
           data:       bytes,
           maxRetries: maxRetries,
+          session:    session,
         );
 
         // Map chunk progress to 0.0–0.90
@@ -472,7 +473,7 @@ class TelegramStorageService {
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         final req = http.MultipartRequest('POST', uri)
-          ..fields['session_string'] = session
+          ..headers['Authorization'] = 'Bearer $session'  // ✅ header, not form field
           ..fields['filename']       = filename
           ..fields['total_size']     = totalSize.toString()
           ..fields['total_chunks']   = totalChunks.toString()
@@ -503,6 +504,7 @@ class TelegramStorageService {
     required int       chunkIndex,
     required Uint8List data,
     required int       maxRetries,
+    required String    session,     // passed to _uploadChunkOnce for Authorization header
   }) async {
     Exception? last;
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
@@ -511,6 +513,7 @@ class TelegramStorageService {
           uploadId:   uploadId,
           chunkIndex: chunkIndex,
           data:       data,
+          session:    session,
         );
         return;
       } on DioException catch (e) {
@@ -536,6 +539,7 @@ class TelegramStorageService {
     required String    uploadId,
     required int       chunkIndex,
     required Uint8List data,
+    required String    session,      // session needed for Authorization header
   }) async {
     final formData = FormData.fromMap({
       'upload_id':   uploadId,
@@ -551,12 +555,10 @@ class TelegramStorageService {
       '$_base/upload/chunk',
       data: formData,
       options: Options(
-        // v5.1: 4 MB chunk at slow speed (500 kbps) = ~64 s upload
-        // + server queues immediately so no relay wait.
-        // 3 min is generous enough for any real-world connection.
         sendTimeout:    const Duration(minutes: 3),
         receiveTimeout: const Duration(minutes: 2),
         responseType: ResponseType.json,
+        headers: {'Authorization': 'Bearer $session'},  // ✅ auth header
       ),
     );
 
@@ -588,8 +590,8 @@ class TelegramStorageService {
     for (int attempt = 1; attempt <= 5; attempt++) {
       try {
         final req = http.MultipartRequest('POST', uri)
+          ..headers['Authorization'] = 'Bearer $session'  // ✅ header, not form field
           ..fields['upload_id']      = uploadId
-          ..fields['session_string'] = session
           ..fields['caption']        = caption;
 
         // v5.1: finalize waits for relay_worker drain which can take
