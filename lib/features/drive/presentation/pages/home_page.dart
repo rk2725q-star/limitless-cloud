@@ -663,6 +663,8 @@ class _CategoriesTabState extends ConsumerState<_CategoriesTab>
         bottom: TabBar(
           controller: _tabCtrl,
           isScrollable: true,
+          tabAlignment: TabAlignment.start,
+          padding: EdgeInsets.zero,
           indicatorColor: AppTheme.primary,
           labelColor: AppTheme.primary,
           unselectedLabelColor: AppTheme.textSecondary,
