@@ -3,7 +3,7 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY server/requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # ── Stage 2: lean runtime image ──────────────────────────────────────────────
@@ -14,7 +14,7 @@ RUN apt-get purge -y --auto-remove && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 COPY --from=builder /install /usr/local
-COPY main.py .
+COPY server/main.py .
 
 # Python memory / GC tuning
 ENV PYTHONDONTWRITEBYTECODE=1 \
