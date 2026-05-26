@@ -269,15 +269,12 @@ class CheckSessionRequest(BaseModel):
     session_string: str
 
 class DeleteFileRequest(BaseModel):
-    session_string: str
     message_id: int
 
 class DownloadChunkedRequest(BaseModel):
-    session_string: str
-    message_ids: list[int]
+    message_ids: list[int]           # session comes from Authorization header only
 
 class UploadFromUrlRequest(BaseModel):
-    session_string: str
     url: str
     caption: str = ""
 
@@ -1370,7 +1367,6 @@ async def delete_file(message_id: int, req: DeleteFileRequest,
 
 
 class RenameFileRequest(BaseModel):
-    session_string: str
     message_id: int
     new_name: str
 
