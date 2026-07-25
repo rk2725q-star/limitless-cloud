@@ -1,8 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:cached_network_image/cached_network_image.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
-import '../../../../core/constants/app_constants.dart';
 import '../../data/models/cloud_file.dart';
 
 class FileGridItem extends StatelessWidget {
@@ -24,24 +22,8 @@ class FileGridItem extends StatelessWidget {
     this.sessionString,
   });
 
-  static const _imageExts = {
-    'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'avif'
-  };
-
-  bool get _isImage => _imageExts.contains(file.extension.toLowerCase());
-
-  /// Backend streaming URL — clean URL, NO session in query params.
-  String? get _streamUrl {
-    if (sessionString == null || sessionString!.isEmpty) return null;
-    return '${AppConstants.backendBaseUrl}/files/download/${file.telegramMessageId}';
-  }
-
-  /// Authorization header sent with every thumbnail request.
-  /// Session travels in the encrypted HTTPS header, never in the URL.
-  Map<String, String>? get _authHeaders {
-    if (sessionString == null || sessionString!.isEmpty) return null;
-    return {'Authorization': 'Bearer $sessionString'};
-  }
+  // In serverless mode, thumbnails are not streamed — all files show a type icon.
+  // (No backend server URL to stream from; user can preview via the file detail page.)
 
   @override
   Widget build(BuildContext context) {
@@ -74,39 +56,9 @@ class FileGridItem extends StatelessWidget {
               child: Stack(
                 fit: StackFit.expand,
                 children: [
-                  // ── Image preview OR file-type icon ──────────────────────
-                  if (_isImage && _streamUrl != null)
-                    ClipRRect(
-                      borderRadius: const BorderRadius.vertical(top: Radius.circular(15)),
-                      child: CachedNetworkImage(
-                        imageUrl: _streamUrl!,
-                        httpHeaders: _authHeaders,  // ✅ Auth in header, not URL
-                        fit: BoxFit.cover,
-                        placeholder: (_, __) => _IconBackground(color: color, icon: icon),
-                        errorWidget: (_, __, ___) => _IconBackground(color: color, icon: icon),
-                        memCacheWidth: 300,
-                      ),
-                    )
-                  else
-                    _IconBackground(color: color, icon: icon),
-
-
-                  // Gradient overlay for image items (readability)
-                  if (_isImage && _streamUrl != null)
-                    Positioned(
-                      bottom: 0, left: 0, right: 0,
-                      child: Container(
-                        height: 32,
-                        decoration: BoxDecoration(
-                          borderRadius: const BorderRadius.vertical(top: Radius.circular(0)),
-                          gradient: LinearGradient(
-                            begin: Alignment.bottomCenter,
-                            end: Alignment.topCenter,
-                            colors: [Colors.black.withValues(alpha: 0.55), Colors.transparent],
-                          ),
-                        ),
-                      ),
-                    ),
+                  // ── Image preview OR file-type icon ───────────────────
+                  // Serverless mode: no server URL to stream from, show icon always
+                  _IconBackground(color: color, icon: icon),
 
                   // Star indicator
                   if (file.isStarred)

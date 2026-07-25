@@ -19,74 +19,10 @@ class _PhoneInputPageState extends ConsumerState<PhoneInputPage> {
   String _countryCode = '+91';
   bool _isLoading = false;
   String? _errorMessage;
-  String _serverUrl = '';
 
   @override
   void initState() {
     super.initState();
-    _loadServerUrl();
-  }
-
-  Future<void> _loadServerUrl() async {
-    var url = await TelegramAuthService.loadServerUrl();
-    // First launch: auto-set Railway production URL as default
-    if (url.isEmpty) {
-      url = 'https://limitless-cloud-production.up.railway.app';
-      await TelegramAuthService.saveServerUrl(url);
-    }
-    if (mounted) setState(() => _serverUrl = url);
-  }
-
-  Future<void> _showServerSetup() async {
-    final ctrl = TextEditingController(text: _serverUrl);
-    await showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppTheme.surface,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text('Server URL', style: TextStyle(color: Colors.white)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Enter your PC\'s LAN IP where the backend server is running.\n\n'
-              'Example:\nhttp://192.168.1.5:8000\n\n'
-              'Find your PC IP: open CMD → type ipconfig',
-              style: AppTheme.bodyMedium.copyWith(height: 1.6),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: ctrl,
-              style: AppTheme.bodyMedium.copyWith(color: Colors.white),
-              decoration: const InputDecoration(
-                hintText: 'http://192.168.1.X:8000',
-                prefixIcon: Icon(Icons.dns_rounded,
-                    color: AppTheme.textHint, size: 20),
-              ),
-              keyboardType: TextInputType.url,
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primary),
-            onPressed: () async {
-              final url = ctrl.text.trim();
-              await TelegramAuthService.saveServerUrl(url);
-              if (mounted) setState(() => _serverUrl = url);
-              if (ctx.mounted) Navigator.pop(ctx);
-            },
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-    ctrl.dispose();
   }
 
   final List<Map<String, String>> _countryCodes = [
@@ -116,7 +52,10 @@ class _PhoneInputPageState extends ConsumerState<PhoneInputPage> {
       _errorMessage = null;
     });
 
-    final phone = '$_countryCode${_phoneController.text.trim()}';
+    // Build full phone number — ensure no double-prefix
+    final localNumber = _phoneController.text.trim();
+    final phone = '$_countryCode$localNumber';
+
     final authService = ref.read(telegramAuthServiceProvider);
     final result = await authService.sendCode(phone);
 
@@ -128,12 +67,16 @@ class _PhoneInputPageState extends ConsumerState<PhoneInputPage> {
         AppRoutes.otp,
         arguments: {
           'phone': phone,
-          'phoneCodeHash': result.phoneCodeHash,
-          'sessionString': result.sessionString ?? '', // ← CRITICAL: pass partial session
+          // phoneCodeHash / sessionString not needed for TDLib path
+          // but kept for API compat — OTP page reads them but TDLib ignores them
+          'phoneCodeHash': result.phoneCodeHash ?? '',
+          'sessionString': result.sessionString ?? '',
         },
       );
     } else {
-      setState(() => _errorMessage = result.error ?? 'Failed to send OTP');
+      // Give the user a friendly hint if TDLib hasn't started yet
+      final err = result.error ?? 'Failed to send OTP';
+      setState(() => _errorMessage = err);
     }
   }
 
@@ -195,53 +138,27 @@ class _PhoneInputPageState extends ConsumerState<PhoneInputPage> {
 
                 const SizedBox(height: 12),
 
-                // ── Server URL Banner ──────────────────────────────────────
-                GestureDetector(
-                  onTap: _showServerSetup,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                    decoration: BoxDecoration(
-                      color: _serverUrl.isEmpty
-                          ? AppTheme.error.withValues(alpha: 0.12)
-                          : AppTheme.primary.withValues(alpha: 0.08),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(
-                        color: _serverUrl.isEmpty
-                            ? AppTheme.error.withValues(alpha: 0.4)
-                            : AppTheme.primary.withValues(alpha: 0.3),
+                // ── Serverless Badge ──────────────────────────────────────────
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: AppTheme.primary.withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: AppTheme.primary.withValues(alpha: 0.3),
+                    ),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.cloud_done_rounded, color: AppTheme.primary, size: 18),
+                      SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'Serverless • Direct Telegram MTProto',
+                          style: TextStyle(color: AppTheme.primary, fontSize: 12),
+                        ),
                       ),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          _serverUrl.isEmpty
-                              ? Icons.warning_amber_rounded
-                              : Icons.dns_rounded,
-                          color: _serverUrl.isEmpty ? AppTheme.error : AppTheme.primary,
-                          size: 18,
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Text(
-                            _serverUrl.isEmpty
-                                ? 'Tap to set Server URL  (required)'
-                                : _serverUrl,
-                            style: AppTheme.bodyMedium.copyWith(
-                              color: _serverUrl.isEmpty
-                                  ? AppTheme.error
-                                  : AppTheme.primary,
-                              fontSize: 12,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        Icon(Icons.edit_rounded,
-                            color: _serverUrl.isEmpty
-                                ? AppTheme.error
-                                : AppTheme.textHint,
-                            size: 16),
-                      ],
-                    ),
+                    ],
                   ),
                 ).animate().fadeIn(delay: 150.ms),
 

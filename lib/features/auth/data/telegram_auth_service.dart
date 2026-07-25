@@ -1,25 +1,23 @@
-import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../../../core/constants/app_constants.dart';
+import '../../../core/services/tdlib_service.dart';
 
-// ── Provider ─────────────────────────────────────────────────────────────────
+// ── Provider ──────────────────────────────────────────────────────────────────
 
 final telegramAuthServiceProvider = Provider<TelegramAuthService>((ref) {
   return TelegramAuthService();
 });
 
-// ── Result model ─────────────────────────────────────────────────────────────
+// ── Result model ──────────────────────────────────────────────────────────────
 
 class AuthResult {
   final bool success;
   final bool needsPassword;
-  final String? phoneCodeHash;
-  final String? sessionString;
+  final String? phoneCodeHash; // kept for API compat, unused in TDLib path
+  final String? sessionString; // kept for API compat
   final String? error;
   final Map<String, dynamic>? user;
 
@@ -33,193 +31,135 @@ class AuthResult {
   });
 }
 
-// ── Storage keys ──────────────────────────────────────────────────────────────
+// ── Storage keys ───────────────────────────────────────────────────────────────
 
-const _kSession      = 'tg_session';      // stored in FlutterSecureStorage (encrypted)
+const _kSession      = 'tg_session';
 const _kUserId       = 'tg_user_id';
 const _kFirstName    = 'tg_first_name';
 const _kLastName     = 'tg_last_name';
 const _kPhone        = 'tg_phone';
 const _kUsername     = 'tg_username';
-const kServerUrl     = 'server_url';       // public so Settings can write it
-const kNeedsDbResync = 'needs_db_resync';  // flag: set on logout, cleared after resync
+const kNeedsDbResync = 'needs_db_resync';
 
 // ── Service ───────────────────────────────────────────────────────────────────
 
 class TelegramAuthService {
 
-  /// ┌─ SECURITY: Session string is stored in Android Keystore via
-  /// │  flutter_secure_storage — hardware-backed AES-256 encryption.
-  /// │  Even if the device is rooted, extracting this value requires
-  /// │  defeating the Keystore TEE (Trusted Execution Environment).
-  /// └──────────────────────────────────────────────────────────────
+  // Hardware-encrypted storage for session token (Android Keystore)
   static const _secure = FlutterSecureStorage(
     aOptions: AndroidOptions(
-      encryptedSharedPreferences: true,   // AES-256 via Android Keystore
+      encryptedSharedPreferences: true,
     ),
   );
 
-  // Read the URL from SharedPreferences every call so Settings changes apply
-  // immediately without restarting the app.
-  Future<String> get _base async {
-    final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getString(kServerUrl) ?? '';
-    return saved.isNotEmpty ? saved : AppConstants.backendBaseUrl;
-  }
-
-  // ── HTTP helpers ────────────────────────────────────────────────────────────
-
-  /// All authenticated API calls use Authorization: Bearer <token> header.
-  /// The session string NEVER appears in URLs or request bodies.
-  Future<Map<String, dynamic>> _post(
-      String path, Map<String, dynamic> body) async {
-    final base = await _base;
-    final uri = Uri.parse('$base$path');
-    try {
-      final resp = await http
-          .post(uri,
-              headers: {'Content-Type': 'application/json'},
-              body: jsonEncode(body))
-          .timeout(const Duration(seconds: 30));
-      final data = jsonDecode(resp.body) as Map<String, dynamic>;
-      if (resp.statusCode >= 400) {
-        throw Exception(data['detail'] ?? 'Server error ${resp.statusCode}');
-      }
-      return data;
-    } on Exception catch (e) {
-      final msg = e.toString();
-      if (msg.contains('TimeoutException') || msg.contains('SocketException') ||
-          msg.contains('Connection refused') || msg.contains('Network')) {
-        throw Exception(
-          '❌ Cannot reach server.\n\n'
-          'The cloud server is temporarily unavailable.\n'
-          'Please check your internet connection and try again.\n\n'
-          'Server URL: $base',
-        );
-      }
-      rethrow;
-    }
-  }
-
-  // ── Secure storage helpers ──────────────────────────────────────────────────
-
-  /// Write session string to Android Keystore (hardware-encrypted).
-  Future<void> _writeSession(String value) =>
-      _secure.write(key: _kSession, value: value);
-
-  /// Read session string from Android Keystore.
-  Future<String> _readSession() async =>
-      await _secure.read(key: _kSession) ?? '';
-
-  /// Delete session string from Android Keystore.
-  Future<void> _deleteSession() => _secure.delete(key: _kSession);
+  TdlibService get _tdlib => TdlibService.instance;
 
   Future<SharedPreferences> get _prefs => SharedPreferences.getInstance();
 
-  Future<void> _saveSession(Map<String, dynamic> data) async {
-    // ✅ Session goes to Android Keystore (hardware encrypted)
-    await _writeSession(data['session_string'] ?? '');
+  // ── Session helpers ──────────────────────────────────────────────────────────
 
-    // Non-sensitive profile data stays in SharedPreferences
+  Future<void> _writeSession(String value) =>
+      _secure.write(key: _kSession, value: value);
+
+  Future<String> _readSession() async =>
+      await _secure.read(key: _kSession) ?? '';
+
+  Future<void> _deleteSession() => _secure.delete(key: _kSession);
+
+  Future<void> _saveProfile(Map<String, dynamic> user) async {
+    // Write session marker first — this is what isLoggedIn() checks
+    await _writeSession('tdlib_active');
+
     final prefs = await _prefs;
-    await prefs.setString(_kUserId,    (data['user_id'] ?? '').toString());
-    await prefs.setString(_kFirstName, data['first_name'] ?? '');
-    await prefs.setString(_kLastName,  data['last_name']  ?? '');
-    await prefs.setString(_kPhone,     data['phone']      ?? '');
-    await prefs.setString(_kUsername,  data['username']   ?? '');
+    // user['id'] can be int from TDLib JSON
+    final uid = (user['id'] ?? '').toString();
+    final firstName = user['first_name'] as String? ?? '';
+    final lastName  = user['last_name']  as String? ?? '';
+    final phone     = user['phone_number'] as String? ?? '';
+    final username  = (user['usernames'] as Map<String, dynamic>?)?['editable_username'] as String?
+        ?? user['username'] as String? ?? '';
+
+    await prefs.setString(_kUserId,    uid);
+    await prefs.setString(_kFirstName, firstName);
+    await prefs.setString(_kLastName,  lastName);
+    await prefs.setString(_kPhone,     phone);
+    await prefs.setString(_kUsername,  username);
   }
 
-  // Save / load server URL
-  static Future<void> saveServerUrl(String url) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(kServerUrl, url.trimRight().replaceAll(RegExp(r'/$'), ''));
-  }
+  // ── Public Auth API ───────────────────────────────────────────────────────────
 
-  static Future<String> loadServerUrl() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(kServerUrl) ?? '';
-  }
-
-  // ── Public API ──────────────────────────────────────────────────────────────
-
-  /// Step 1 – Send OTP to the phone via Telegram.
+  /// Step 1 — Send OTP to the phone via Telegram MTProto (direct, no server).
   Future<AuthResult> sendCode(String phone) async {
     try {
-      final data = await _post('/auth/send-code', {'phone': phone});
-      return AuthResult(
-        success: true,
-        phoneCodeHash: data['phone_code_hash'],
-        sessionString: data['session_string'],
-      );
+      final result = await _tdlib.sendCode(phone);
+      if (!result.success) {
+        return AuthResult(success: false, error: result.error);
+      }
+      return const AuthResult(success: true);
     } catch (e) {
-      return AuthResult(success: false, error: e.toString());
+      return AuthResult(success: false, error: _friendly(e));
     }
   }
 
-  /// Step 2 – Verify the OTP received on Telegram.
+  /// Step 2 — Verify the OTP received on Telegram.
   Future<AuthResult> verifyCode({
     required String phone,
-    required String phoneCodeHash,
+    required String phoneCodeHash, // kept for API compat, not used by TDLib
     required String code,
-    String partialSession = '',
+    String partialSession = '',    // kept for API compat, not used by TDLib
   }) async {
     try {
-      final data = await _post('/auth/verify-code', {
-        'phone': phone,
-        'phone_code_hash': phoneCodeHash,
-        'code': code,
-        'session_string': partialSession, // CRITICAL: reuse DC from send-code
-      });
-
-      if (data['needs_password'] == true) {
-        // Temporarily store partial session securely while 2FA is entered
-        await _writeSession(data['session_string'] ?? '');
-        return AuthResult(
-          success: true,
-          needsPassword: true,
-          sessionString: data['session_string'],
-        );
+      final result = await _tdlib.verifyCode(code);
+      if (!result.success) {
+        return AuthResult(success: false, error: result.error);
       }
-
-      await _saveSession(data);
-      return AuthResult(
-        success: true,
-        sessionString: data['session_string'],
-        user: data,
-      );
+      if (result.needsPassword) {
+        return const AuthResult(success: true, needsPassword: true);
+      }
+      if (result.user != null) {
+        await _saveProfile(result.user!);
+      }
+      return AuthResult(success: true, user: result.user);
     } catch (e) {
-      return AuthResult(success: false, error: e.toString());
+      return AuthResult(success: false, error: _friendly(e));
     }
   }
 
-  /// Step 3 (optional) – Complete 2FA with cloud password.
+  /// Step 3 (optional) — Complete 2FA with cloud password.
   Future<AuthResult> verifyPassword(String password) async {
     try {
-      final session = await _readSession();
-      final data = await _post('/auth/verify-2fa', {
-        'session_string': session,
-        'password': password,
-      });
-      await _saveSession(data);
-      return AuthResult(
-        success: true,
-        sessionString: data['session_string'],
-        user: data,
-      );
+      final result = await _tdlib.verifyPassword(password);
+      if (!result.success) {
+        return AuthResult(success: false, error: result.error);
+      }
+      if (result.user != null) {
+        await _saveProfile(result.user!);
+      }
+      return AuthResult(success: true, user: result.user);
     } catch (e) {
-      return AuthResult(success: false, error: e.toString());
+      return AuthResult(success: false, error: _friendly(e));
     }
   }
 
-  /// Check whether the locally stored session is still valid on Telegram.
+  /// Check whether user has a stored session (fast, no network).
   Future<bool> isLoggedIn() async {
     final session = await _readSession();
-    if (session.isEmpty) return false;
+    return session.isNotEmpty; // 'tdlib_active' = logged in
+  }
+
+  /// Clear session if it turns out to be stale (TDLib reported not authorized).
+  Future<void> clearStaleSession() async {
+    await _deleteSession();
+  }
+
+  /// Save profile when TDLib confirms authorization (called after verifyCode).
+  Future<void> saveProfileFromTdlib() async {
     try {
-      final data = await _post('/auth/check-session', {'session_string': session});
-      return data['valid'] == true;
+      final me = await _tdlib.getMe();
+      await _saveProfile(me);
     } catch (_) {
-      return false;
+      // Fallback: at least write the session marker
+      await _writeSession('tdlib_active');
     }
   }
 
@@ -235,23 +175,18 @@ class TelegramAuthService {
     };
   }
 
-  /// Return the stored session string (from hardware-encrypted storage).
+  /// Returns a non-empty string when logged in (used by storage service checks).
   Future<String> getSession() => _readSession();
 
-  /// Sign out: revoke session on Telegram and clear all secure + prefs storage.
+  /// Sign out: log out from Telegram and clear all local state.
   Future<void> logout() async {
     try {
-      final session = await _readSession();
-      if (session.isNotEmpty) {
-        await _post('/auth/logout', {'session_string': session});
-      }
+      await _tdlib.logout();
     } catch (_) {}
 
-    // ✅ Wipe session from Android Keystore
     await _deleteSession();
 
     final prefs = await _prefs;
-    // Set flag so the next login triggers a full DB wipe + resync
     await prefs.setBool(kNeedsDbResync, true);
     await prefs.remove(_kUserId);
     await prefs.remove(_kFirstName);
@@ -266,9 +201,43 @@ class TelegramAuthService {
     return prefs.getBool(kNeedsDbResync) ?? false;
   }
 
-  /// Clear the resync flag once sync completes successfully.
+  /// Clear the resync flag once sync completes.
   Future<void> clearResyncFlag() async {
     final prefs = await _prefs;
     await prefs.remove(kNeedsDbResync);
+  }
+
+  // ── Error helper ─────────────────────────────────────────────────────────────
+
+  String _friendly(Object e) {
+    final msg = e.toString().replaceFirst('Exception: ', '');
+    if (msg.contains('PHONE_NUMBER_INVALID')) {
+      return 'Invalid phone number. Include country code (e.g. +91...).';
+    }
+    if (msg.contains('PHONE_CODE_INVALID')) {
+      return 'Invalid verification code. Check Telegram and try again.';
+    }
+    if (msg.contains('PHONE_CODE_EXPIRED')) {
+      return 'Code expired. Tap \'Resend\' to get a new one.';
+    }
+    if (msg.contains('PASSWORD_HASH_INVALID')) {
+      return 'Wrong 2FA password. Try again.';
+    }
+    if (msg.contains('FLOOD_WAIT')) {
+      return 'Too many attempts. Please wait a few minutes and try again.';
+    }
+    if (msg.contains('still initializing') || msg.contains('not initialized')) {
+      return 'Telegram is still connecting. Please wait a moment and try again.';
+    }
+    if (msg.contains('Timed out waiting') || msg.contains('Timeout')) {
+      return 'Connecting to Telegram timed out. Check your internet and try again.';
+    }
+    if (msg.contains('SocketException') || msg.contains('Connection')) {
+      return 'No internet connection. Check your network and try again.';
+    }
+    if (msg.contains('TDLib closed')) {
+      return 'Telegram connection was reset. Please restart the app.';
+    }
+    return msg;
   }
 }

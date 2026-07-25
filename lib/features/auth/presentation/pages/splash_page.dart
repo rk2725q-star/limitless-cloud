@@ -3,6 +3,7 @@ import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../core/constants/app_routes.dart';
 import '../../../../core/constants/app_constants.dart';
+import '../../../../core/services/tdlib_service.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../data/telegram_auth_service.dart';
 
@@ -28,16 +29,63 @@ class _SplashPageState extends ConsumerState<SplashPage>
   }
 
   Future<void> _checkAuth() async {
-    await Future.delayed(const Duration(seconds: 3));
+    // Show splash for at least 2 seconds (branding moment)
+    await Future.delayed(const Duration(seconds: 2));
     if (!mounted) return;
 
     final authService = ref.read(telegramAuthServiceProvider);
-    final isLoggedIn = await authService.isLoggedIn();
 
+    // ── Step 1: Check local session marker ─────────────────────────────────
+    // This is a lightweight flag written to SharedPreferences on successful
+    // login and cleared on explicit logout. It does NOT require network.
+    final session = await authService.getSession();
+    if (session.isEmpty) {
+      // First launch or explicit logout — go to login
+      if (!mounted) return;
+      Navigator.of(context).pushReplacementNamed(AppRoutes.phoneInput);
+      return;
+    }
+
+    // ── Step 2: Wait for TDLib to settle ───────────────────────────────────
+    // TDLib is initialised 100ms after runApp() and then needs a few seconds
+    // to negotiate with Telegram servers.  We poll up to 20 seconds.
+    //
+    // IMPORTANT: we only CLEAR the session if TDLib explicitly reports
+    // authorizationStateWaitPhoneNumber — meaning the stored credentials
+    // are truly invalid.  A timeout just means a slow connection; we still
+    // trust the session marker and send the user home.
+    String lastState = '';
+    for (int i = 0; i < 40; i++) {          // 40 × 500ms = 20 s max
+      lastState = TdlibService.instance.authState;
+
+      if (lastState == 'authorizationStateReady') {
+        // TDLib confirmed: session is valid → go home
+        if (!mounted) return;
+        Navigator.of(context).pushReplacementNamed(AppRoutes.home);
+        return;
+      }
+
+      if (lastState == 'authorizationStateWaitPhoneNumber') {
+        // TDLib explicitly rejected the stored session → clear and re-login
+        await authService.clearStaleSession();
+        if (!mounted) return;
+        Navigator.of(context).pushReplacementNamed(AppRoutes.phoneInput);
+        return;
+      }
+
+      // Intermediate / closing states — keep waiting
+      await Future.delayed(const Duration(milliseconds: 500));
+      if (!mounted) return;
+    }
+
+    // ── Step 3: Timeout — trust the session marker ─────────────────────────
+    // TDLib didn't reach a definitive state within 20 s (very slow network or
+    // first cold start on a slow device).  We do NOT clear the session —
+    // that would log the user out for no reason.
+    // Instead, send them to the home page; TDLib will finish connecting in
+    // the background and syncFromTelegram() will pick up their files.
     if (!mounted) return;
-    Navigator.of(context).pushReplacementNamed(
-      isLoggedIn ? AppRoutes.home : AppRoutes.phoneInput,
-    );
+    Navigator.of(context).pushReplacementNamed(AppRoutes.home);
   }
 
   @override
@@ -56,11 +104,9 @@ class _SplashPageState extends ConsumerState<SplashPage>
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              // ── Logo ──────────────────────────────────────────────────────
               _buildLogo(),
               const SizedBox(height: 32),
 
-              // ── App Name ──────────────────────────────────────────────────
               Text(
                 AppConstants.appName,
                 style: AppTheme.displayLarge.copyWith(
@@ -78,16 +124,13 @@ class _SplashPageState extends ConsumerState<SplashPage>
 
               Text(
                 AppConstants.appTagline,
-                style: AppTheme.bodyMedium.copyWith(
-                  letterSpacing: 0.5,
-                ),
+                style: AppTheme.bodyMedium.copyWith(letterSpacing: 0.5),
               )
                   .animate()
                   .fadeIn(delay: 900.ms, duration: 600.ms),
 
               const SizedBox(height: 80),
 
-              // ── Loading Indicator ─────────────────────────────────────────
               _buildLoadingDots(),
             ],
           ),

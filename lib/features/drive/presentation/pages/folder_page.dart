@@ -202,8 +202,6 @@ class _FolderPageState extends ConsumerState<FolderPage> {
               // Files list / grid
               filesAsync.when(
                 data: (files) {
-                  final sessionAsync = ref.watch(sessionProvider);
-                  final session = sessionAsync.valueOrNull ?? '';
                   const imgExts = {
                     'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'avif'
                   };
@@ -233,7 +231,6 @@ class _FolderPageState extends ConsumerState<FolderPage> {
                                 final isImg = imgExts.contains(f.extension.toLowerCase());
                                 return FileGridItem(
                                   file: f,
-                                  sessionString: session,
                                   isSelected: drive.selectedFileIds.contains(f.id),
                                   isSelectionMode: drive.isSelectionMode,
                                   onTap: () {

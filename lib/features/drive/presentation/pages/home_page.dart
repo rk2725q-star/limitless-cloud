@@ -1,8 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:cached_network_image/cached_network_image.dart';
 import '../../../../core/constants/app_routes.dart';
-import '../../../../core/constants/app_constants.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
 import '../../../auth/data/telegram_auth_service.dart';
@@ -355,8 +353,6 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
   }
 
   Widget _buildFileGrid(BuildContext context, WidgetRef ref, List<CloudFile> files, DriveState drive) {
-    final sessionAsync = ref.watch(sessionProvider);
-    final session = sessionAsync.valueOrNull ?? '';
     return SliverPadding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
       sliver: SliverGrid(
@@ -368,7 +364,6 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
               file: f,
               isSelected: drive.selectedFileIds.contains(f.id),
               isSelectionMode: drive.isSelectionMode,
-              sessionString: session,
               onTap: () => drive.isSelectionMode
                   ? ref.read(driveProvider.notifier).toggleSelection(f.id)
                   : isImg
@@ -844,8 +839,6 @@ class _ImageGalleryGrid extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final sessionAsync = ref.watch(sessionProvider);
-    final session = sessionAsync.valueOrNull ?? '';
     return GridView.builder(
       padding: const EdgeInsets.fromLTRB(12, 4, 12, 80),
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
@@ -862,7 +855,7 @@ class _ImageGalleryGrid extends ConsumerWidget {
             AppRoutes.imageViewer,
             arguments: {'file': f, 'allFiles': files, 'initialIndex': i},
           ),
-          child: _GalleryThumbnail(file: f, session: session),
+          child: _GalleryThumbnail(file: f),
         );
       },
     );
@@ -871,38 +864,13 @@ class _ImageGalleryGrid extends ConsumerWidget {
 
 class _GalleryThumbnail extends StatelessWidget {
   final CloudFile file;
-  final String session;
-  const _GalleryThumbnail({required this.file, required this.session});
-
-  /// Clean URL — session NOT in query params (security fix).
-  String? get _streamUrl {
-    if (session.isEmpty) return null;
-    return '${AppConstants.backendBaseUrl}/files/download/${file.telegramMessageId}';
-  }
-
-  /// Session sent as Authorization header — never visible in logs or URLs.
-  Map<String, String> get _authHeaders => {'Authorization': 'Bearer $session'};
+  const _GalleryThumbnail({required this.file});
 
   @override
   Widget build(BuildContext context) {
     final color = FileUtils.getFileColor(file.extension);
-    final url = _streamUrl;
-
-    Widget content;
-    if (url != null) {
-      content = CachedNetworkImage(
-        imageUrl: url,
-        httpHeaders: _authHeaders,   // ✅ Auth in header, not URL
-        fit: BoxFit.cover,
-        memCacheWidth: 300,
-        placeholder: (_, __) => _imgPlaceholder(color),
-        errorWidget: (_, __, ___) => _imgPlaceholder(color),
-      );
-
-    } else {
-      content = _imgPlaceholder(color);
-    }
-
+    // Serverless mode: no backend URL for streaming thumbnails
+    // Show image icon placeholder instead
     return Container(
       clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
@@ -912,7 +880,7 @@ class _GalleryThumbnail extends StatelessWidget {
       child: Stack(
         fit: StackFit.expand,
         children: [
-          content,
+          _imgPlaceholder(color),
           // Bottom gradient
           Positioned(
             bottom: 0, left: 0, right: 0,

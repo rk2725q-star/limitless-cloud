@@ -134,7 +134,17 @@ class DriveNotifier extends StateNotifier<DriveState> {
   Future<String?> get _userId async {
     final authService = _ref.read(telegramAuthServiceProvider);
     final profile = await authService.getProfile();
-    final uid = profile['userId'] ?? '';
+    var uid = profile['userId'] ?? '';
+
+    // Fallback: if profile not stored yet, fetch from TDLib directly
+    if (uid.isEmpty) {
+      try {
+        await authService.saveProfileFromTdlib();
+        final refreshed = await authService.getProfile();
+        uid = refreshed['userId'] ?? '';
+      } catch (_) {}
+    }
+
     return uid.isEmpty ? null : uid;
   }
 

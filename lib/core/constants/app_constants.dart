@@ -10,10 +10,10 @@ class AppConstants {
   static const int telegramApiId = 36148181;
   static const String telegramApiHash = 'cf8e8509b0ceaf5b229ad47f59b79e6e';
 
-  // ── Backend Server ────────────────────────────────────────────────────────
-  // ✅ Production: deployed on Railway — works from any network, no PC needed!
-  static const String backendBaseUrl = 'https://limitless-cloud-production.up.railway.app';
-  // Local dev: run server/start_server.bat and use LAN IP:
+  // ── Backend Server ────────────────────────────────────────────
+  // ✅ SERVERLESS: Flutter → Telegram MTProto direct (via TDLib/handy_tdlib)
+  // No backend server needed! Railway server has been eliminated.
+  // If needed for debugging, set backendBaseUrl to a local dev server:
   // static const String backendBaseUrl = 'http://192.168.1.5:8000';
 
 

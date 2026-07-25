@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'app.dart';
 import 'features/drive/data/offline_cache_service.dart';
 import 'core/services/upload_background_service.dart';
+import 'core/services/tdlib_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -49,10 +50,19 @@ void main() async {
         child: LimitlessCloudApp(),
       ),
     );
+
+    // ── Init TDLib AFTER runApp so the UI appears instantly ──────────────────
+    // TDLib loads a ~28MB native library — doing it before runApp causes
+    // the user to stare at a blank screen for 2-5 seconds.
+    // 100ms is enough for the widget tree to render before we start loading.
+    Future.delayed(const Duration(milliseconds: 100), () async {
+      try {
+        await initTdlibService();
+      } catch (e) {
+        if (kDebugMode) debugPrint('TDLib init failed: $e');
+      }
+    });
   }, (error, stack) {
-    // Async zone errors — log in debug only, never crash the process
-    if (kDebugMode) {
-      debugPrint('Zone error: $error\n$stack');
-    }
+    if (kDebugMode) debugPrint('Zone error: $error\n$stack');
   });
 }

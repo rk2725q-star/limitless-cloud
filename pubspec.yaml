@@ -38,10 +38,12 @@ dependencies:
   flutter_secure_storage: ^9.2.2
 
 
-  # Networking
-  http: ^1.2.2
-  http_parser: ^4.0.2
+  # Networking — Dio for external URL downloads only (Telegram via TDLib direct)
   dio: ^5.7.0
+
+  # Telegram MTProto — direct connection, zero server
+  handy_tdlib: ^2.3.10     # TDLib FFI bindings for Flutter/Android (official C++ TDLib)
+  ffi: ^2.1.3              # Required by handy_tdlib
 
   # Utilities
   intl: ^0.19.0

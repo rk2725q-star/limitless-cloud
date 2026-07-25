@@ -162,7 +162,7 @@ packages:
     source: hosted
     version: "1.3.3"
   ffi:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: ffi
       sha256: "6d7fd89431262d8f3125e81b50d3847a091d846eafcd4fdb88dd06f36d705a45"
@@ -432,6 +432,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "6.3.3"
+  handy_tdlib:
+    dependency: "direct main"
+    description:
+      name: handy_tdlib
+      sha256: "006de38a7fd8dd809acc9b7c071c0df7a4e383f572fdd6970f95abc9db3aa837"
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.3.10"
   hooks:
     dependency: transitive
     description:
@@ -441,7 +449,7 @@ packages:
     source: hosted
     version: "1.0.3"
   http:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: http
       sha256: "87721a4a50b19c7f1d49001e51409bddc46303966ce89a65af4f4e6004896412"
@@ -449,7 +457,7 @@ packages:
     source: hosted
     version: "1.6.0"
   http_parser:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: http_parser
       sha256: "178d74305e7866013777bab2c3d8726205dc5a4dd935297175b19a23a2e66571"

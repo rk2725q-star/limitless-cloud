@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
@@ -10,6 +9,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
+import '../../../../core/services/tdlib_service.dart';
 import '../../../../core/services/upload_background_service.dart';
 import '../../data/models/cloud_file.dart';
 import '../../data/telegram_storage_service.dart';
@@ -112,18 +112,36 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
     }
   }
 
+  /// Wait for TDLib to reach authorizationStateReady before downloading.
+  /// Throws if TDLib doesn't become ready within [timeout].
+  Future<void> _waitForTdlib({
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    final tdlib = TdlibService.instance;
+    final deadline = DateTime.now().add(timeout);
+    while (tdlib.authState != 'authorizationStateReady') {
+      if (DateTime.now().isAfter(deadline)) {
+        throw Exception(
+            'Telegram is still connecting. Please wait a moment and try again.');
+      }
+      final s = tdlib.authState;
+      if (s == 'authorizationStateWaitPhoneNumber' ||
+          s == 'authorizationStateClosed' ||
+          s == 'authorizationStateClosing') {
+        throw Exception(
+            'Not logged in to Telegram. Please log in and try again.');
+      }
+      await Future.delayed(const Duration(milliseconds: 300));
+    }
+  }
+
   /// Download a Telegram cloud file to public Downloads folder.
   ///
-  /// Routing:
-  ///   • Single-message file (sizeBytes < 2 GB or chunkMessageIds empty)
-  ///     → GET  /files/download/{message_id}          (parallel stream)
-  ///   • Multi-part file (chunkMessageIds has 2+ IDs)
-  ///     → POST /files/download-chunked               (stitched stream)
+  /// Routing (serverless — direct via TDLib):
+  ///   • Single-message file → TdlibService.downloadFile (TDLib internal parallel)
+  ///   • Multi-part file     → TdlibService.downloadChunkedFile (8 isolate workers)
   ///
-  /// Reliability:
-  ///   • receiveTimeout = Duration.zero (no timeout — large files take time)
-  ///   • Up to 3 automatic retries with 5 s / 15 s / 30 s back-off
-  ///   • Foreground notification keeps download alive when app is closed
+  /// Up to 3 automatic retries with 5 s / 15 s / 30 s back-off.
   Future<void> downloadCloudFile(CloudFile file, TelegramStorageService tg) async {
     final taskId = file.id;
     if (state.any((t) => t.id == taskId && t.status == DlStatus.downloading)) return;
@@ -141,101 +159,83 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
     await UploadBackgroundService.startUpload('Downloading ${file.name}');
 
     for (var attempt = 1; attempt <= maxRetries; attempt++) {
-      // Create a fresh CancelToken for each attempt
-      final cancelToken = CancelToken();
-      _cancelTokens[taskId] = cancelToken;
-
       try {
+        // ── Guard: wait for TDLib to be ready ─────────────────────────────
+        // TDLib initialises ~100ms after runApp(). If the user triggers a
+        // download immediately after opening the app, TDLib may not have
+        // finished setTdlibParameters yet, causing "Initialization parameters
+        // are needed" errors. We wait up to 30 s before every attempt.
+        _updateTask(taskId, status: DlStatus.downloading,
+            error: attempt == 1 ? null : 'Connecting to Telegram…');
+        await _waitForTdlib();
+
         final ok = await _requestPermission();
         if (!ok) throw Exception('Storage permission denied');
 
         final dir  = await _downloadsDir();
         final dest = _uniquePath(dir.path, file.name);
-        final session = await tg.authService.getSession();
-        final base    = tg.backendBaseUrl;
 
-        // ── Route: chunked (>2 GB multi-part) vs single message ──────────────
+        // ── Serverless: route directly via TDLib ─────────────────────────
         if (file.isChunked && file.chunkMessageIds.length > 1) {
-          await _dio.download(
-            '$base/files/download-chunked',
+          // Multi-part file (≥ 2 GB) — stitch all chunk messages into one file
+          await tg.downloadChunkedFile(
+            file.chunkMessageIds,
             dest,
-            deleteOnError: true,
-            cancelToken: cancelToken,
-            data: jsonEncode({'message_ids': file.chunkMessageIds}), // no session in body
-            options: Options(
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': 'Bearer $session',  // ✅ header only
-              },
-              receiveTimeout: Duration.zero,
-              sendTimeout: const Duration(seconds: 30),
-              responseType: ResponseType.stream,
-            ),
-            onReceiveProgress: (received, total) {
-              final t = total > 0 ? total : file.sizeBytes;
-              _updateTask(taskId,
-                progress: t > 0 ? received / t : -1,
-                totalBytes: t > 0 ? t : received);
-              UploadBackgroundService.updateProgress(file.name, t > 0 ? received / t : 0);
+            onProgress: (p) {
+              _updateTask(taskId, progress: p, totalBytes: file.sizeBytes);
+              UploadBackgroundService.updateProgress(file.name, p);
             },
           );
         } else {
-          await _dio.download(
-            '$base/files/download/${file.telegramMessageId}',
-            dest,
-            deleteOnError: true,
-            cancelToken: cancelToken,
-            options: Options(
-              receiveTimeout: Duration.zero,
-              sendTimeout: const Duration(seconds: 30),
-              responseType: ResponseType.stream,
-              headers: {'Authorization': 'Bearer $session'},  // ✅ header, not URL
-            ),
-            onReceiveProgress: (received, total) {
-              final t = total > 0 ? total : file.sizeBytes;
-              _updateTask(taskId,
-                progress: t > 0 ? received / t : -1,
-                totalBytes: t > 0 ? t : received);
-              UploadBackgroundService.updateProgress(file.name, t > 0 ? received / t : 0);
-            },
+          // Single-message file — TDLib fetches via getMessage → downloadFile
+          // tg.downloadFile() saves to app documents dir and returns the File.
+          final downloaded = await tg.downloadFile(
+            file.telegramMessageId,
+            file.name,
           );
+          // Copy from TDLib's internal cache to the public Downloads folder.
+          await downloaded.copy(dest);
+          _updateTask(taskId, progress: 1.0, totalBytes: file.sizeBytes);
         }
 
-        _cancelTokens.remove(taskId);
         _updateTask(taskId, status: DlStatus.done, progress: 1.0, savedPath: dest);
         await UploadBackgroundService.stopUpload();
         return;
 
-      } on DioException catch (e) {
-        _cancelTokens.remove(taskId);
-        // Cancelled by user — silently stop (task already removed from UI)
-        if (CancelToken.isCancel(e)) {
-          await UploadBackgroundService.stopUpload();
-          return;
-        }
-        final isLast = attempt == maxRetries;
-        if (isLast) {
-          _updateTask(taskId, status: DlStatus.failed, error: _friendlyDlError(e));
-          await UploadBackgroundService.stopUpload();
-          return;
-        }
-        _updateTask(taskId, status: DlStatus.downloading, error: 'Retrying ($attempt/$maxRetries)…');
-        await Future.delayed(Duration(seconds: backoffs[attempt - 1]));
-
       } catch (e) {
-        _cancelTokens.remove(taskId);
         final isLast = attempt == maxRetries;
         if (isLast) {
           _updateTask(taskId, status: DlStatus.failed,
-            error: e.toString().replaceFirst('Exception: ', ''));
+            error: _friendlyCloudError(e.toString()));
           await UploadBackgroundService.stopUpload();
           return;
         }
-        _updateTask(taskId, status: DlStatus.downloading, error: 'Retrying ($attempt/$maxRetries)…');
+        _updateTask(taskId, status: DlStatus.downloading,
+            error: 'Retrying ($attempt/$maxRetries)…');
         await Future.delayed(Duration(seconds: backoffs[attempt - 1]));
       }
     }
+  }
+
+  /// Human-friendly error for cloud/TDLib download failures.
+  String _friendlyCloudError(String raw) {
+    final msg = raw.replaceFirst('Exception: ', '');
+    if (msg.contains('Initialization parameters') || msg.contains('setTdlibParameters')) {
+      return 'Telegram is still starting up. Please try again in a moment.';
+    }
+    if (msg.contains('Not Found') || msg.contains('not found') || msg.contains('MESSAGE_NOT_FOUND')) {
+      return 'File not found in Telegram. It may have been deleted.';
+    }
+    if (msg.contains('still connecting') || msg.contains('Not logged in')) {
+      return msg;
+    }
+    if (msg.contains('Timed out') || msg.contains('timeout')) {
+      return 'Download timed out. Check your connection and retry.';
+    }
+    if (msg.contains('SocketException') || msg.contains('Connection')) {
+      return 'No internet connection. Check network and retry.';
+    }
+    return msg;
   }
 
   /// Human-friendly download error message

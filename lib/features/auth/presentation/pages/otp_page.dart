@@ -91,9 +91,9 @@ class _OtpPageState extends ConsumerState<OtpPage> {
     if (result.success) {
       if (result.needsPassword) {
         // 2FA is enabled — navigate to password screen
+        // No session_string needed for TDLib path (2FA state is held by TDLib internally)
         Navigator.of(context).pushNamed(
           AppRoutes.twoFactor,
-          arguments: {'session_string': result.sessionString},
         );
       } else {
         // Fully authenticated — go home
@@ -111,7 +111,10 @@ class _OtpPageState extends ConsumerState<OtpPage> {
 
   Future<void> _resendOTP() async {
     if (!_canResend) return;
+    setState(() => _errorMessage = null);
     final authService = ref.read(telegramAuthServiceProvider);
+    // sendCode internally detects authorizationStateWaitCode and calls
+    // resendAuthenticationCode on TDLib — so this is safe to call here.
     await authService.sendCode(_phone);
     _startResendTimer();
     if (mounted) {

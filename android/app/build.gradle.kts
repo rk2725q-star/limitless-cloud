@@ -31,7 +31,7 @@ android {
 
     defaultConfig {
         applicationId = "com.limitlesscloud.limitless_cloud"
-        minSdk = flutter.minSdkVersion
+        minSdk = flutter.minSdkVersion   // TDLib requires API 21+
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
@@ -62,6 +62,17 @@ android {
         }
         debug {
             signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    // ── ABI splits — each Play Store variant is per-architecture only ──────
+    // This prevents users downloading 3x the native TDLib binary they don't need.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            isUniversalApk = true  // also produce a fat universal APK for sideloading
         }
     }
 }
