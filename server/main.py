@@ -92,6 +92,7 @@ API_HASH = "cf8e8509b0ceaf5b229ad47f59b79e6e"
 
 # ── Concurrency limits ────────────────────────────────────────────────────────
 _LIGHT_SEM             = asyncio.Semaphore(8)   # auth / list / meta
+_HEAVY_SEM             = asyncio.Semaphore(2)   # legacy single-shot upload (large file, temp-file to disk)
 MAX_CONCURRENT_UPLOADS = 3                       # max simultaneous uploads
 MAX_CONCURRENT_DOWNLOADS = 4                     # max simultaneous full-file downloads
 _DL_SEM                = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)

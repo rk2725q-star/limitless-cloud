@@ -120,9 +120,13 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
     final tdlib = TdlibService.instance;
     final deadline = DateTime.now().add(timeout);
     while (tdlib.authState != 'authorizationStateReady') {
+      if (tdlib.initError != null) {
+        throw Exception(
+            'Telegram core failed to load: ${tdlib.initError}. The split ABI APK might be missing native libraries. Please install the universal APK.');
+      }
       if (DateTime.now().isAfter(deadline)) {
         throw Exception(
-            'Telegram is still connecting. Please wait a moment and try again.');
+            'Telegram is stuck connecting (State: "${tdlib.authState}"). Please clear app data and log in again.');
       }
       final s = tdlib.authState;
       if (s == 'authorizationStateWaitPhoneNumber' ||

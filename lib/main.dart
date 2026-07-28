@@ -59,6 +59,7 @@ void main() async {
       try {
         await initTdlibService();
       } catch (e) {
+        TdlibService.instance.initError = e.toString();
         if (kDebugMode) debugPrint('TDLib init failed: $e');
       }
     });

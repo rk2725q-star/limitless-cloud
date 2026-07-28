@@ -105,6 +105,9 @@ class TdlibService {
   String _authState = '';
   String get authState => _authState;
 
+  // Initialization error
+  String? initError;
+
   // ── Initialize ──────────────────────────────────────────────────────────────
 
   Future<void> initialize({required String dbPath}) async {
@@ -125,10 +128,16 @@ class TdlibService {
 
     // Subscribe to auth state changes internally
     updates.listen((upd) {
+      if (upd['@type'] == 'error') {
+        initError = 'TDLib Error: ${upd['message']}';
+        return;
+      }
+
       if (upd['@type'] == 'updateAuthorizationState') {
         final state = upd['authorization_state'] as Map<String, dynamic>?;
         final type = state?['@type'] as String? ?? '';
         _authState = type;
+        
         // Respond to encryption key request automatically
         if (type == 'authorizationStateWaitEncryptionKey') {
           _fireAndForget({
@@ -139,7 +148,7 @@ class TdlibService {
       }
     });
 
-    // Send parameters — fire and forget (response comes as updateAuthorizationState)
+    // Send parameters unconditionally — fire and forget
     _fireAndForget({
       '@type': 'setTdlibParameters',
       'use_test_dc': false,
@@ -309,10 +318,9 @@ class TdlibService {
         // Wait for TDLib to reach WaitPhoneNumber after logout
       }
 
-      // Wait for TDLib to reach WaitPhoneNumber (covers: startup negotiation,
-      // encryption key check, and the post-logout transition).
+      // Wait for TDLib to reach WaitPhoneNumber
       await _waitForAuthState('authorizationStateWaitPhoneNumber',
-          timeout: const Duration(seconds: 60));
+          timeout: const Duration(seconds: 10));
 
       await _send({
         '@type': 'setAuthenticationPhoneNumber',
@@ -519,9 +527,14 @@ class TdlibService {
     String? fileName,
   }) async {
     final chatId = await _getSavedMessagesChatId();
-    onProgress?.call(0.1);
+    onProgress?.call(0.0);
 
-    final result = await _send({
+    // ── Step 1: Queue the message send ──────────────────────────────────────
+    // sendMessage returns IMMEDIATELY with a TEMPORARY negative ID.
+    // The real Telegram message ID arrives later via updateMessageSendSucceeded.
+    // If we return the temp ID, the DB will store a broken record that can never
+    // match real messages on sync — causing "files not appearing" after re-login.
+    final pending = await _send({
       '@type': 'sendMessage',
       'chat_id': chatId,
       'message_thread_id': 0,
@@ -535,10 +548,82 @@ class TdlibService {
         },
         'disable_content_type_detection': true,
       },
-    }, timeout: const Duration(minutes: 60));
+    }, timeout: const Duration(minutes: 5));
 
-    onProgress?.call(1.0);
-    return result['id'] as int;
+    final tempId = pending['id'] as int; // negative temp ID
+
+    // ── Step 2: Subscribe to update events BEFORE yielding control ──────────
+    // We listen for:
+    //   updateFile                  → real byte-level upload progress (0→1)
+    //   updateMessageSendSucceeded  → real final message ID
+    //   updateMessageSendFailed     → upload error
+    final completer = Completer<int>();
+
+    StreamSubscription<Map<String, dynamic>>? sub;
+    sub = updates.listen((upd) {
+      final type = upd['@type'] as String?;
+
+      // ── Real upload progress via updateFile ──────────────────────────────
+      if (type == 'updateFile') {
+        try {
+          final fileMap = upd['file'] as Map<String, dynamic>?;
+          final local   = fileMap?['local'] as Map<String, dynamic>?;
+          if (local != null) {
+            final uploadOffset = (local['upload_offset'] as num?)?.toInt() ?? 0;
+            final expectedSize = (fileMap?['expected_size'] as num?)?.toInt()
+                              ?? (fileMap?['size'] as num?)?.toInt()
+                              ?? 0;
+            if (expectedSize > 0 && onProgress != null) {
+              // Clamp to 0.95 — leave 0.95→1.0 for the final ID confirmation step
+              final pct = (uploadOffset / expectedSize).clamp(0.0, 0.95);
+              onProgress(pct);
+            }
+          }
+        } catch (_) {}
+        return;
+      }
+
+      // ── Real message ID when Telegram confirms the send ──────────────────
+      if (type == 'updateMessageSendSucceeded') {
+        final oldId = upd['old_message_id'] as int?;
+        if (oldId == tempId && !completer.isCompleted) {
+          final msg    = upd['message'] as Map<String, dynamic>?;
+          final realId = msg?['id'] as int?;
+          if (realId != null) {
+            completer.complete(realId);
+          } else {
+            completer.completeError(Exception('updateMessageSendSucceeded missing id'));
+          }
+        }
+        return;
+      }
+
+      // ── Upload failure ───────────────────────────────────────────────────
+      if (type == 'updateMessageSendFailed') {
+        final oldId = upd['old_message_id'] as int?;
+        if (oldId == tempId && !completer.isCompleted) {
+          final errMap = upd['error'] as Map<String, dynamic>?;
+          final msg    = errMap?['message'] as String?
+                      ?? 'Telegram rejected the file upload';
+          completer.completeError(Exception(msg));
+        }
+        return;
+      }
+    });
+
+    // ── Step 3: Wait for real ID (up to 60 min for large files) ─────────────
+    try {
+      final realId = await completer.future.timeout(
+        const Duration(minutes: 60),
+        onTimeout: () {
+          throw Exception('Upload timed out after 60 minutes — check your connection');
+        },
+      );
+      onProgress?.call(1.0);
+      return realId;
+    } finally {
+      await sub.cancel();
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -661,6 +746,11 @@ class TdlibService {
       if (messages.isEmpty) break;
 
       for (final msg in messages) {
+        // Skip messages with a TEMPORARY negative ID — these haven't been
+        // confirmed by Telegram yet. Storing them would corrupt the local DB.
+        final msgId = msg['id'] as int;
+        if (msgId <= 0) continue;
+
         final content = msg['content'] as Map<String, dynamic>?;
         if (content == null) continue;
         final caption = _extractCaption(content);
@@ -669,7 +759,7 @@ class TdlibService {
 
         final fileInfo = _extractFileInfo(content);
         results.add(TdSavedMessage(
-          messageId: msg['id'] as int,
+          messageId: msgId,
           caption: caption,
           fileName: fileInfo?['name'] as String?,
           fileSize: fileInfo?['size'] as int? ?? 0,
@@ -836,12 +926,10 @@ class TdlibService {
   String? _extractCaption(Map<String, dynamic> content) {
     final type = content['@type'] as String?;
     switch (type) {
-      case 'messageDocument':
-        final doc = content['document'] as Map<String, dynamic>?;
-        return (doc?['caption'] as Map<String, dynamic>?)?['text'] as String?;
       case 'messageText':
         return (content['text'] as Map<String, dynamic>?)?['text'] as String?;
       default:
+        // messageDocument, messageVideo, messagePhoto, etc. all have 'caption' on the root content object
         final cap = content['caption'] as Map<String, dynamic>?;
         return cap?['text'] as String?;
     }
@@ -869,6 +957,28 @@ class TdlibService {
   void dispose() {
     _pollTimer?.cancel();
     _updateCtrl.close();
+    _fireAndForget({'@type': 'close'});
+  }
+
+  /// Safety net: Aggressively try to close any leaked clients (from hot restart or 
+  /// detached engines) and reinitialize TDLib.
+  Future<void> retryInit() async {
+    initError = null;
+    if (_clientId > 0) {
+      // Send close to our known client, plus a few previous ones just in case 
+      // they were leaked from a previous Isolate in the same C++ process.
+      for (int i = 1; i <= _clientId + 5; i++) {
+        try {
+          TdPlugin.instance.tdSend(i, '{"@type":"close"}');
+        } catch (_) {}
+      }
+    }
+    await Future.delayed(const Duration(milliseconds: 500));
+    _initialized = false;
+    _pollTimer?.cancel();
+    final docs = await getApplicationDocumentsDirectory();
+    final dbPath = p.join(docs.path, 'tdlib_db');
+    await initialize(dbPath: dbPath);
   }
 }
 

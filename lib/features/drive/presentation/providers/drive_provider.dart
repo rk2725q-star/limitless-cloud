@@ -12,6 +12,7 @@ import '../../data/firestore_metadata_service.dart';
 import '../../data/telegram_storage_service.dart';
 import '../../../../core/constants/app_constants.dart';
 import '../../../../core/utils/file_utils.dart';
+import '../../../../core/services/tdlib_service.dart';
 import '../../../../core/services/upload_background_service.dart';
 import 'package:mime/mime.dart';
 
@@ -146,6 +147,47 @@ class DriveNotifier extends StateNotifier<DriveState> {
     }
 
     return uid.isEmpty ? null : uid;
+  }
+
+  // ── TDLib readiness guard ─────────────────────────────────────────────────────────
+
+  /// Waits until TDLib reaches [authorizationStateReady].
+  ///
+  /// Every operation that talks to Telegram (upload, sync, listing) MUST
+  /// call this first.  TDLib is initialised ~100ms after runApp() and needs
+  /// several more seconds to negotiate with Telegram servers.  Without this
+  /// guard, operations fired before the handshake completes hang forever
+  /// (2-hour upload timeout) or fail silently (sync catch block).
+  Future<void> _waitForTdlib({
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    final tdlib = TdlibService.instance;
+    final deadline = DateTime.now().add(timeout);
+    bool retried = false;
+
+    while (tdlib.authState != 'authorizationStateReady') {
+      if (tdlib.initError != null) {
+        if (!retried && tdlib.initError!.contains('lock file')) {
+          retried = true;
+          await tdlib.retryInit();
+          continue;
+        }
+        throw Exception(
+            'Telegram core failed to load: ${tdlib.initError}. Please force-close the app and reopen.');
+      }
+      if (DateTime.now().isAfter(deadline)) {
+        throw Exception(
+            'Telegram is stuck connecting (State: "${tdlib.authState}"). Please clear app data and log in again.');
+      }
+      final s = tdlib.authState;
+      if (s == 'authorizationStateWaitPhoneNumber' ||
+          s == 'authorizationStateClosed' ||
+          s == 'authorizationStateClosing') {
+        throw Exception(
+            'Not logged in to Telegram. Please log in again.');
+      }
+      await Future.delayed(const Duration(milliseconds: 400));
+    }
   }
 
   // ── View Mode ─────────────────────────────────────────────────────────────
@@ -352,6 +394,11 @@ class DriveNotifier extends StateNotifier<DriveState> {
     await UploadBackgroundService.startUpload(fileName);
 
     try {
+      // ── Guard: wait for TDLib before uploading ───────────────────────────
+      // Without this, sendMessage fires before authorizationStateReady and the
+      // upload hangs at 0% forever (2-hour _send timeout).
+      await _waitForTdlib();
+
       final uploadResult = await _telegramService.uploadFileChunked(
         file,
         folderId: folderId,
@@ -501,24 +548,32 @@ class DriveNotifier extends StateNotifier<DriveState> {
     state = state.copyWith(isSyncing: true);
 
     try {
+      // ── Guard: wait for TDLib before ANY Telegram API call ────────────────
+      // Without this, listFolderMeta + listFiles throw before auth is ready,
+      // the catch block swallowed it, and the user saw an empty drive.
+      await _waitForTdlib(timeout: const Duration(seconds: 45));
+
       int foldersImported = 0;
       int filesImported = 0;
 
       final authService = _ref.read(telegramAuthServiceProvider);
 
-      // ── If user just logged in (after logout), wipe stale local DB ─────────
+      // ── If user just logged in (after logout), wipe stale local DB ──────────
+      // IMPORTANT: Do NOT clear the resync flag here. We clear it ONLY after
+      // the sync completes successfully. If sync fails mid-way, the flag must
+      // remain so the next app open retries the wipe + full reimport.
       final needsWipe = await authService.needsDbResync();
       if (needsWipe) {
         await _firestoreService.clearUserData(userId);
-        await authService.clearResyncFlag();
+        // flag cleared below, AFTER successful sync
       }
 
-      // ── Check current DB state ─────────────────────────────────────────────
+      // ── Check current DB state ───────────────────────────────────────────────
       final existingMsgIds     = await _firestoreService.getExistingMessageIds(userId);
       final existingFolderIds  = await _firestoreService.getExistingFolderIds(userId);
       final deletedFolderIds   = await _firestoreService.getDeletedFolderIds(userId);
 
-      // ── STEP 1: Restore folder structure ─────────────────────────────────
+      // ── STEP 1: Restore folder structure ───────────────────────────────────
       final folderMetas = await _telegramService.listFolderMeta();
       if (folderMetas.isNotEmpty) {
         final sorted = _sortFoldersByDepth(folderMetas);
@@ -557,10 +612,18 @@ class DriveNotifier extends StateNotifier<DriveState> {
             folderPath = meta['fp'] as String? ?? '/';
           }
 
+          // Only validate folder exists if we have a folderId.
+          // If folder is missing locally (e.g. folder sync failed), keep the
+          // file in its original folderPath so it still appears — just not
+          // inside the folder widget until the folder syncs on next open.
           if (folderId != null) {
             final folder = await _firestoreService.getFolderById(
                 userId: userId, folderId: folderId);
-            if (folder == null) { folderId = null; folderPath = '/'; }
+            if (folder == null) {
+              // Folder missing locally — keep folderId+path so it will resolve
+              // correctly once the folder syncs. We do NOT silently drop to root.
+              // The file will appear under folderId once that folder is imported.
+            }
           }
 
           final ext = tf.fileName.contains('.')
@@ -577,10 +640,19 @@ class DriveNotifier extends StateNotifier<DriveState> {
         }
       }
 
+      // ── STEP 3: Only clear resync flag after everything succeeded ───────────
+      // If an exception was thrown above, we never reach here and the flag
+      // persists — the next app open will retry the wipe + full reimport.
+      if (needsWipe) {
+        await authService.clearResyncFlag();
+      }
+
       if (foldersImported > 0 || filesImported > 0) _invalidateAll(null);
       return (folders: foldersImported, files: filesImported);
-    } catch (_) {
-      return (folders: 0, files: 0);
+    } catch (e) {
+      // Rethrow so the calling widget can show a user-visible error banner
+      // instead of silently returning an empty drive.
+      rethrow;
     } finally {
       if (mounted) state = state.copyWith(isSyncing: false);
     }

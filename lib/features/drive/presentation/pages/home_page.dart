@@ -147,6 +147,7 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
   int _syncedFiles = 0;
   int _syncedFolders = 0;
   bool _syncDone = false;
+  String? _syncError;
 
   @override
   void initState() {
@@ -155,15 +156,27 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
   }
 
   Future<void> _sync() async {
-    final result = await ref.read(driveProvider.notifier).syncFromTelegram();
-    if (mounted && (result.files > 0 || result.folders > 0)) {
-      setState(() {
-        _syncedFiles = result.files;
-        _syncedFolders = result.folders;
-        _syncDone = true;
-      });
-      await Future.delayed(const Duration(seconds: 4));
-      if (mounted) setState(() => _syncDone = false);
+    if (mounted) setState(() => _syncError = null);
+    try {
+      final result = await ref.read(driveProvider.notifier).syncFromTelegram();
+      if (mounted && (result.files > 0 || result.folders > 0)) {
+        setState(() {
+          _syncedFiles = result.files;
+          _syncedFolders = result.folders;
+          _syncDone = true;
+          _syncError = null;
+        });
+        await Future.delayed(const Duration(seconds: 4));
+        if (mounted) setState(() => _syncDone = false);
+      }
+    } catch (e) {
+      // Sync failed — show error banner so user knows and can retry.
+      // Previously this was silently swallowed, leaving an empty drive with
+      // no feedback whatsoever.
+      if (mounted) {
+        final msg = e.toString().replaceAll('Exception: ', '');
+        setState(() => _syncError = msg);
+      }
     }
   }
 
@@ -282,6 +295,41 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
                       'Synced: $_syncedFolders folder(s) · $_syncedFiles file(s)',
                       style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
                     ),
+                  ),
+                ]),
+              ),
+            ),
+          ),
+
+        // ── Sync error banner — visible when sync failed ──────────────────
+        if (_syncError != null)
+          Positioned(
+            top: 80, left: 16, right: 16,
+            child: Material(
+              elevation: 4,
+              borderRadius: BorderRadius.circular(12),
+              color: Colors.red.shade800,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                child: Row(children: [
+                  const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _syncError!,
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: _sync,
+                    child: const Text('Retry',
+                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  ),
+                  GestureDetector(
+                    onTap: () => setState(() => _syncError = null),
+                    child: const Icon(Icons.close, color: Colors.white70, size: 16),
                   ),
                 ]),
               ),

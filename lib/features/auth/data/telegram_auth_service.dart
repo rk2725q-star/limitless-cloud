@@ -91,6 +91,9 @@ class TelegramAuthService {
   /// Step 1 — Send OTP to the phone via Telegram MTProto (direct, no server).
   Future<AuthResult> sendCode(String phone) async {
     try {
+      if (_tdlib.initError != null) {
+        return AuthResult(success: false, error: 'Core Error: ${_tdlib.initError}');
+      }
       final result = await _tdlib.sendCode(phone);
       if (!result.success) {
         return AuthResult(success: false, error: result.error);
