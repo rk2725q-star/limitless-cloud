@@ -659,18 +659,64 @@ class TdlibService {
       'priority': 1,
       'offset': 0,
       'limit': 0,
-      'synchronous': true,
-    }, timeout: const Duration(hours: 2));
+      'synchronous': false,
+    });
 
-    final localPath =
-        (dlResult['local'] as Map<String, dynamic>?)?['path'] as String?;
-    if (localPath == null || localPath.isEmpty) {
-      throw Exception('TDLib download returned no local path');
+    final initialLocal = dlResult['local'] as Map<String, dynamic>?;
+    if (initialLocal != null && initialLocal['is_downloading_completed'] == true) {
+      final localPath = initialLocal['path'] as String?;
+      if (localPath != null && localPath.isNotEmpty) {
+        onProgress?.call(0.95);
+        await io.File(localPath).copy(destPath);
+        onProgress?.call(1.0);
+        return;
+      }
     }
 
-    onProgress?.call(0.9);
-    await io.File(localPath).copy(destPath);
-    onProgress?.call(1.0);
+    final completer = Completer<String>();
+    StreamSubscription<Map<String, dynamic>>? sub;
+
+    sub = updates.listen((upd) {
+      if (upd['@type'] == 'updateFile') {
+        final fileMap = upd['file'] as Map<String, dynamic>?;
+        if (fileMap?['id'] == tdFileId) {
+          final local = fileMap?['local'] as Map<String, dynamic>?;
+          if (local != null) {
+            final expectedSize = (fileMap?['expected_size'] as num?)?.toInt() ?? 0;
+            final downloadedSize = (local['downloaded_size'] as num?)?.toInt() ?? 0;
+            
+            if (expectedSize > 0 && onProgress != null) {
+              onProgress((downloadedSize / expectedSize).clamp(0.0, 0.95));
+            }
+            
+            if (local['is_downloading_completed'] == true) {
+              final path = local['path'] as String?;
+              if (path != null && path.isNotEmpty && !completer.isCompleted) {
+                completer.complete(path);
+              }
+            }
+          }
+        }
+      }
+    });
+
+    try {
+      // 2 hours absolute max for a single chunk/file download
+      final localPath = await completer.future.timeout(const Duration(hours: 2));
+      onProgress?.call(0.95);
+      await io.File(localPath).copy(destPath);
+      onProgress?.call(1.0);
+    } catch (e) {
+      // Cancel the download in TDLib if it timed out or failed
+      _fireAndForget({
+        '@type': 'cancelDownloadFile',
+        'file_id': tdFileId,
+        'only_if_pending': false,
+      });
+      rethrow;
+    } finally {
+      await sub.cancel();
+    }
   }
 
   int? _extractTdFileId(Map<String, dynamic> content) {

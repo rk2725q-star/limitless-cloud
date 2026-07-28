@@ -1,3 +1,4 @@
+import 'dart:io' as io;
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import '../../../../core/theme/app_theme.dart';
@@ -85,12 +86,18 @@ class FileListItem extends StatelessWidget {
                 ),
                 clipBehavior: Clip.antiAlias,
                 child: _isImage && file.thumbnailPath != null && file.thumbnailPath!.isNotEmpty
-                    ? CachedNetworkImage(
-                        imageUrl: file.thumbnailPath!,
-                        fit: BoxFit.cover,
-                        placeholder: (_, __) => Icon(icon, color: color, size: 22),
-                        errorWidget: (_, __, ___) => Icon(icon, color: color, size: 22),
-                      )
+                    ? (file.thumbnailPath!.startsWith('http')
+                        ? CachedNetworkImage(
+                            imageUrl: file.thumbnailPath!,
+                            fit: BoxFit.cover,
+                            placeholder: (_, __) => Icon(icon, color: color, size: 22),
+                            errorWidget: (_, __, ___) => Icon(icon, color: color, size: 22),
+                          )
+                        : Image.file(
+                            io.File(file.thumbnailPath!),
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => Icon(icon, color: color, size: 22),
+                          ))
                     : Icon(icon, color: color, size: 22),
               ),
 

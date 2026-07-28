@@ -433,6 +433,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
         sizeBytes: fileSize,
         extension: extension,
         chunkMessageIds: uploadResult.allMessageIds,
+        thumbnailPath: ['jpg', 'jpeg', 'png', 'gif', 'webp'].contains(extension.toLowerCase()) ? file.path : null,
       );
 
       // Mark complete.

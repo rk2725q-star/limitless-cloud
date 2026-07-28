@@ -1,4 +1,6 @@
+import 'dart:io' as io;
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
 import '../../data/models/cloud_file.dart';
@@ -29,6 +31,7 @@ class FileGridItem extends StatelessWidget {
   Widget build(BuildContext context) {
     final color = FileUtils.getFileColor(file.extension);
     final icon  = FileUtils.getFileIcon(file.extension);
+    final bool isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp'].contains(file.extension.toLowerCase());
 
     return GestureDetector(
       onTap: onTap,
@@ -57,8 +60,26 @@ class FileGridItem extends StatelessWidget {
                 fit: StackFit.expand,
                 children: [
                   // ── Image preview OR file-type icon ───────────────────
-                  // Serverless mode: no server URL to stream from, show icon always
-                  _IconBackground(color: color, icon: icon),
+                  isImage && file.thumbnailPath != null && file.thumbnailPath!.isNotEmpty
+                      ? Container(
+                          decoration: const BoxDecoration(
+                            borderRadius: BorderRadius.vertical(top: Radius.circular(15)),
+                          ),
+                          clipBehavior: Clip.antiAlias,
+                          child: file.thumbnailPath!.startsWith('http')
+                              ? CachedNetworkImage(
+                                  imageUrl: file.thumbnailPath!,
+                                  fit: BoxFit.cover,
+                                  placeholder: (_, __) => _IconBackground(color: color, icon: icon),
+                                  errorWidget: (_, __, ___) => _IconBackground(color: color, icon: icon),
+                                )
+                              : Image.file(
+                                  io.File(file.thumbnailPath!),
+                                  fit: BoxFit.cover,
+                                  errorBuilder: (_, __, ___) => _IconBackground(color: color, icon: icon),
+                                ),
+                        )
+                      : _IconBackground(color: color, icon: icon),
 
                   // Star indicator
                   if (file.isStarred)
