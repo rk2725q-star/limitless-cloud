@@ -427,7 +427,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
       if (['jpg', 'jpeg', 'png', 'gif', 'webp'].contains(extension.toLowerCase())) {
         try {
           final docDir = await getApplicationDocumentsDirectory();
-          final thumbDir = io.Directory('${docDir.path}/thumbnails');
+          final thumbDir = Directory('${docDir.path}/thumbnails');
           if (!await thumbDir.exists()) await thumbDir.create(recursive: true);
           final ext = extension.isNotEmpty ? '.$extension' : '';
           final newPath = '${thumbDir.path}/thumb_${uploadResult.primaryMessageId}$ext';
