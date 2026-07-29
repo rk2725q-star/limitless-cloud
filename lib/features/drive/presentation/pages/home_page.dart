@@ -1,4 +1,6 @@
+import 'dart:io' as io;
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../core/constants/app_routes.dart';
 import '../../../../core/theme/app_theme.dart';
@@ -917,8 +919,8 @@ class _GalleryThumbnail extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final color = FileUtils.getFileColor(file.extension);
-    // Serverless mode: no backend URL for streaming thumbnails
-    // Show image icon placeholder instead
+    final hasThumbnail = file.thumbnailPath != null && file.thumbnailPath!.isNotEmpty;
+
     return Container(
       clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
@@ -928,7 +930,22 @@ class _GalleryThumbnail extends StatelessWidget {
       child: Stack(
         fit: StackFit.expand,
         children: [
-          _imgPlaceholder(color),
+          if (hasThumbnail)
+            file.thumbnailPath!.startsWith('http')
+                ? CachedNetworkImage(
+                    imageUrl: file.thumbnailPath!,
+                    fit: BoxFit.cover,
+                    placeholder: (_, __) => _imgPlaceholder(color),
+                    errorWidget: (_, __, ___) => _imgPlaceholder(color),
+                  )
+                : Image.file(
+                    io.File(file.thumbnailPath!),
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => _imgPlaceholder(color),
+                  )
+          else
+            _imgPlaceholder(color),
+          
           // Bottom gradient
           Positioned(
             bottom: 0, left: 0, right: 0,

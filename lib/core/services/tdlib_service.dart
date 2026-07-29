@@ -551,6 +551,7 @@ class TdlibService {
     }, timeout: const Duration(minutes: 5));
 
     final tempId = pending['id'] as int; // negative temp ID
+    final fileId = _extractTdFileId(pending['content'] as Map<String, dynamic>? ?? {});
 
     // ── Step 2: Subscribe to update events BEFORE yielding control ──────────
     // We listen for:
@@ -567,6 +568,8 @@ class TdlibService {
       if (type == 'updateFile') {
         try {
           final fileMap = upd['file'] as Map<String, dynamic>?;
+          if (fileId != null && fileMap?['id'] != fileId) return;
+
           final local   = fileMap?['local'] as Map<String, dynamic>?;
           if (local != null) {
             final uploadOffset = (local['upload_offset'] as num?)?.toInt() ?? 0;
