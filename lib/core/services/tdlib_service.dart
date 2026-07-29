@@ -27,6 +27,7 @@ class TdSavedMessage {
   final int fileSize;
   final String mimeType;
   final DateTime date;
+  final int? thumbnailId;
 
   const TdSavedMessage({
     required this.messageId,
@@ -35,6 +36,7 @@ class TdSavedMessage {
     this.fileSize = 0,
     this.mimeType = 'application/octet-stream',
     required this.date,
+    this.thumbnailId,
   });
 }
 
@@ -472,51 +474,66 @@ class TdlibService {
     } else {
       final numChunks = (fileSize / _kTgLimit).ceil();
       final chunkBytes = (fileSize / numChunks).ceil();
-      final msgIds = <int>[];
+      final msgIds = List<int?>.filled(numChunks, null);
       final tmpDir = await getTemporaryDirectory();
+      final chunkProgress = List<double>.filled(numChunks, 0.0);
+      final taskId = DateTime.now().millisecondsSinceEpoch;
+      // Bounded parallel upload (max 2 chunks concurrently)
+      const maxParallel = 2;
+      for (int i = 0; i < numChunks; i += maxParallel) {
+        final batch = <Future<void>>[];
+        for (int j = i; j < i + maxParallel && j < numChunks; j++) {
+          batch.add(() async {
+            final offset = j * chunkBytes;
+            final partLen = min(chunkBytes, fileSize - offset);
+            final tmpPath = '${tmpDir.path}/lc_chunk_${taskId}_$j';
+            final tmpFile = io.File(tmpPath);
 
-      for (int i = 0; i < numChunks; i++) {
-        final offset = i * chunkBytes;
-        final partLen = min(chunkBytes, fileSize - offset);
-        final tmpPath = '${tmpDir.path}/lc_chunk_${file.hashCode}_$i';
-        final tmpFile = io.File(tmpPath);
+            try {
+              // 1. Buffer streaming to fix OOM
+              final sink = tmpFile.openWrite();
+              await file.openRead(offset, offset + partLen).pipe(sink);
 
-        final raf = await file.open(mode: io.FileMode.read);
-        await raf.setPosition(offset);
-        final bytes = await raf.read(partLen);
-        await raf.close();
-        await tmpFile.writeAsBytes(bytes);
+              final partName = j == 0 ? fileName : '$fileName.part${j + 1}of$numChunks';
+              final caption = j == 0
+                  ? _buildFileCaption(fileName: fileName, folderId: folderId, folderPath: folderPath)
+                  : _buildChunkCaption(
+                      fileName: fileName,
+                      partIndex: j,
+                      totalParts: numChunks,
+                      folderId: folderId,
+                      folderPath: folderPath,
+                    );
 
-        final partName =
-            i == 0 ? fileName : '$fileName.part${i + 1}of$numChunks';
-        final caption = i == 0
-            ? _buildFileCaption(
-                fileName: fileName, folderId: folderId, folderPath: folderPath)
-            : _buildChunkCaption(
-                fileName: fileName,
-                partIndex: i,
-                totalParts: numChunks,
-                folderId: folderId,
-                folderPath: folderPath,
+              // 2. Upload
+              final msgId = await _uploadSingleFile(
+                localPath: tmpPath,
+                caption: caption,
+                onProgress: (prog) {
+                  chunkProgress[j] = prog;
+                  final totalProg = chunkProgress.reduce((a, b) => a + b) / numChunks;
+                  onProgress?.call(totalProg.clamp(0.0, 1.0));
+                },
+                fileName: partName,
               );
-
-        final msgId = await _uploadSingleFile(
-          localPath: tmpPath,
-          caption: caption,
-          onProgress: (prog) {
-            onProgress?.call(((i + prog) / numChunks).clamp(0.0, 1.0));
-          },
-          fileName: partName,
-        );
-        msgIds.add(msgId);
-        try {
-          await tmpFile.delete();
-        } catch (_) {}
+              msgIds[j] = msgId;
+            } finally {
+              // 3. Strict cleanup
+              try {
+                if (await tmpFile.exists()) {
+                  await tmpFile.delete();
+                }
+              } catch (_) {}
+            }
+          }());
+        }
+        await Future.wait(batch);
       }
 
       onProgress?.call(1.0);
+      final finalMsgIds = msgIds.whereType<int>().toList();
       return TdUploadResult(
-          primaryMessageId: msgIds.first, allMessageIds: msgIds);
+          primaryMessageId: finalMsgIds.first, allMessageIds: finalMsgIds);
     }
   }
 
@@ -759,20 +776,73 @@ class TdlibService {
     try {
       for (int i = 0; i < messageIds.length; i++) {
         final tmpPath = '$destPath.part$i';
-        await downloadFile(messageIds[i], tmpPath, onProgress: (prog) {
-          onProgress?.call(((i + prog) / messageIds.length).clamp(0.0, 1.0));
-        });
-        final partFile = io.File(tmpPath);
-        await partFile.openRead().pipe(sink);
         try {
-          await partFile.delete();
-        } catch (_) {}
+          await downloadFile(messageIds[i], tmpPath, onProgress: (prog) {
+            onProgress?.call(((i + prog) / messageIds.length).clamp(0.0, 1.0));
+          });
+          final partFile = io.File(tmpPath);
+          await partFile.openRead().pipe(sink);
+        } finally {
+          try {
+            final partFile = io.File(tmpPath);
+            if (await partFile.exists()) {
+              await partFile.delete();
+            }
+          } catch (_) {}
+        }
       }
     } finally {
       await sink.flush();
       await sink.close();
     }
     onProgress?.call(1.0);
+  }
+
+  Future<String?> downloadThumbnail(int fileId) async {
+    final dlResult = await _send({
+      '@type': 'downloadFile',
+      'file_id': fileId,
+      'priority': 1,
+      'offset': 0,
+      'limit': 0,
+      'synchronous': false,
+    });
+
+    final initialLocal = dlResult['local'] as Map<String, dynamic>?;
+    if (initialLocal != null && initialLocal['is_downloading_completed'] == true) {
+      return initialLocal['path'] as String?;
+    }
+
+    final completer = Completer<String?>();
+    StreamSubscription<Map<String, dynamic>>? sub;
+
+    sub = updates.listen((upd) {
+      if (upd['@type'] == 'updateFile') {
+        final fileMap = upd['file'] as Map<String, dynamic>?;
+        if (fileMap?['id'] == fileId) {
+          final local = fileMap?['local'] as Map<String, dynamic>?;
+          if (local != null && local['is_downloading_completed'] == true) {
+            final path = local['path'] as String?;
+            if (path != null && path.isNotEmpty && !completer.isCompleted) {
+              completer.complete(path);
+            }
+          }
+        }
+      }
+    });
+
+    try {
+      return await completer.future.timeout(const Duration(seconds: 30));
+    } catch (e) {
+      _fireAndForget({
+        '@type': 'cancelDownloadFile',
+        'file_id': fileId,
+        'only_if_pending': false,
+      });
+      return null;
+    } finally {
+      await sub.cancel();
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -825,6 +895,7 @@ class TdlibService {
           mimeType: fileInfo?['mime'] as String? ?? 'application/octet-stream',
           date: DateTime.fromMillisecondsSinceEpoch(
               (msg['date'] as int) * 1000),
+          thumbnailId: fileInfo?['thumbnailId'] as int?,
         ));
       }
 
@@ -999,10 +1070,13 @@ class TdlibService {
     if (type == 'messageDocument') {
       final doc = content['document'] as Map<String, dynamic>?;
       final file = doc?['document'] as Map<String, dynamic>?;
+      final thumb = doc?['thumbnail'] as Map<String, dynamic>?;
+      final thumbFile = thumb?['file'] as Map<String, dynamic>?;
       return {
         'name': doc?['file_name'],
         'size': file?['size'] ?? 0,
         'mime': doc?['mime_type'] ?? 'application/octet-stream',
+        'thumbnailId': thumbFile?['id'],
       };
     }
     return null;

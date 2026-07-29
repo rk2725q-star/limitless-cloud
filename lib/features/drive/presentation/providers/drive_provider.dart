@@ -652,6 +652,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
             telegramMessageId: tf.messageId,
             telegramFileId: tf.messageId.toString(),
             mimeType: tf.mimeType, sizeBytes: tf.fileSize, extension: ext,
+            telegramThumbnailId: tf.thumbnailId,
           );
           filesImported++;
         }

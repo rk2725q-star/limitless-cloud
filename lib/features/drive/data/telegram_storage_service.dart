@@ -32,6 +32,7 @@ class TelegramFile {
   final String mimeType;
   final DateTime date;
   final String caption;
+  final int? thumbnailId;
 
   const TelegramFile({
     required this.messageId,
@@ -40,6 +41,7 @@ class TelegramFile {
     required this.mimeType,
     required this.date,
     required this.caption,
+    this.thumbnailId,
   });
 
   factory TelegramFile.fromSavedMessage(TdSavedMessage msg) => TelegramFile(
@@ -49,6 +51,7 @@ class TelegramFile {
         mimeType:  msg.mimeType,
         date:      msg.date,
         caption:   msg.caption,
+        thumbnailId: msg.thumbnailId,
       );
 }
 

@@ -11,6 +11,7 @@ class CloudFile {
   final int sizeBytes;
   final String extension;
   final String? thumbnailPath;
+  final int? telegramThumbnailId;
   final bool isStarred;
   final bool isTrashed;
   final DateTime uploadedAt;
@@ -33,6 +34,7 @@ class CloudFile {
     required this.sizeBytes,
     required this.extension,
     this.thumbnailPath,
+    this.telegramThumbnailId,
     this.isStarred = false,
     this.isTrashed = false,
     required this.uploadedAt,
@@ -51,6 +53,7 @@ class CloudFile {
     int? sizeBytes,
     String? extension,
     String? thumbnailPath,
+    int? telegramThumbnailId,
     bool? isStarred,
     bool? isTrashed,
     DateTime? uploadedAt,
@@ -68,6 +71,7 @@ class CloudFile {
       sizeBytes: sizeBytes ?? this.sizeBytes,
       extension: extension ?? this.extension,
       thumbnailPath: thumbnailPath ?? this.thumbnailPath,
+      telegramThumbnailId: telegramThumbnailId ?? this.telegramThumbnailId,
       isStarred: isStarred ?? this.isStarred,
       isTrashed: isTrashed ?? this.isTrashed,
       uploadedAt: uploadedAt ?? this.uploadedAt,

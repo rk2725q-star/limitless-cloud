@@ -5,8 +5,12 @@ import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
 import '../../../../core/utils/date_utils.dart';
 import '../../data/models/cloud_file.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../../core/services/tdlib_service.dart';
+import '../../data/firestore_metadata_service.dart';
+import '../../../auth/data/telegram_auth_service.dart';
 
-class FileListItem extends StatelessWidget {
+class FileListItem extends ConsumerStatefulWidget {
   final CloudFile file;
   final bool isSelected;
   final bool isSelectionMode;
@@ -24,53 +28,106 @@ class FileListItem extends StatelessWidget {
     this.isSelectionMode = false,
   });
 
+  @override
+  ConsumerState<FileListItem> createState() => _FileListItemState();
+}
+
+class _FileListItemState extends ConsumerState<FileListItem> {
+  bool _isLoadingThumbnail = false;
+
   bool get _isImage {
     const imageExts = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'avif'};
-    return imageExts.contains(file.extension.toLowerCase());
+    return imageExts.contains(widget.file.extension.toLowerCase());
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _checkThumbnail();
+  }
+
+  @override
+  void didUpdateWidget(FileListItem oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.file.id != widget.file.id || oldWidget.file.thumbnailPath != widget.file.thumbnailPath) {
+      _checkThumbnail();
+    }
+  }
+
+  void _checkThumbnail() {
+    final file = widget.file;
+    if (_isImage && (file.thumbnailPath == null || file.thumbnailPath!.isEmpty) && file.telegramThumbnailId != null) {
+      _loadThumbnail(file.telegramThumbnailId!);
+    }
+  }
+
+  Future<void> _loadThumbnail(int thumbnailId) async {
+    if (_isLoadingThumbnail) return;
+    setState(() => _isLoadingThumbnail = true);
+    
+    try {
+      final firestoreService = ref.read(firestoreServiceProvider);
+      
+      final localPath = await TdlibService.instance.downloadThumbnail(thumbnailId);
+      if (localPath != null && localPath.isNotEmpty && mounted) {
+        final authService = ref.read(telegramAuthServiceProvider);
+        final profile = await authService.getProfile();
+        final userId = profile['userId'];
+        if (userId != null && userId.isNotEmpty) {
+          await firestoreService.updateThumbnailPath(widget.file.id, localPath);
+        }
+      }
+    } catch (_) {
+    } finally {
+      if (mounted) {
+        setState(() => _isLoadingThumbnail = false);
+      }
+    }
   }
 
   @override
   Widget build(BuildContext context) {
+    final file = widget.file;
     final color = FileUtils.getFileColor(file.extension);
     final icon  = FileUtils.getFileIcon(file.extension);
 
     return GestureDetector(
-      onTap: onTap,
-      onLongPress: onLongPress,
+      onTap: widget.onTap,
+      onLongPress: widget.onLongPress,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
         margin: const EdgeInsets.only(bottom: 2),
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
         decoration: BoxDecoration(
-          color: isSelected
+          color: widget.isSelected
               ? AppTheme.primary.withValues(alpha: 0.1)
               : Colors.transparent,
           borderRadius: BorderRadius.circular(12),
           border: Border.all(
-            color: isSelected ? AppTheme.primary.withValues(alpha: 0.5) : Colors.transparent,
+            color: widget.isSelected ? AppTheme.primary.withValues(alpha: 0.5) : Colors.transparent,
           ),
         ),
         child: Row(
           children: [
             // ── File Icon / Thumbnail ──────────────────────────────────────
-            if (isSelectionMode)
+            if (widget.isSelectionMode)
               GestureDetector(
-                onTap: onTap,
+                onTap: widget.onTap,
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 200),
                   width: 52,
                   height: 52,
                   margin: const EdgeInsets.only(right: 14),
                   decoration: BoxDecoration(
-                    color: isSelected ? AppTheme.primary : AppTheme.surfaceVariant,
+                    color: widget.isSelected ? AppTheme.primary : AppTheme.surfaceVariant,
                     borderRadius: BorderRadius.circular(12),
                     border: Border.all(
-                      color: isSelected ? AppTheme.primary : AppTheme.cardBorder,
+                      color: widget.isSelected ? AppTheme.primary : AppTheme.cardBorder,
                     ),
                   ),
                   child: Icon(
-                    isSelected ? Icons.check : icon,
-                    color: isSelected ? Colors.white : color,
+                    widget.isSelected ? Icons.check : icon,
+                    color: widget.isSelected ? Colors.white : color,
                     size: 22,
                   ),
                 ),
@@ -98,7 +155,15 @@ class FileListItem extends StatelessWidget {
                             fit: BoxFit.cover,
                             errorBuilder: (_, __, ___) => Icon(icon, color: color, size: 22),
                           ))
-                    : Icon(icon, color: color, size: 22),
+                    : _isImage && _isLoadingThumbnail
+                        ? SizedBox(
+                            width: 16, height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation<Color>(color),
+                            ),
+                          )
+                        : Icon(icon, color: color, size: 22),
               ),
 
             // ── File Details ───────────────────────────────────────────────
@@ -136,10 +201,10 @@ class FileListItem extends StatelessWidget {
             ),
 
             // ── More Button ────────────────────────────────────────────────
-            if (!isSelectionMode)
+            if (!widget.isSelectionMode)
               IconButton(
                 icon: const Icon(Icons.more_vert_rounded, color: AppTheme.textHint, size: 20),
-                onPressed: onMoreTap,
+                onPressed: widget.onMoreTap,
                 splashRadius: 20,
               ),
           ],

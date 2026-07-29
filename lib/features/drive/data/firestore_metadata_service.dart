@@ -20,7 +20,7 @@ class _DB {
     final dbPath = p.join(await getDatabasesPath(), 'limitless_cloud.db');
     return openDatabase(
       dbPath,
-      version: 5,
+      version: 6,
       onCreate: (db, version) async {
         await _createTables(db);
       },
@@ -57,6 +57,12 @@ class _DB {
                 'ALTER TABLE files ADD COLUMN chunkMessageIds TEXT DEFAULT ""');
           } catch (_) {}
         }
+        if (oldVersion < 6) {
+          try {
+            await db.execute(
+                'ALTER TABLE files ADD COLUMN telegramThumbnailId INTEGER');
+          } catch (_) {}
+        }
       },
     );
   }
@@ -90,6 +96,7 @@ class _DB {
         sizeBytes          INTEGER DEFAULT 0,
         extension          TEXT DEFAULT "",
         thumbnailPath      TEXT,
+        telegramThumbnailId INTEGER,
         isStarred          INTEGER DEFAULT 0,
         isTrashed          INTEGER DEFAULT 0,
         chunkMessageIds    TEXT DEFAULT "",
@@ -140,6 +147,7 @@ CloudFile _fileFromMap(Map<String, dynamic> m) => CloudFile(
       sizeBytes: m['sizeBytes'] as int? ?? 0,
       extension: m['extension'] as String? ?? '',
       thumbnailPath: m['thumbnailPath'] as String?,
+      telegramThumbnailId: m['telegramThumbnailId'] as int?,
       isStarred: (m['isStarred'] as int? ?? 0) == 1,
       isTrashed: (m['isTrashed'] as int? ?? 0) == 1,
       chunkMessageIds: CloudFile.parseChunkIds(m['chunkMessageIds'] as String?),
@@ -430,6 +438,7 @@ class LocalMetadataService {
     required int sizeBytes,
     required String extension,
     String? thumbnailPath,
+    int? telegramThumbnailId,
     List<int> chunkMessageIds = const [],
   }) async {
     final db = await _DB.instance;
@@ -448,6 +457,7 @@ class LocalMetadataService {
       'sizeBytes': sizeBytes,
       'extension': extension,
       'thumbnailPath': thumbnailPath,
+      'telegramThumbnailId': telegramThumbnailId,
       'isStarred': 0,
       'isTrashed': 0,
       'chunkMessageIds': CloudFile(
@@ -479,9 +489,24 @@ class LocalMetadataService {
       sizeBytes: sizeBytes,
       extension: extension,
       thumbnailPath: thumbnailPath,
+      telegramThumbnailId: telegramThumbnailId,
+      uploadedAt: DateTime.parse(now),
+      updatedAt: DateTime.parse(now),
       chunkMessageIds: chunkMessageIds,
-      uploadedAt: DateTime.now(),
-      updatedAt: DateTime.now(),
+    );
+  }
+
+  Future<void> updateThumbnailPath(String fileId, String localPath) async {
+    final db = await _DB.instance;
+    final now = DateTime.now().toIso8601String();
+    await db.update(
+      'files',
+      {
+        'thumbnailPath': localPath,
+        'updatedAt': now,
+      },
+      where: 'id = ?',
+      whereArgs: [fileId],
     );
   }
 
