@@ -5,6 +5,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:path_provider/path_provider.dart';
 import '../../../auth/data/telegram_auth_service.dart';
 import '../../data/models/cloud_file.dart';
 import '../../data/models/cloud_folder.dart';
@@ -422,6 +423,21 @@ class DriveNotifier extends StateNotifier<DriveState> {
         },
       );
 
+      String? finalThumbPath;
+      if (['jpg', 'jpeg', 'png', 'gif', 'webp'].contains(extension.toLowerCase())) {
+        try {
+          final docDir = await getApplicationDocumentsDirectory();
+          final thumbDir = io.Directory('${docDir.path}/thumbnails');
+          if (!await thumbDir.exists()) await thumbDir.create(recursive: true);
+          final ext = extension.isNotEmpty ? '.$extension' : '';
+          final newPath = '${thumbDir.path}/thumb_${uploadResult.primaryMessageId}$ext';
+          await file.copy(newPath);
+          finalThumbPath = newPath;
+        } catch (_) {
+          finalThumbPath = file.path;
+        }
+      }
+
       await _firestoreService.saveFileMetadata(
         userId: userId,
         name: fileName,
@@ -433,7 +449,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
         sizeBytes: fileSize,
         extension: extension,
         chunkMessageIds: uploadResult.allMessageIds,
-        thumbnailPath: ['jpg', 'jpeg', 'png', 'gif', 'webp'].contains(extension.toLowerCase()) ? file.path : null,
+        thumbnailPath: finalThumbPath,
       );
 
       // Mark complete.

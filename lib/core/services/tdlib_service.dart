@@ -568,9 +568,16 @@ class TdlibService {
       if (type == 'updateFile') {
         try {
           final fileMap = upd['file'] as Map<String, dynamic>?;
-          if (fileId != null && fileMap?['id'] != fileId) return;
-
           final local   = fileMap?['local'] as Map<String, dynamic>?;
+          
+          bool matchesId = (fileId != null && fileMap?['id'] == fileId && fileId != 0);
+          bool matchesPath = false;
+          if (local != null && local['path'] != null) {
+            matchesPath = p.basename(local['path'] as String) == p.basename(localPath);
+          }
+          
+          if (!matchesId && !matchesPath) return;
+
           if (local != null) {
             final uploadOffset = (local['upload_offset'] as num?)?.toInt() ?? 0;
             final expectedSize = (fileMap?['expected_size'] as num?)?.toInt()
@@ -799,6 +806,9 @@ class TdlibService {
         // confirmed by Telegram yet. Storing them would corrupt the local DB.
         final msgId = msg['id'] as int;
         if (msgId <= 0) continue;
+
+        // Skip messages that are still pending or failed to send
+        if (msg['sending_state'] != null) continue;
 
         final content = msg['content'] as Map<String, dynamic>?;
         if (content == null) continue;
