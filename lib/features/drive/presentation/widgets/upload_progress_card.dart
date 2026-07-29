@@ -116,13 +116,19 @@ class _UploadProgressOverlayState extends ConsumerState<UploadProgressOverlay>
                         child: Stack(
                           alignment: Alignment.center,
                           children: [
-                            CircularProgressIndicator(
-                              value: active.isEmpty ? 1.0 : overallProgress,
-                              strokeWidth: 3,
-                              backgroundColor: AppTheme.surfaceVariant,
-                              valueColor: AlwaysStoppedAnimation(
-                                active.isEmpty ? AppTheme.success : AppTheme.primary,
-                              ),
+                            TweenAnimationBuilder<double>(
+                              tween: Tween<double>(begin: 0, end: active.isEmpty ? 1.0 : overallProgress),
+                              duration: const Duration(milliseconds: 300),
+                              builder: (context, val, child) {
+                                return CircularProgressIndicator(
+                                  value: val,
+                                  strokeWidth: 3,
+                                  backgroundColor: AppTheme.surfaceVariant,
+                                  valueColor: AlwaysStoppedAnimation(
+                                    active.isEmpty ? AppTheme.success : AppTheme.primary,
+                                  ),
+                                );
+                              },
                             ),
                             if (active.isEmpty)
                               const Icon(Icons.check_rounded,
@@ -503,13 +509,19 @@ class _ThinGradientBar extends StatelessWidget {
               // Track
               Container(color: AppTheme.surfaceVariant),
               // Fill
-              FractionallySizedBox(
-                widthFactor: value.clamp(0.0, 1.0),
-                child: Container(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(colors: [c1, c2]),
-                  ),
-                ),
+              TweenAnimationBuilder<double>(
+                tween: Tween<double>(begin: 0, end: value.clamp(0.0, 1.0)),
+                duration: const Duration(milliseconds: 300),
+                builder: (context, val, child) {
+                  return FractionallySizedBox(
+                    widthFactor: val,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(colors: [c1, c2]),
+                      ),
+                    ),
+                  );
+                },
               ),
             ],
           ),

@@ -544,7 +544,26 @@ class TdlibService {
     String? fileName,
   }) async {
     final chatId = await _getSavedMessagesChatId();
-    onProgress?.call(0.0);
+
+    final file = io.File(localPath);
+    final fileSize = await file.exists() ? await file.length() : 0;
+    final isSmall = fileSize < 10 * 1024 * 1024; // 10MB
+    double fakePct = 0.05;
+    Timer? fakeTimer;
+    
+    if (isSmall && onProgress != null) {
+      onProgress(fakePct);
+      fakeTimer = Timer.periodic(const Duration(milliseconds: 100), (t) {
+        if (fakePct < 0.90) {
+          fakePct += 0.02;
+          onProgress(fakePct);
+        } else {
+          t.cancel();
+        }
+      });
+    } else {
+      onProgress?.call(0.0);
+    }
 
     // ── Step 1: Queue the message send ──────────────────────────────────────
     // sendMessage returns IMMEDIATELY with a TEMPORARY negative ID.
@@ -596,6 +615,7 @@ class TdlibService {
           if (!matchesId && !matchesPath) return;
 
           if (local != null) {
+            fakeTimer?.cancel();
             final uploadOffset = (local['upload_offset'] as num?)?.toInt() ?? 0;
             final expectedSize = (fileMap?['expected_size'] as num?)?.toInt()
                               ?? (fileMap?['size'] as num?)?.toInt()
@@ -649,6 +669,7 @@ class TdlibService {
       onProgress?.call(1.0);
       return realId;
     } finally {
+      fakeTimer?.cancel();
       await sub.cancel();
     }
   }
