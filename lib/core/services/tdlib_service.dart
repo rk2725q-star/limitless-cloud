@@ -982,18 +982,19 @@ class TdlibService {
 
   Future<void> editMessageCaption(int messageId, String newCaption) async {
     final chatId = await _getSavedMessagesChatId();
-    try {
-      await _send({
-        '@type': 'editMessageCaption',
-        'chat_id': chatId,
-        'message_id': messageId,
-        'caption': {
-          '@type': 'formattedText',
-          'text': newCaption,
-          'entities': []
-        },
-      });
-    } catch (_) {}
+    await _send({
+      '@type': 'editMessageCaption',
+      'chat_id': chatId,
+      'message_id': messageId,
+      'caption': {
+        '@type': 'formattedText',
+        'text': newCaption,
+        'entities': []
+      },
+    });
+    // Note: errors are NOT swallowed here — callers must handle them.
+    // editMessageCaption fails with MESSAGE_EDIT_TIME_EXPIRED after 48 hours,
+    // so callers should fall back to sending a new move-override message instead.
   }
 
   Future<void> deleteMessages(List<int> messageIds) async {

@@ -634,16 +634,33 @@ class DriveNotifier extends StateNotifier<DriveState> {
 
       // ── STEP 2: Restore files ─────────────────────────────────────────────
       final telegramFiles = await _telegramService.listFiles();
+
+      // Fetch move-override messages alongside file restoration.
+      // These are lightweight text messages sent when editMessageCaption failed
+      // (Telegram only allows caption edits within 48 hours of the original upload).
+      // Override map: originalMessageId -> {folderPath, folderId?}
+      final moveOverrides = await _telegramService.listMoveOverrides();
+
       if (telegramFiles.isNotEmpty) {
         for (final tf in telegramFiles) {
           if (existingMsgIds.contains(tf.messageId)) continue;
 
           String? folderId;
           String folderPath = '/';
+
+          // Base location from the file's own caption.
           final meta = TelegramStorageService.parseFileCaption(tf.caption);
           if (meta != null) {
             folderId   = meta['fi'] as String?;
             folderPath = meta['fp'] as String? ?? '/';
+          }
+
+          // Apply move-override if present -- covers files moved AFTER the
+          // 48-hour Telegram edit window. The override records the latest folder.
+          final override = moveOverrides[tf.messageId];
+          if (override != null) {
+            folderPath = override['folderPath'] as String? ?? folderPath;
+            folderId   = override['folderId']   as String? ?? folderId;
           }
 
           // Only validate folder exists if we have a folderId.

@@ -93,8 +93,20 @@ class TelegramFolderMeta {
 }
 
 // ── Caption constants (identical to Python server — backward compat) ──────────
-const _folderPrefix   = 'LIMITLESS_FOLDER:';
-const _fileMetaPrefix = 'LIMITLESS_FILE:';
+const _folderPrefix      = 'LIMITLESS_FOLDER:';
+const _fileMetaPrefix    = 'LIMITLESS_FILE:';
+
+// ── Move-override message prefix ─────────────────────────────────────────────
+// When editMessageCaption fails (Telegram only allows edits within 48 hours),
+// we send a NEW lightweight text message with this prefix to record the move.
+// syncFromTelegram reads these overrides and applies them on top of file captions,
+// so data recovery always restores files to their LATEST folder, not the upload folder.
+//
+// Format (what appears in Telegram Saved Messages):
+//   ☁️📍 <originalTelegramMessageId>
+//   📂 /NewFolder/Path
+//   🆔 newFolderIdIfAny
+const _moveOverridePrefix = '☁️📍 ';
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  TelegramStorageService  — serverless direct-to-Telegram
@@ -293,9 +305,12 @@ class TelegramStorageService {
 
   /// Update the folder location of a file by editing its Telegram caption.
   ///
-  /// Called fire-and-forget after every move so that Telegram Saved Messages
-  /// always reflects the latest folder — making data recovery via syncFromTelegram
-  /// restore the file to its correct, current location (not the original upload folder).
+  /// Strategy (handles the 48-hour Telegram edit limit):
+  ///   1. Try editMessageCaption — works within 48 hours of upload.
+  ///   2. If that fails (MESSAGE_EDIT_TIME_EXPIRED or any error), fall back to
+  ///      sending a NEW move-override text message. Text messages can always be
+  ///      sent; there is no time limit on sending. syncFromTelegram reads these
+  ///      overrides and applies them on top of the base file captions.
   ///
   /// For chunked (>2 GB) files only the primary message carries the caption,
   /// so passing [messageId] = file.telegramMessageId is always correct.
@@ -305,6 +320,7 @@ class TelegramStorageService {
     required String? newFolderId,
     required String newFolderPath,
   }) async {
+    // ── Attempt 1: direct caption edit (works within 48 hours) ──────────────
     try {
       final newCaption = buildFileCaption(
         fileName:   fileName,
@@ -312,11 +328,73 @@ class TelegramStorageService {
         folderPath: newFolderPath,
       );
       await _tdlib.editMessageCaption(messageId, newCaption);
+      return; // ✔ Edit succeeded — done.
     } catch (_) {
-      // Non-fatal — the move already succeeded in SQLite.
-      // On the next sync the caption will still be the old path,
-      // but at least the app works. A background retry could be added later.
+      // Edit failed: file is older than 48 hours (MESSAGE_EDIT_TIME_EXPIRED),
+      // or some transient error. Fall through to the override message strategy.
     }
+
+    // ── Attempt 2: send a move-override text message (no time limit) ────────
+    // This lightweight text message records that the original file message
+    // (identified by [messageId]) has been moved to a new folder. When the
+    // user reinstalls and syncFromTelegram runs, listMoveOverrides() will
+    // find this message and apply the new folder location.
+    try {
+      final buf = StringBuffer();
+      buf.write('$_moveOverridePrefix$messageId');        // line 0: original msg ID
+      buf.write('\n📂 $newFolderPath');                   // line 1: new folder path
+      if (newFolderId != null && newFolderId.isNotEmpty) {
+        buf.write('\n🆔 $newFolderId');                    // line 2: new folder ID
+      }
+      await _tdlib.sendTextMessage(buf.toString());
+    } catch (_) {
+      // Non-fatal — the move already succeeded in SQLite for this session.
+    }
+  }
+
+  // ── Move-override parsing ────────────────────────────────────────────────────
+
+  /// Parse a move-override text message.
+  /// Returns null if the text is not a move-override message.
+  /// Returns a map with keys:
+  ///   'msgId'      (int)     — the original Telegram file message ID
+  ///   'folderPath' (String)  — the new folder path
+  ///   'folderId'   (String?) — the new folder ID (optional)
+  static Map<String, dynamic>? parseMoveOverride(String text) {
+    if (!text.startsWith(_moveOverridePrefix)) return null;
+    try {
+      final lines = text.split('\n');
+      final msgId = int.tryParse(lines[0].substring(_moveOverridePrefix.length).trim());
+      if (msgId == null) return null;
+      String folderPath = '/';
+      String? folderId;
+      for (final line in lines.skip(1)) {
+        if (line.startsWith('📂 '))       { folderPath = line.substring(3).trim(); }
+        else if (line.startsWith('🆔 '))  { folderId   = line.substring(3).trim(); }
+      }
+      return {'msgId': msgId, 'folderPath': folderPath, 'folderId': folderId};
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Read all move-override messages from Telegram Saved Messages.
+  /// Returns a map: originalMessageId → {folderPath, folderId?}
+  /// Only the LATEST override per file is kept (in case the file was moved
+  /// multiple times after the 48-hour window).
+  Future<Map<int, Map<String, dynamic>>> listMoveOverrides() async {
+    final msgs = await _tdlib.listSavedMessages(limit: 500);
+    final overrides = <int, Map<String, dynamic>>{};
+    for (final msg in msgs) {
+      // Move overrides are text messages (fileSize == 0)
+      if (msg.fileSize > 0) continue;
+      final parsed = parseMoveOverride(msg.caption);
+      if (parsed == null) continue;
+      final msgId = parsed['msgId'] as int;
+      // Keep the most recent override (list is newest-first from Telegram)
+      overrides.putIfAbsent(msgId, () => parsed);
+    }
+    return overrides;
   }
 
   // ══════════════════════════════════════════════════════════════════════════
