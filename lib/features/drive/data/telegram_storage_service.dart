@@ -291,6 +291,34 @@ class TelegramStorageService {
     }
   }
 
+  /// Update the folder location of a file by editing its Telegram caption.
+  ///
+  /// Called fire-and-forget after every move so that Telegram Saved Messages
+  /// always reflects the latest folder — making data recovery via syncFromTelegram
+  /// restore the file to its correct, current location (not the original upload folder).
+  ///
+  /// For chunked (>2 GB) files only the primary message carries the caption,
+  /// so passing [messageId] = file.telegramMessageId is always correct.
+  Future<void> moveFileTelegram(
+    int messageId, {
+    required String fileName,
+    required String? newFolderId,
+    required String newFolderPath,
+  }) async {
+    try {
+      final newCaption = buildFileCaption(
+        fileName:   fileName,
+        folderId:   newFolderId,
+        folderPath: newFolderPath,
+      );
+      await _tdlib.editMessageCaption(messageId, newCaption);
+    } catch (_) {
+      // Non-fatal — the move already succeeded in SQLite.
+      // On the next sync the caption will still be the old path,
+      // but at least the app works. A background retry could be added later.
+    }
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
   // FOLDER METADATA — stored as text messages in Saved Messages
   // ══════════════════════════════════════════════════════════════════════════

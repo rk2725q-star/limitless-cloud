@@ -832,8 +832,10 @@ class DriveNotifier extends StateNotifier<DriveState> {
     final userId = await _userId;
     if (userId == null) return;
     // Empty id means root
-    final destId = destinationFolder.id.isEmpty ? null : destinationFolder.id;
-    final destPath = destinationFolder.path.isEmpty ? '/' : destinationFolder.path;
+    final destId   = destinationFolder.id.isEmpty   ? null : destinationFolder.id;
+    final destPath = destinationFolder.path.isEmpty ? '/'  : destinationFolder.path;
+
+    // 1. Update SQLite — source of truth for the current session.
     await _firestoreService.moveFile(
       userId: userId,
       fileId: file.id,
@@ -842,8 +844,27 @@ class DriveNotifier extends StateNotifier<DriveState> {
       newFolderPath: destPath,
       fileSizeBytes: file.sizeBytes,
     );
+
+    // 2. Refresh UI immediately.
     _invalidateAll(file.folderId);
     _invalidateAll(destId);
+
+    // 3. Edit the Telegram caption fire-and-forget so Saved Messages always
+    //    reflects the latest folder. This is what makes data recovery correct:
+    //    syncFromTelegram reads the caption to restore folder location, so if
+    //    the caption stays at the old folder, recovery would restore the file
+    //    to the wrong place.
+    //
+    //    Small delay added to respect Telegram's flood-wait for bulk moves.
+    unawaited(Future<void>(() async {
+      await Future.delayed(const Duration(milliseconds: 200));
+      await _telegramService.moveFileTelegram(
+        file.telegramMessageId,
+        fileName:      file.name,
+        newFolderId:   destId,
+        newFolderPath: destPath,
+      );
+    }));
   }
 
   Future<void> copyFile(CloudFile file, CloudFolder destinationFolder) async {
