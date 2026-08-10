@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
@@ -55,7 +56,20 @@ class DlTask {
 class DlManagerNotifier extends StateNotifier<List<DlTask>> {
   DlManagerNotifier() : super([]);
 
-  final _dio = Dio();
+  final _dio = Dio(
+    BaseOptions(
+      connectTimeout: const Duration(seconds: 15),
+      sendTimeout: const Duration(seconds: 30),
+      receiveTimeout: Duration.zero, // streaming — no receive timeout
+      followRedirects: true,
+      maxRedirects: 10,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/124',
+        'Accept-Encoding': 'identity', // prevent gzip — stream raw bytes
+        'Connection': 'keep-alive',
+      },
+    ),
+  );
 
   /// Active cancel tokens — keyed by task ID.
   /// Cancelling the token aborts the Dio request immediately.
@@ -577,86 +591,165 @@ class _DownloadManagerPageState extends ConsumerState<DownloadManagerPage>
 
   void _showUrlDialog() {
     final ctrl = TextEditingController();
+    String? parsedName;
+    bool isValidUrl = false;
+
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setInner) => AlertDialog(
-          backgroundColor: AppTheme.surface,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          title: const Row(children: [
-            Icon(Icons.link_rounded, color: AppTheme.primary),
-            SizedBox(width: 8),
-            Text('URL Action', style: TextStyle(color: Colors.white, fontSize: 16)),
-          ]),
-          actions: null,
-          content: Column(mainAxisSize: MainAxisSize.min, children: [
-            const Text(
-              'Paste a direct URL. Choose where the file goes:',
-              style: TextStyle(color: AppTheme.textSecondary, fontSize: 12, height: 1.5),
-            ),
-            const SizedBox(height: 14),
-            TextField(
-              controller: ctrl,
-              autofocus: true,
-              style: const TextStyle(color: Colors.white, fontSize: 13),
-              decoration: const InputDecoration(
-                hintText: 'https://example.com/file.mp4',
-                prefixIcon: Icon(Icons.public_rounded, color: AppTheme.textHint),
+        builder: (ctx, setInner) {
+          void onUrlChanged(String text) {
+            final trimmed = text.trim();
+            final uri = Uri.tryParse(trimmed);
+            final valid = uri != null &&
+                (uri.scheme == 'http' || uri.scheme == 'https') &&
+                uri.host.isNotEmpty;
+            String? name;
+            if (valid) {
+              final segs = uri.pathSegments;
+              name = segs.isNotEmpty && segs.last.isNotEmpty
+                  ? segs.last
+                  : null;
+              if (name != null && !name.contains('.')) name = null;
+            }
+            setInner(() {
+              isValidUrl = valid;
+              parsedName = name;
+            });
+          }
+
+          ctrl.addListener(() => onUrlChanged(ctrl.text));
+
+          return AlertDialog(
+            backgroundColor: AppTheme.surface,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+            title: const Row(children: [
+              Icon(Icons.link_rounded, color: AppTheme.primary),
+              SizedBox(width: 8),
+              Text('Add URL', style: TextStyle(color: Colors.white, fontSize: 16)),
+            ]),
+            actions: null,
+            content: Column(mainAxisSize: MainAxisSize.min, children: [
+              const Text(
+                'Paste a direct link. Choose where the file goes:',
+                style: TextStyle(color: AppTheme.textSecondary, fontSize: 12, height: 1.5),
               ),
-              keyboardType: TextInputType.url,
-            ),
-            const SizedBox(height: 16),
-            // ── Upload to Telegram ──────────────────────────────────────
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                icon: const Icon(Icons.cloud_upload_rounded, size: 16),
-                label: const Text('Save to Telegram  (progress shown live)'),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.lightBlueAccent,
-                  side: const BorderSide(color: Colors.lightBlueAccent),
-                  padding: const EdgeInsets.symmetric(vertical: 12),
+              const SizedBox(height: 14),
+              // ── URL input row with paste button ──────────────────────────
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: ctrl,
+                      autofocus: true,
+                      style: const TextStyle(color: Colors.white, fontSize: 13),
+                      decoration: InputDecoration(
+                        hintText: 'https://example.com/file.mp4',
+                        prefixIcon: const Icon(Icons.public_rounded, color: AppTheme.textHint),
+                        suffixIcon: isValidUrl
+                            ? const Icon(Icons.check_circle_rounded, color: Colors.greenAccent, size: 18)
+                            : ctrl.text.isNotEmpty
+                                ? const Icon(Icons.error_outline_rounded, color: Colors.redAccent, size: 18)
+                                : null,
+                      ),
+                      keyboardType: TextInputType.url,
+                      onChanged: onUrlChanged,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Tooltip(
+                    message: 'Paste from clipboard',
+                    child: IconButton(
+                      icon: const Icon(Icons.content_paste_rounded, color: AppTheme.textSecondary, size: 20),
+                      style: IconButton.styleFrom(
+                        backgroundColor: AppTheme.card,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      ),
+                      onPressed: () async {
+                        final data = await Clipboard.getData(Clipboard.kTextPlain);
+                        final text = data?.text?.trim() ?? '';
+                        if (text.isNotEmpty) {
+                          ctrl.text = text;
+                          ctrl.selection = TextSelection.collapsed(offset: text.length);
+                          onUrlChanged(text);
+                        }
+                      },
+                    ),
+                  ),
+                ],
+              ),
+              // ── Parsed filename preview ───────────────────────────────────
+              if (isValidUrl && parsedName != null) ...[
+                const SizedBox(height: 6),
+                Row(children: [
+                  const Icon(Icons.insert_drive_file_rounded, color: AppTheme.textHint, size: 14),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      parsedName!,
+                      style: const TextStyle(color: AppTheme.textHint, fontSize: 11),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ]),
+              ],
+              const SizedBox(height: 16),
+              // ── Upload to Telegram ──────────────────────────────────────
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  icon: const Icon(Icons.cloud_upload_rounded, size: 16),
+                  label: const Text('Save to Telegram'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.lightBlueAccent,
+                    side: BorderSide(
+                      color: isValidUrl ? Colors.lightBlueAccent : AppTheme.textHint,
+                    ),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                  onPressed: isValidUrl
+                      ? () {
+                          final url = ctrl.text.trim();
+                          final auth = ref.read(telegramAuthServiceProvider);
+                          final tg = TelegramStorageService(auth);
+                          ref.read(dlManagerProvider.notifier).uploadUrl(url, tg);
+                          Navigator.pop(ctx);
+                          _tab.animateTo(1);
+                        }
+                      : null,
                 ),
-                onPressed: () {
-                  final url = ctrl.text.trim();
-                  if (url.isNotEmpty) {
-                    final auth = ref.read(telegramAuthServiceProvider);
-                    final tg = TelegramStorageService(auth);
-                    ref.read(dlManagerProvider.notifier).uploadUrl(url, tg);
-                    Navigator.pop(ctx);
-                    _tab.animateTo(1);
-                  }
-                },
               ),
-            ),
-            const SizedBox(height: 8),
-            // ── Download to device ──────────────────────────────────────
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                icon: const Icon(Icons.download_rounded, size: 16),
-                label: const Text('Save to Device Downloads'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: AppTheme.primary,
-                  padding: const EdgeInsets.symmetric(vertical: 12),
+              const SizedBox(height: 8),
+              // ── Download to device ──────────────────────────────────────
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  icon: const Icon(Icons.download_rounded, size: 16),
+                  label: const Text('Save to Device Downloads'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: isValidUrl ? AppTheme.primary : AppTheme.card,
+                    foregroundColor: isValidUrl ? Colors.white : AppTheme.textHint,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                  onPressed: isValidUrl
+                      ? () {
+                          final url = ctrl.text.trim();
+                          ref.read(dlManagerProvider.notifier).downloadUrl(url);
+                          Navigator.pop(ctx);
+                          _tab.animateTo(1);
+                        }
+                      : null,
                 ),
-                onPressed: () {
-                  final url = ctrl.text.trim();
-                  if (url.isNotEmpty) {
-                    ref.read(dlManagerProvider.notifier).downloadUrl(url);
-                    Navigator.pop(ctx);
-                    _tab.animateTo(1);
-                  }
-                },
               ),
-            ),
-            const SizedBox(height: 4),
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Cancel'),
-            ),
-          ]),
-        ),
+              const SizedBox(height: 4),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel'),
+              ),
+            ]),
+          );
+        },
       ),
     ).whenComplete(() => ctrl.dispose());
   }

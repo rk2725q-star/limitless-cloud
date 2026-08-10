@@ -275,6 +275,16 @@ class DriveNotifier extends StateNotifier<DriveState> {
     // For content:// URIs it ALREADY copies the file to its own cache directory
     // and returns that cache path. The returned pickedFile.path is ALWAYS a real,
     // accessible file path by the time pickFiles() completes.
+
+    // Resolve the system temp/cache directory once (used to detect cache files).
+    String tmpDirPath;
+    try {
+      final tmpDir = await getTemporaryDirectory();
+      tmpDirPath = tmpDir.path;
+    } catch (_) {
+      tmpDirPath = '/cache';
+    }
+
     for (final pickedFile in result.files) {
       final fileName = pickedFile.name;
 
@@ -293,15 +303,19 @@ class DriveNotifier extends StateNotifier<DriveState> {
         continue;
       }
 
+      // Detect cache files robustly: compare against the resolved temp dir AND
+      // the common '/cache/' substring (covers file_picker's SAF copy locations).
+      final filePath = file.path;
+      final isCacheFile = filePath.contains('/cache/') ||
+          filePath.startsWith(tmpDirPath);
+
       await _runUpload(
         file: file,
         fileName: fileName,
         folderId: folderId,
         folderPath: folderPath,
         userId: userId,
-        // file_picker copies content:// URIs to its own cache dir.
-        // We mark those as cache files so we can clean them up after upload.
-        isCacheFile: file.path.contains('/cache/'),
+        isCacheFile: isCacheFile,
       );
     }
   }
@@ -409,6 +423,9 @@ class DriveNotifier extends StateNotifier<DriveState> {
           final tasks = state.uploadTasks.toList();
           final idx = tasks.indexWhere((t) => t.taskId == taskId);
           if (idx >= 0) {
+            // For parallel chunk uploads, derive currentChunk from the progress
+            // value using a floor calculation — this is more accurate than
+            // per-chunk tracking since the TDLib layer aggregates chunk progress.
             final currentChunk = totalChunks > 1
                 ? ((progress * totalChunks).floor() + 1).clamp(1, totalChunks)
                 : 1;

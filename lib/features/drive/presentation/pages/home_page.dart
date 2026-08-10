@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../../core/constants/app_routes.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
+import '../../../../core/services/tdlib_service.dart';
 import '../../../auth/data/telegram_auth_service.dart';
 import '../../data/models/cloud_file.dart';
 import '../../data/models/cloud_folder.dart';
@@ -727,6 +728,26 @@ class _CategoriesTabState extends ConsumerState<_CategoriesTab>
           icon: c.icon,
         )).toList(),
       ),
+      // ── Upload FAB — only visible on the Images tab ─────────────────────
+      floatingActionButton: AnimatedBuilder(
+        animation: _tabCtrl,
+        builder: (_, __) {
+          final isImagesTab = _tabCtrl.index == 0; // Images is first tab
+          return AnimatedScale(
+            scale: isImagesTab ? 1.0 : 0.0,
+            duration: const Duration(milliseconds: 200),
+            child: FloatingActionButton.extended(
+              heroTag: 'categories_upload_fab',
+              backgroundColor: AppTheme.primary,
+              icon: const Icon(Icons.add_photo_alternate_rounded, color: Colors.white),
+              label: const Text('Upload Images', style: TextStyle(color: Colors.white)),
+              onPressed: isImagesTab
+                  ? () => ref.read(driveProvider.notifier).uploadFiles()
+                  : null,
+            ),
+          );
+        },
+      ),
     );
   }
 }
@@ -912,14 +933,76 @@ class _ImageGalleryGrid extends ConsumerWidget {
   }
 }
 
-class _GalleryThumbnail extends StatelessWidget {
+// ── Gallery Thumbnail ─────────────────────────────────────────────────────────
+// Lazy-loads the TDLib thumbnail so images show previews without being opened.
+// Uses the exact same loading strategy as FileGridItem for consistency.
+
+class _GalleryThumbnail extends ConsumerStatefulWidget {
   final CloudFile file;
   const _GalleryThumbnail({required this.file});
 
   @override
+  ConsumerState<_GalleryThumbnail> createState() => _GalleryThumbnailState();
+}
+
+class _GalleryThumbnailState extends ConsumerState<_GalleryThumbnail> {
+  bool _isLoadingThumbnail = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkThumbnail();
+  }
+
+  @override
+  void didUpdateWidget(_GalleryThumbnail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.file.id != widget.file.id ||
+        oldWidget.file.thumbnailPath != widget.file.thumbnailPath) {
+      _checkThumbnail();
+    }
+  }
+
+  /// If the file is an image with no local thumbnail yet, but has a Telegram
+  /// thumbnail ID, kick off an async download of that thumbnail via TDLib.
+  void _checkThumbnail() {
+    final f = widget.file;
+    final isImage =
+        _imageExts.contains(f.extension.toLowerCase());
+    final needsLoad = isImage &&
+        (f.thumbnailPath == null || f.thumbnailPath!.isEmpty) &&
+        f.telegramThumbnailId != null;
+    if (needsLoad) _loadThumbnail(f.telegramThumbnailId!);
+  }
+
+  Future<void> _loadThumbnail(int thumbnailId) async {
+    if (_isLoadingThumbnail) return;
+    if (mounted) setState(() => _isLoadingThumbnail = true);
+    try {
+      final localPath =
+          await TdlibService.instance.downloadThumbnail(thumbnailId);
+      if (localPath != null && localPath.isNotEmpty && mounted) {
+        final authService = ref.read(telegramAuthServiceProvider);
+        final profile = await authService.getProfile();
+        final userId = profile['userId'];
+        if (userId != null && userId.isNotEmpty) {
+          await ref
+              .read(firestoreServiceProvider)
+              .updateThumbnailPath(widget.file.id, localPath);
+        }
+      }
+    } catch (_) {
+    } finally {
+      if (mounted) setState(() => _isLoadingThumbnail = false);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final file = widget.file;
     final color = FileUtils.getFileColor(file.extension);
-    final hasThumbnail = file.thumbnailPath != null && file.thumbnailPath!.isNotEmpty;
+    final hasThumbnail =
+        file.thumbnailPath != null && file.thumbnailPath!.isNotEmpty;
 
     return Container(
       clipBehavior: Clip.antiAlias,
@@ -943,10 +1026,28 @@ class _GalleryThumbnail extends StatelessWidget {
                     fit: BoxFit.cover,
                     errorBuilder: (_, __, ___) => _imgPlaceholder(color),
                   )
+          else if (_isLoadingThumbnail)
+            // ── Loading shimmer while thumbnail downloads from Telegram ─────
+            Stack(
+              fit: StackFit.expand,
+              children: [
+                _imgPlaceholder(color),
+                Center(
+                  child: SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      valueColor: AlwaysStoppedAnimation<Color>(color),
+                    ),
+                  ),
+                ),
+              ],
+            )
           else
             _imgPlaceholder(color),
-          
-          // Bottom gradient
+
+          // ── Bottom gradient + filename ──────────────────────────────────
           Positioned(
             bottom: 0, left: 0, right: 0,
             child: Container(

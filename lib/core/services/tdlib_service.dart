@@ -478,8 +478,8 @@ class TdlibService {
       final tmpDir = await getTemporaryDirectory();
       final chunkProgress = List<double>.filled(numChunks, 0.0);
       final taskId = DateTime.now().millisecondsSinceEpoch;
-      // Bounded parallel upload (max 2 chunks concurrently)
-      const maxParallel = 2;
+      // Bounded parallel upload (max 4 chunks concurrently for higher throughput)
+      const maxParallel = 4;
       for (int i = 0; i < numChunks; i += maxParallel) {
         final batch = <Future<void>>[];
         for (int j = i; j < i + maxParallel && j < numChunks; j++) {
@@ -548,15 +548,23 @@ class TdlibService {
     final file = io.File(localPath);
     final fileSize = await file.exists() ? await file.length() : 0;
     final isSmall = fileSize < 10 * 1024 * 1024; // 10MB
-    double fakePct = 0.05;
+    double fakePct = 0.0;
     Timer? fakeTimer;
     
     if (isSmall && onProgress != null) {
+      // Scale fake-progress speed to file size: smaller files animate faster
+      // so the bar doesn't sit at low % while the upload already finished.
+      // ~0.5 MB → ~1.5 s to 90%; ~9 MB → ~4.5 s to 90%.
+      final double mb = fileSize / (1024 * 1024);
+      final double step = 0.02 + (0.06 * (1.0 - (mb / 10.0)).clamp(0.0, 1.0));
+      final int intervalMs = 60 + (40 * (mb / 10.0)).round();
+
+      fakePct = step;
       onProgress(fakePct);
-      fakeTimer = Timer.periodic(const Duration(milliseconds: 100), (t) {
+      fakeTimer = Timer.periodic(Duration(milliseconds: intervalMs), (t) {
         if (fakePct < 0.90) {
-          fakePct += 0.02;
-          onProgress(fakePct);
+          fakePct += step;
+          onProgress(fakePct.clamp(0.0, 0.90));
         } else {
           t.cancel();
         }
@@ -704,7 +712,7 @@ class TdlibService {
     final dlResult = await _send({
       '@type': 'downloadFile',
       'file_id': tdFileId,
-      'priority': 1,
+      'priority': 32, // max TDLib priority for fastest download
       'offset': 0,
       'limit': 0,
       'synchronous': false,
@@ -792,23 +800,52 @@ class TdlibService {
     String destPath, {
     ProgressCallback? onProgress,
   }) async {
+    final n = messageIds.length;
+    // Per-chunk progress tracking for accurate overall progress reporting
+    final chunkProgress = List<double>.filled(n, 0.0);
+
+    // ── Phase 1: Download all chunks in parallel (max 4 concurrent) ──────────
+    // Each chunk lands in its own temp file, then we stitch them in order.
+    const maxParallel = 4;
+    final tmpPaths = List<String>.filled(n, '');
+
+    for (int base = 0; base < n; base += maxParallel) {
+      final batch = <Future<void>>[];
+      for (int j = base; j < base + maxParallel && j < n; j++) {
+        final idx = j;
+        final tmpPath = '$destPath.chunk$idx';
+        tmpPaths[idx] = tmpPath;
+        batch.add(() async {
+          try {
+            await downloadFile(messageIds[idx], tmpPath, onProgress: (prog) {
+              chunkProgress[idx] = prog;
+              final total = chunkProgress.fold(0.0, (a, b) => a + b) / n;
+              onProgress?.call(total.clamp(0.0, 0.95));
+            });
+          } catch (e) {
+            // Clean up partial temp file on failure
+            try {
+              final f = io.File(tmpPath);
+              if (await f.exists()) await f.delete();
+            } catch (_) {}
+            rethrow;
+          }
+        }());
+      }
+      await Future.wait(batch);
+    }
+
+    // ── Phase 2: Stitch chunks in order into the final output file ────────────
     final outFile = io.File(destPath);
     final sink = outFile.openWrite();
     try {
-      for (int i = 0; i < messageIds.length; i++) {
-        final tmpPath = '$destPath.part$i';
+      for (int i = 0; i < n; i++) {
+        final partFile = io.File(tmpPaths[i]);
         try {
-          await downloadFile(messageIds[i], tmpPath, onProgress: (prog) {
-            onProgress?.call(((i + prog) / messageIds.length).clamp(0.0, 1.0));
-          });
-          final partFile = io.File(tmpPath);
           await partFile.openRead().pipe(sink);
         } finally {
           try {
-            final partFile = io.File(tmpPath);
-            if (await partFile.exists()) {
-              await partFile.delete();
-            }
+            if (await partFile.exists()) await partFile.delete();
           } catch (_) {}
         }
       }
