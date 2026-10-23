@@ -33,6 +33,7 @@ class TelegramFile {
   final DateTime date;
   final String caption;
   final int? thumbnailId;
+  final List<int> chunkMessageIds;
 
   const TelegramFile({
     required this.messageId,
@@ -42,6 +43,7 @@ class TelegramFile {
     required this.date,
     required this.caption,
     this.thumbnailId,
+    this.chunkMessageIds = const [],
   });
 
   factory TelegramFile.fromSavedMessage(TdSavedMessage msg) => TelegramFile(
@@ -52,6 +54,7 @@ class TelegramFile {
         date:      msg.date,
         caption:   msg.caption,
         thumbnailId: msg.thumbnailId,
+        chunkMessageIds: const [],
       );
 }
 
@@ -252,13 +255,151 @@ class TelegramStorageService {
   // ══════════════════════════════════════════════════════════════════════════
 
   /// List all files from Telegram Saved Messages (new + legacy format).
+  /// Multi-part / chunked files (> 2 GB) are unified into a single TelegramFile
+  /// with chunkMessageIds and combined total fileSize populated.
+  /// Standalone chunks are strictly excluded and never returned individually.
   Future<List<TelegramFile>> listFiles() async {
-    // Fetch all messages — no prefix filter so we catch both old and new captions.
     final msgs = await _tdlib.listSavedMessages(limit: 500);
-    return msgs
-        .where((m) => TdlibService.isFileCaption(m.caption))
-        .map(TelegramFile.fromSavedMessage)
-        .toList();
+
+    // 1. Separate folder metadata and non-file messages
+    final fileMsgs = msgs.where((m) =>
+        TdlibService.isFileCaption(m.caption) &&
+        !TdlibService.isFolderCaption(m.caption)).toList();
+
+    // Regex for part indicator in caption: e.g. "(part 1/2)" or "(part 2/2)"
+    final partRegex = RegExp(r'\(part\s*(\d+)/(\d+)\)');
+
+    // Map: "$folderPath:$cleanFileName" -> list of chunk messages
+    final chunkGroups = <String, List<TdSavedMessage>>{};
+    final consumedChunkMsgIds = <int>{};
+
+    // First pass: identify explicit chunk parts by caption or filename
+    for (final m in fileMsgs) {
+      final isChunk = TdlibService.isChunkCaption(m.caption) ||
+          (m.fileName?.startsWith('lc_chunk_') ?? false) ||
+          (m.fileName?.contains(RegExp(r'\.part\d+of\d+')) ?? false);
+
+      if (isChunk) {
+        final meta = TdlibService.parseFileCaption(m.caption);
+        String cleanName = meta?['n'] as String? ?? m.fileName ?? 'unknown';
+        // Strip lc_chunk prefix if name is raw temp name
+        if (cleanName.startsWith('lc_chunk_') && m.caption.contains('☁️ ')) {
+          final lines = m.caption.split('\n');
+          String first = lines[0].substring(lines[0].indexOf('☁️ ') + 3);
+          final cIdx = first.indexOf(' (part ');
+          if (cIdx != -1) first = first.substring(0, cIdx);
+          if (first.isNotEmpty) cleanName = first;
+        }
+        final folderPath = (meta?['fp'] as String?) ?? '/';
+        final key = '$folderPath:$cleanName';
+        chunkGroups.putIfAbsent(key, () => []).add(m);
+        consumedChunkMsgIds.add(m.messageId);
+      }
+    }
+
+    // Second pass: for each chunk group, check if Part 1 was uploaded without "(part 1/N)"
+    // (handles backward compatibility with earlier uploads where j == 0 used standard caption)
+    for (final entry in chunkGroups.entries) {
+      final group = entry.value;
+      bool hasPart1 = false;
+      for (final m in group) {
+        final match = partRegex.firstMatch(m.caption);
+        if (match != null && match.group(1) == '1') {
+          hasPart1 = true;
+          break;
+        }
+      }
+      if (!hasPart1) {
+        final sepIdx = entry.key.indexOf(':');
+        final targetPath = sepIdx != -1 ? entry.key.substring(0, sepIdx) : '/';
+        final targetName = sepIdx != -1 ? entry.key.substring(sepIdx + 1) : entry.key;
+
+        for (final m in fileMsgs) {
+          if (consumedChunkMsgIds.contains(m.messageId)) continue;
+          final meta = TdlibService.parseFileCaption(m.caption);
+          if (meta == null) continue;
+          final name = meta['n'] as String?;
+          final path = (meta['fp'] as String?) ?? '/';
+          if (name == targetName && path == targetPath) {
+            group.add(m);
+            consumedChunkMsgIds.add(m.messageId);
+            break;
+          }
+        }
+      }
+    }
+
+    final result = <TelegramFile>[];
+
+    // 3. Convert unified chunk groups to single TelegramFiles
+    for (final entry in chunkGroups.entries) {
+      final group = entry.value;
+      if (group.isEmpty) continue;
+
+      // Sort parts: part 1 first, then part 2, etc.
+      group.sort((a, b) {
+        final matchA = partRegex.firstMatch(a.caption);
+        final matchB = partRegex.firstMatch(b.caption);
+        if (matchA != null && matchB != null) {
+          final idxA = int.tryParse(matchA.group(1)!) ?? 0;
+          final idxB = int.tryParse(matchB.group(1)!) ?? 0;
+          return idxA.compareTo(idxB);
+        }
+        if (matchA == null && matchB != null) return -1;
+        if (matchA != null && matchB == null) return 1;
+        return a.messageId.compareTo(b.messageId);
+      });
+
+      final primary = group.first;
+      final meta = TdlibService.parseFileCaption(primary.caption) ??
+          TdlibService.parseFileCaption(group.last.caption);
+      var cleanName = meta?['n'] as String? ?? primary.fileName ?? 'unknown';
+      if (cleanName.startsWith('lc_chunk_')) {
+        for (final gm in group) {
+          final gMeta = TdlibService.parseFileCaption(gm.caption);
+          if (gMeta?['n'] != null && !(gMeta!['n'] as String).startsWith('lc_chunk_')) {
+            cleanName = gMeta['n'] as String;
+            break;
+          }
+        }
+      }
+
+      final totalSize = group.fold<int>(0, (sum, m) => sum + m.fileSize);
+      final chunkIds = group.map((m) => m.messageId).toList();
+      int? thumbId = primary.thumbnailId;
+      if (thumbId == null) {
+        for (final gm in group) {
+          if (gm.thumbnailId != null) {
+            thumbId = gm.thumbnailId;
+            break;
+          }
+        }
+      }
+
+      result.add(TelegramFile(
+        messageId: primary.messageId,
+        fileName: cleanName,
+        fileSize: totalSize,
+        mimeType: primary.mimeType,
+        date: primary.date,
+        caption: primary.caption,
+        thumbnailId: thumbId,
+        chunkMessageIds: chunkIds,
+      ));
+    }
+
+    // 4. Add normal non-chunk files
+    for (final m in fileMsgs) {
+      if (consumedChunkMsgIds.contains(m.messageId)) continue;
+      // Exclude any leftover ghost chunk filenames or captions
+      if (m.fileName?.startsWith('lc_chunk_') ?? false) continue;
+      if (m.fileName?.contains(RegExp(r'\.part\d+of\d+')) ?? false) continue;
+      if (TdlibService.isChunkCaption(m.caption)) continue;
+
+      result.add(TelegramFile.fromSavedMessage(m));
+    }
+
+    return result;
   }
 
   /// Delete a single Telegram message (file or metadata).

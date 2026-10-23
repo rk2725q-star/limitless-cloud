@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
@@ -162,7 +163,7 @@ enum FileCategory { images, videos, audio, documents, others }
 extension FileCategoryExt on FileCategory {
   String get label {
     switch (this) {
-      case FileCategory.images:    return 'Images';
+      case FileCategory.images:    return 'Gallery';
       case FileCategory.videos:    return 'Videos';
       case FileCategory.audio:     return 'Audio';
       case FileCategory.documents: return 'Documents';
@@ -445,6 +446,21 @@ class LocalMetadataService {
     final now = DateTime.now().toIso8601String();
     final id = _uuid();
 
+    // Guard: Never save internal chunk parts as standalone file records
+    if (name.startsWith('lc_chunk_') || (name.contains('.part') && name.contains('of'))) {
+      return CloudFile(
+        id: id,
+        name: name,
+        folderPath: folderPath,
+        telegramMessageId: telegramMessageId,
+        telegramFileId: telegramFileId,
+        sizeBytes: sizeBytes,
+        extension: extension,
+        uploadedAt: DateTime.now(),
+        updatedAt: DateTime.now(),
+      );
+    }
+
     await db.insert('files', {
       'id': id,
       'userId': userId,
@@ -525,14 +541,14 @@ class LocalMetadataService {
       if (folderId == null) {
         rows = await db.query(
           'files',
-          where: 'userId = ? AND folderId IS NULL AND isTrashed = 0',
+          where: "userId = ? AND folderId IS NULL AND isTrashed = 0 AND name NOT LIKE 'lc_chunk_%' AND name NOT LIKE '%.part%of%'",
           whereArgs: [userId],
           orderBy: '$col $dir',
         );
       } else {
         rows = await db.query(
           'files',
-          where: 'userId = ? AND folderId = ? AND isTrashed = 0',
+          where: "userId = ? AND folderId = ? AND isTrashed = 0 AND name NOT LIKE 'lc_chunk_%' AND name NOT LIKE '%.part%of%'",
           whereArgs: [userId, folderId],
           orderBy: '$col $dir',
         );
@@ -556,17 +572,17 @@ class LocalMetadataService {
       List<Map<String, dynamic>> rows;
       if (starredOnly) {
         rows = await db.query('files',
-            where: 'userId = ? AND isStarred = 1 AND isTrashed = 0',
+            where: "userId = ? AND isStarred = 1 AND isTrashed = 0 AND name NOT LIKE 'lc_chunk_%' AND name NOT LIKE '%.part%of%'",
             whereArgs: [userId],
             orderBy: 'uploadedAt DESC');
       } else if (trashedOnly) {
         rows = await db.query('files',
-            where: 'userId = ? AND isTrashed = 1',
+            where: "userId = ? AND isTrashed = 1 AND name NOT LIKE 'lc_chunk_%' AND name NOT LIKE '%.part%of%'",
             whereArgs: [userId],
             orderBy: 'updatedAt DESC');
       } else {
         rows = await db.query('files',
-            where: 'userId = ? AND isTrashed = 0',
+            where: "userId = ? AND isTrashed = 0 AND name NOT LIKE 'lc_chunk_%' AND name NOT LIKE '%.part%of%'",
             whereArgs: [userId],
             orderBy: 'uploadedAt DESC');
       }
@@ -588,7 +604,7 @@ class LocalMetadataService {
       final db = await _DB.instance;
       final mimeCond = category.mimeCondition;
       final rows = await db.rawQuery(
-        'SELECT * FROM files WHERE userId = ? AND isTrashed = 0 AND $mimeCond ORDER BY uploadedAt DESC',
+        "SELECT * FROM files WHERE userId = ? AND isTrashed = 0 AND name NOT LIKE 'lc_chunk_%' AND name NOT LIKE '%.part%of%' AND $mimeCond ORDER BY uploadedAt DESC",
         [userId],
       );
       controller.add(rows.map(_fileFromMap).toList());
@@ -717,16 +733,69 @@ class LocalMetadataService {
     return rows.map(_fileFromMap).toList();
   }
 
-  /// Returns all Telegram message IDs already stored locally for a user.
+  /// Returns all Telegram message IDs already stored locally for a user,
+  /// including primary message IDs and chunk message IDs of multipart files.
   Future<Set<int>> getExistingMessageIds(String userId) async {
     final db = await _DB.instance;
     final rows = await db.query(
       'files',
-      columns: ['telegramMessageId'],
+      columns: ['telegramMessageId', 'chunkMessageIds'],
       where: 'userId = ?',
       whereArgs: [userId],
     );
-    return rows.map((r) => r['telegramMessageId'] as int).toSet();
+    final ids = <int>{};
+    for (final r in rows) {
+      final primaryId = r['telegramMessageId'] as int?;
+      if (primaryId != null) ids.add(primaryId);
+      final rawChunks = r['chunkMessageIds'] as String?;
+      if (rawChunks != null && rawChunks.isNotEmpty) {
+        try {
+          final list = (jsonDecode(rawChunks) as List<dynamic>).cast<int>();
+          ids.addAll(list);
+        } catch (_) {}
+      }
+    }
+    return ids;
+  }
+
+  /// Purges any accidentally imported chunk files from the local database.
+  Future<int> purgeChunkGhostFiles(String userId) async {
+    final db = await _DB.instance;
+    // 1. Delete by name pattern lc_chunk_% or .part%of%
+    final count1 = await db.delete(
+      'files',
+      where: "userId = ? AND (name LIKE 'lc_chunk_%' OR name LIKE '%.part%of%')",
+      whereArgs: [userId],
+    );
+    // 2. Also delete any file record whose telegramMessageId is in another file's chunkMessageIds
+    final chunkedFiles = await db.query(
+      'files',
+      columns: ['chunkMessageIds'],
+      where: "userId = ? AND chunkMessageIds != '' AND chunkMessageIds IS NOT NULL",
+      whereArgs: [userId],
+    );
+    final allChunkIds = <int>{};
+    for (final row in chunkedFiles) {
+      final raw = row['chunkMessageIds'] as String?;
+      if (raw != null && raw.isNotEmpty) {
+        try {
+          final list = (jsonDecode(raw) as List<dynamic>).cast<int>();
+          if (list.length > 1) {
+            allChunkIds.addAll(list.sublist(1));
+          }
+        } catch (_) {}
+      }
+    }
+    int count2 = 0;
+    if (allChunkIds.isNotEmpty) {
+      final placeholders = List.filled(allChunkIds.length, '?').join(',');
+      count2 = await db.delete(
+        'files',
+        where: 'userId = ? AND telegramMessageId IN ($placeholders)',
+        whereArgs: [userId, ...allChunkIds],
+      );
+    }
+    return count1 + count2;
   }
 
   /// Returns all existing folder IDs for a user.

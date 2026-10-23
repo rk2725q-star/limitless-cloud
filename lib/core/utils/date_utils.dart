@@ -56,4 +56,33 @@ class AppDateUtils {
     if (now.year == dateTime.year) return DateFormat('MMM d').format(dateTime);
     return DateFormat('MMM d, yyyy').format(dateTime);
   }
+
+  /// Returns organized timeline header (e.g. "Today • 21 October 2026", "Yesterday", "Wednesday, 29 July 2026")
+  static String getTimelineHeader(DateTime dateTime) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final day = DateTime(dateTime.year, dateTime.month, dateTime.day);
+
+    if (day == today) {
+      return 'Today • ${DateFormat('d MMMM yyyy').format(dateTime)}';
+    }
+    if (day == today.subtract(const Duration(days: 1))) {
+      return 'Yesterday • ${DateFormat('d MMMM yyyy').format(dateTime)}';
+    }
+    if (now.year == dateTime.year) {
+      return DateFormat('EEEE, d MMMM yyyy').format(dateTime);
+    }
+    return DateFormat('EEEE, d MMMM yyyy').format(dateTime);
+  }
+
+  /// Returns month + year e.g. "October 2026"
+  static String getMonthYear(DateTime dateTime) {
+    return DateFormat('MMMM yyyy').format(dateTime);
+  }
+
+  /// Returns 4-digit year string e.g. "2026"
+  static String getYear(DateTime dateTime) {
+    return dateTime.year.toString();
+  }
 }
+

@@ -15,7 +15,10 @@ import '../providers/drive_provider.dart';
 import '../widgets/file_grid_item.dart';
 import '../widgets/file_list_item.dart';
 import '../widgets/folder_item.dart';
+import '../widgets/images_gallery_view.dart';
+import '../../../../core/services/face_detection_service.dart';
 import './download_manager_page.dart';
+import './camera_capture_page.dart';
 import '../widgets/upload_progress_card.dart';
 
 // ── Global nav-index provider — lets any widget switch the HomePage tab ────────
@@ -91,6 +94,10 @@ class _HomePageState extends ConsumerState<HomePage> {
         onUploadFiles: () {
           Navigator.pop(context);
           ref.read(driveProvider.notifier).uploadFiles();
+        },
+        onCamera: () {
+          Navigator.pop(context);
+          openCameraCapture(context);
         },
         onCreateFolder: () {
           Navigator.pop(context);
@@ -669,7 +676,7 @@ class _CategoriesTabState extends ConsumerState<_CategoriesTab>
   late TabController _tabCtrl;
 
   static const _cats = [
-    (cat: FileCategory.images,    icon: Icons.image_rounded,          color: Color(0xFF4CAF50)),
+    (cat: FileCategory.images,    icon: Icons.photo_library_rounded,  color: Color(0xFF4CAF50)),
     (cat: FileCategory.videos,    icon: Icons.videocam_rounded,       color: Color(0xFFE91E63)),
     (cat: FileCategory.audio,     icon: Icons.music_note_rounded,     color: Color(0xFF9C27B0)),
     (cat: FileCategory.documents, icon: Icons.description_rounded,    color: Color(0xFF2196F3)),
@@ -722,11 +729,19 @@ class _CategoriesTabState extends ConsumerState<_CategoriesTab>
       ),
       body: TabBarView(
         controller: _tabCtrl,
-        children: _cats.map((c) => _CategoryList(
-          category: c.cat,
-          accentColor: c.color,
-          icon: c.icon,
-        )).toList(),
+        children: _cats.map((c) {
+          if (c.cat == FileCategory.images) {
+            return ImagesGalleryView(
+              accentColor: c.color,
+              icon: c.icon,
+            );
+          }
+          return _CategoryList(
+            category: c.cat,
+            accentColor: c.color,
+            icon: c.icon,
+          );
+        }).toList(),
       ),
       // ── Upload FAB — only visible on the Images tab ─────────────────────
       floatingActionButton: AnimatedBuilder(
@@ -740,13 +755,112 @@ class _CategoriesTabState extends ConsumerState<_CategoriesTab>
               heroTag: 'categories_upload_fab',
               backgroundColor: AppTheme.primary,
               icon: const Icon(Icons.add_photo_alternate_rounded, color: Colors.white),
-              label: const Text('Upload Images', style: TextStyle(color: Colors.white)),
+              label: const Text('Add to Gallery', style: TextStyle(color: Colors.white)),
               onPressed: isImagesTab
-                  ? () => ref.read(driveProvider.notifier).uploadFiles()
+                  ? () => _showImagesActionMenu(context)
                   : null,
             ),
           );
         },
+      ),
+    );
+  }
+
+  void _showImagesActionMenu(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: AppTheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (_) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 40, height: 4,
+                decoration: BoxDecoration(color: AppTheme.cardBorder, borderRadius: BorderRadius.circular(2)),
+              ),
+              const SizedBox(height: 16),
+              const Text('Add to Photos', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: AppTheme.textPrimary)),
+              const SizedBox(height: 16),
+              ListTile(
+                leading: Container(
+                  width: 42, height: 42,
+                  decoration: BoxDecoration(color: AppTheme.primary.withValues(alpha: 0.15), shape: BoxShape.circle),
+                  child: const Icon(Icons.add_photo_alternate_rounded, color: AppTheme.primary),
+                ),
+                title: const Text('Upload Images'),
+                subtitle: const Text('Pick photos from your gallery'),
+                onTap: () {
+                  Navigator.pop(context);
+                  ref.read(driveProvider.notifier).uploadFiles();
+                },
+              ),
+              ListTile(
+                leading: Container(
+                  width: 42, height: 42,
+                  decoration: BoxDecoration(color: Colors.pink.withValues(alpha: 0.15), shape: BoxShape.circle),
+                  child: const Icon(Icons.camera_alt_rounded, color: Colors.pink),
+                ),
+                title: const Text('Take Photo / Video'),
+                subtitle: const Text('Capture with organized camera'),
+                onTap: () {
+                  Navigator.pop(context);
+                  openCameraCapture(context);
+                },
+              ),
+              ListTile(
+                leading: Container(
+                  width: 42, height: 42,
+                  decoration: BoxDecoration(color: AppTheme.folderColor.withValues(alpha: 0.15), shape: BoxShape.circle),
+                  child: const Icon(Icons.create_new_folder_rounded, color: AppTheme.folderColor),
+                ),
+                title: const Text('New Folder / Album'),
+                subtitle: const Text('Create a folder to organize images'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showCreateFolderDialog(context);
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showCreateFolderDialog(BuildContext context) {
+    final ctrl = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AppTheme.surface,
+        title: const Text('New Folder / Album'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          style: AppTheme.bodyLarge,
+          decoration: const InputDecoration(
+            hintText: 'Folder name (e.g. Vacation, Family)',
+            prefixIcon: Icon(Icons.folder_rounded, color: AppTheme.folderColor),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () {
+              final name = ctrl.text.trim();
+              if (name.isNotEmpty) {
+                ref.read(driveProvider.notifier).createFolder(name: name);
+                Navigator.pop(context);
+              }
+            },
+            child: const Text('Create'),
+          ),
+        ],
       ),
     );
   }
@@ -989,6 +1103,11 @@ class _GalleryThumbnailState extends ConsumerState<_GalleryThumbnail> {
           await ref
               .read(firestoreServiceProvider)
               .updateThumbnailPath(widget.file.id, localPath);
+          FaceDetectionService.instance.scanSingleFile(
+            userId,
+            widget.file,
+            localPath,
+          );
         }
       }
     } catch (_) {
@@ -1214,8 +1333,13 @@ class _SortButton extends ConsumerWidget {
 
 class _UploadOptionsSheet extends StatelessWidget {
   final VoidCallback onUploadFiles;
+  final VoidCallback onCamera;
   final VoidCallback onCreateFolder;
-  const _UploadOptionsSheet({required this.onUploadFiles, required this.onCreateFolder});
+  const _UploadOptionsSheet({
+    required this.onUploadFiles,
+    required this.onCamera,
+    required this.onCreateFolder,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1229,9 +1353,29 @@ class _UploadOptionsSheet extends StatelessWidget {
             const SizedBox(height: 20),
             Text('Add New', style: AppTheme.headlineMedium),
             const SizedBox(height: 24),
-            _OptionTile(icon: Icons.upload_file_rounded, color: AppTheme.primary, title: 'Upload Files', subtitle: 'Pick any file from device', onTap: onUploadFiles),
+            _OptionTile(
+              icon: Icons.upload_file_rounded,
+              color: AppTheme.primary,
+              title: 'Upload Files',
+              subtitle: 'Pick any file from device',
+              onTap: onUploadFiles,
+            ),
             const SizedBox(height: 12),
-            _OptionTile(icon: Icons.create_new_folder_rounded, color: AppTheme.secondary, title: 'New Folder', subtitle: 'Organize your files', onTap: onCreateFolder),
+            _OptionTile(
+              icon: Icons.camera_alt_rounded,
+              color: const Color(0xFF10B981), // emerald green
+              title: 'Camera',
+              subtitle: 'Capture & upload — auto deletes locally',
+              onTap: onCamera,
+            ),
+            const SizedBox(height: 12),
+            _OptionTile(
+              icon: Icons.create_new_folder_rounded,
+              color: AppTheme.secondary,
+              title: 'New Folder',
+              subtitle: 'Organize your files',
+              onTap: onCreateFolder,
+            ),
             const SizedBox(height: 8),
           ],
         ),
@@ -1263,11 +1407,16 @@ class _OptionTile extends StatelessWidget {
           children: [
             Container(width: 48, height: 48, decoration: BoxDecoration(color: color.withValues(alpha: 0.15), shape: BoxShape.circle), child: Icon(icon, color: color, size: 24)),
             const SizedBox(width: 16),
-            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(title, style: AppTheme.titleMedium),
-              Text(subtitle, style: AppTheme.bodyMedium),
-            ]),
-            const Spacer(),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title, style: AppTheme.titleMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  Text(subtitle, style: AppTheme.bodyMedium, maxLines: 2, overflow: TextOverflow.ellipsis),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
             Icon(Icons.arrow_forward_ios_rounded, color: color, size: 16),
           ],
         ),

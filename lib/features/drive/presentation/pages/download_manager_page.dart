@@ -21,6 +21,35 @@ export '../../data/offline_cache_service.dart' show OfflineStatus;
 export '../providers/offline_cache_provider.dart'
     show offlineCacheProvider, fileOfflineStateProvider, FileOfflineState;
 
+// ── Shared format helpers ────────────────────────────────────────────────────
+
+String _fmtBytes(int bytes) {
+  if (bytes <= 0) return '0 B';
+  if (bytes < 1024) return '$bytes B';
+  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  if (bytes < 1024 * 1024 * 1024) {
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+  return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+}
+
+String _fmtSpeed(double bps) {
+  if (bps <= 0) return '';
+  if (bps >= 1024 * 1024) return '${(bps / (1024 * 1024)).toStringAsFixed(1)} MB/s';
+  if (bps >= 1024) return '${(bps / 1024).toStringAsFixed(0)} KB/s';
+  return '${bps.toStringAsFixed(0)} B/s';
+}
+
+String _fmtEta(int secs) {
+  if (secs <= 0) return '';
+  if (secs < 60) return '${secs}s';
+  if (secs < 3600) return '${secs ~/ 60}m ${secs % 60}s';
+  final h = secs ~/ 3600;
+  final m = (secs % 3600) ~/ 60;
+  return '${h}h ${m}m';
+}
+
+
 // ── Download task model ───────────────────────────────────────────────────────
 
 enum DlStatus { queued, downloading, done, failed }
@@ -928,7 +957,7 @@ class _DoneTab extends ConsumerWidget {
 
 // ── Task Tile ─────────────────────────────────────────────────────────────────
 
-class _TaskTile extends StatelessWidget {
+class _TaskTile extends StatefulWidget {
   final DlTask task;
   final VoidCallback onCancel;
   final VoidCallback? onOpen;
@@ -938,13 +967,114 @@ class _TaskTile extends StatelessWidget {
       this.onOpen, this.onRetry, required this.showProgress});
 
   @override
+  State<_TaskTile> createState() => _TaskTileState();
+}
+
+class _TaskTileState extends State<_TaskTile>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _barCtrl;
+  late Animation<double> _barAnim;
+
+  double _prevProgress = 0;
+  DateTime _prevTime = DateTime.now();
+  double _speedBps = 0;
+  String _etaLabel = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _barCtrl = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 500));
+    final initP = widget.task.progress.clamp(0.0, 1.0);
+    _barAnim = Tween<double>(begin: 0, end: initP)
+        .animate(CurvedAnimation(parent: _barCtrl, curve: Curves.easeOut));
+    if (initP > 0) _barCtrl.forward();
+  }
+
+  @override
+  void didUpdateWidget(_TaskTile old) {
+    super.didUpdateWidget(old);
+    final newP = widget.task.progress.clamp(0.0, 1.0);
+    final oldP = old.task.progress.clamp(0.0, 1.0);
+    if ((newP - oldP).abs() > 0.0005) {
+      _barAnim = Tween<double>(begin: _barAnim.value, end: newP)
+          .animate(CurvedAnimation(parent: _barCtrl, curve: Curves.easeOut));
+      _barCtrl
+        ..reset()
+        ..forward();
+
+      final now = DateTime.now();
+      final dtMs = now.difference(_prevTime).inMilliseconds;
+      final dp = newP - _prevProgress;
+
+      if (dtMs >= 200 && dp > 0 && widget.task.totalBytes > 0) {
+        final dt = dtMs / 1000.0;
+        final bps = (dp * widget.task.totalBytes) / dt;
+        final rem = (1.0 - newP) * widget.task.totalBytes;
+        final etaSecs = bps > 0 ? (rem / bps).round() : 0;
+        setState(() {
+          _speedBps = bps;
+          _etaLabel = _fmtEta(etaSecs);
+        });
+        _prevProgress = newP;
+        _prevTime = now;
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _barCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final task = widget.task;
     final color = task.ext.isEmpty
-        ? AppTheme.fileColorDefault : FileUtils.getFileColor(task.ext);
-    final icon  = task.ext.isEmpty
-        ? Icons.insert_drive_file_rounded : FileUtils.getFileIcon(task.ext);
+        ? AppTheme.fileColorDefault
+        : FileUtils.getFileColor(task.ext);
+    final icon = task.ext.isEmpty
+        ? Icons.insert_drive_file_rounded
+        : FileUtils.getFileIcon(task.ext);
     final isFailed = task.status == DlStatus.failed;
-    final isDone   = task.status == DlStatus.done;
+    final isDone = task.status == DlStatus.done;
+    final isActive = !isFailed && !isDone;
+
+    // Byte counts
+    final total = task.totalBytes;
+    final progress = task.progress.clamp(0.0, 1.0);
+    final transferred = total > 0 ? (progress * total).round() : 0;
+
+    // Speed / size visibility
+    final speedLabel = _fmtSpeed(_speedBps);
+    final hasSizeInfo = total > 0 && isActive && task.progress >= 0;
+    final hasSpeedInfo = speedLabel.isNotEmpty && isActive;
+
+    // Accent colour for gradient bar
+    final accent = isFailed
+        ? AppTheme.error
+        : isDone
+            ? AppTheme.success
+            : task.progress >= 0.91
+                ? AppTheme.accent
+                : AppTheme.primary;
+
+    // Status sub-label (only when no size info shown)
+    String statusLabel = '';
+    if (isFailed) {
+      statusLabel = task.error ?? 'Failed';
+    } else if (isDone) {
+      statusLabel = task.savedPath == 'telegram://saved'
+          ? '✓ Saved to Telegram Saved Messages'
+          : '✓ Saved to device Downloads';
+    } else if (task.progress < 0) {
+      statusLabel = 'Fetching…${total > 0 ? '  ${FileUtils.formatFileSize(total)}' : ''}';
+    } else if (task.name.startsWith('☁')) {
+      statusLabel = task.progress < 0.5
+          ? 'Fetching URL… ${(task.progress * 200).toInt()}%'
+          : 'Uploading to Telegram… ${((task.progress - 0.5) * 200).toInt()}%';
+    }
 
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
@@ -952,86 +1082,182 @@ class _TaskTile extends StatelessWidget {
       decoration: BoxDecoration(
         color: AppTheme.card,
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: isFailed
-            ? AppTheme.error.withValues(alpha: 0.3) : AppTheme.cardBorder),
+        border: Border.all(
+            color: isFailed
+                ? AppTheme.error.withValues(alpha: 0.3)
+                : AppTheme.cardBorder),
       ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          Container(
-            width: 42, height: 42,
-            decoration: BoxDecoration(
-              color: color.withValues(alpha: 0.12),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Icon(icon, color: color, size: 22),
-          ),
-          const SizedBox(width: 12),
-          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(task.name, style: AppTheme.titleMedium,
-                maxLines: 1, overflow: TextOverflow.ellipsis),
-            Text(
-              isFailed
-                  ? task.error ?? 'Failed'
-                  : isDone
-                      ? (task.savedPath == 'telegram://saved'
-                          ? '✓ Saved to Telegram Saved Messages'
-                          : '✓ Saved to device Downloads')
-                      : task.progress < 0
-                          ? 'Fetching…${task.totalBytes > 0 ? '  ${FileUtils.formatFileSize(task.totalBytes)}' : ''}'
-                          : task.name.startsWith('☁')
-                              ? task.progress < 0.5
-                                  ? 'Fetching URL… ${(task.progress * 200).toInt()}%'
-                                  : 'Uploading to Telegram… ${((task.progress - 0.5) * 200).toInt()}%'
-                              : '${(task.progress * 100).toInt()}%'
-                                  '${task.totalBytes > 0 ? '  ·  ${FileUtils.formatFileSize(task.totalBytes)}' : ''}',
-              style: TextStyle(
-                  color: isFailed
-                      ? AppTheme.error
-                      : isDone ? AppTheme.success : AppTheme.textSecondary,
-                  fontSize: 11),
-            ),
-          ])),
-          if (onOpen != null)
-            IconButton(
-              icon: const Icon(Icons.open_in_new_rounded, size: 20, color: AppTheme.primary),
-              onPressed: onOpen,
-              tooltip: 'Open file',
-            ),
-          if (onRetry != null)
-            IconButton(
-              icon: const Icon(Icons.refresh_rounded, size: 20, color: AppTheme.warning),
-              onPressed: onRetry,
-              tooltip: 'Retry download',
-            ),
-          IconButton(
-            icon: Icon(
-              isDone ? Icons.close_rounded : Icons.cancel_rounded,
-              size: 20,
-              color: AppTheme.error,
-            ),
-            onPressed: onCancel,
-            tooltip: isDone ? 'Remove from list' : 'Cancel',
-          ),
-        ]),
-
-        if (showProgress && !isFailed && !isDone) ...[
-          const SizedBox(height: 10),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(4),
-            child: LinearProgressIndicator(
-              // progress < 0 → indeterminate; 0 queued → also indeterminate
-              value: task.progress > 0 ? task.progress : null,
-              backgroundColor: AppTheme.surfaceVariant,
-              valueColor: AlwaysStoppedAnimation(
-                task.progress < 0 ? Colors.lightBlueAccent : AppTheme.primary,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // ── Top row: icon + name + action buttons ─────────────────────────
+          Row(
+            children: [
+              Container(
+                width: 42,
+                height: 42,
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(icon, color: color, size: 22),
               ),
-              minHeight: 4,
-            ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // filename + pct
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            task.name,
+                            style: AppTheme.titleMedium,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (isActive && task.progress >= 0)
+                          Padding(
+                            padding: const EdgeInsets.only(left: 6),
+                            child: Text(
+                              '${(progress * 100).toInt()}%',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w700,
+                                color: accent,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+
+                    // bytes transferred / total  +  speed pill
+                    if (hasSizeInfo || hasSpeedInfo) ...[  
+                      const SizedBox(height: 2),
+                      Row(
+                        children: [
+                          if (hasSizeInfo)
+                            Expanded(
+                              child: Text(
+                                '${_fmtBytes(transferred)} / ${_fmtBytes(total)}',
+                                style: const TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w500,
+                                  color: AppTheme.textSecondary,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          if (hasSpeedInfo)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 6, vertical: 1),
+                              decoration: BoxDecoration(
+                                color: accent.withValues(alpha: 0.12),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Text(
+                                speedLabel,
+                                style: TextStyle(
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.w700,
+                                  color: accent,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ] else if (statusLabel.isNotEmpty)
+                      Text(
+                        statusLabel,
+                        style: TextStyle(
+                          color: isFailed
+                              ? AppTheme.error
+                              : isDone
+                                  ? AppTheme.success
+                                  : AppTheme.textSecondary,
+                          fontSize: 11,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                  ],
+                ),
+              ),
+              if (onOpen != null)
+                IconButton(
+                  icon: const Icon(Icons.open_in_new_rounded,
+                      size: 20, color: AppTheme.primary),
+                  onPressed: widget.onOpen,
+                  tooltip: 'Open file',
+                ),
+              if (widget.onRetry != null)
+                IconButton(
+                  icon: const Icon(Icons.refresh_rounded,
+                      size: 20, color: AppTheme.warning),
+                  onPressed: widget.onRetry,
+                  tooltip: 'Retry download',
+                ),
+              IconButton(
+                icon: Icon(
+                  isDone ? Icons.close_rounded : Icons.cancel_rounded,
+                  size: 20,
+                  color: AppTheme.error,
+                ),
+                onPressed: widget.onCancel,
+                tooltip: isDone ? 'Remove from list' : 'Cancel',
+              ),
+            ],
           ),
+
+          // ── Progress bar (gradient) ────────────────────────────────────────
+          if (widget.showProgress && isActive && task.progress >= 0) ...[
+            const SizedBox(height: 8),
+            AnimatedBuilder(
+              animation: _barAnim,
+              builder: (_, __) => _DlGradientBar(
+                value: _barAnim.value,
+                accent: accent,
+              ),
+            ),
+          ],
+          if (widget.showProgress && isActive && task.progress < 0) ...[
+            const SizedBox(height: 8),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: const LinearProgressIndicator(
+                backgroundColor: AppTheme.surfaceVariant,
+                valueColor:
+                    AlwaysStoppedAnimation(Colors.lightBlueAccent),
+                minHeight: 4,
+              ),
+            ),
+          ],
+
+          // ── ETA row ───────────────────────────────────────────────────────
+          if (isActive && (_etaLabel.isNotEmpty || task.error != null)) ...[
+            const SizedBox(height: 4),
+            Text(
+              task.error != null
+                  ? task.error!
+                  : '$_etaLabel left',
+              style: TextStyle(
+                fontSize: 9,
+                color: task.error != null
+                    ? AppTheme.warning
+                    : AppTheme.textHint,
+              ),
+            ),
+          ],
         ],
-      ]),
+      ),
     );
   }
+
+  VoidCallback? get onOpen => widget.onOpen;
 }
 
 // ── Empty State ───────────────────────────────────────────────────────────────
@@ -1065,5 +1291,53 @@ class _EmptyState extends StatelessWidget {
         ]),
       ),
     );
+  }
+}
+
+// ── Gradient progress bar (download) ─────────────────────────────────────────
+
+class _DlGradientBar extends StatelessWidget {
+  final double value;
+  final Color accent;
+
+  const _DlGradientBar({
+    required this.value,
+    required this.accent,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    const double h = 4;
+    final c1 = accent;
+    final c2 = accent.withValues(alpha: 0.6);
+
+    return LayoutBuilder(builder: (_, constraints) {
+      return SizedBox(
+        height: h,
+        width: constraints.maxWidth,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(h / 2),
+          child: Stack(
+            children: [
+              Container(color: AppTheme.surfaceVariant),
+              TweenAnimationBuilder<double>(
+                tween: Tween<double>(begin: 0, end: value.clamp(0.0, 1.0)),
+                duration: const Duration(milliseconds: 300),
+                builder: (context, val, _) {
+                  return FractionallySizedBox(
+                    widthFactor: val,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(colors: [c1, c2]),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ],
+          ),
+        ),
+      );
+    });
   }
 }

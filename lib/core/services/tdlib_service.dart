@@ -476,58 +476,70 @@ class TdlibService {
       final chunkBytes = (fileSize / numChunks).ceil();
       final msgIds = List<int?>.filled(numChunks, null);
       final tmpDir = await getTemporaryDirectory();
-      final chunkProgress = List<double>.filled(numChunks, 0.0);
       final taskId = DateTime.now().millisecondsSinceEpoch;
+      final chunkDir = io.Directory('${tmpDir.path}/chunks_$taskId');
+      if (!await chunkDir.exists()) await chunkDir.create(recursive: true);
+      final chunkProgress = List<double>.filled(numChunks, 0.0);
       // Bounded parallel upload (max 4 chunks concurrently for higher throughput)
       const maxParallel = 4;
-      for (int i = 0; i < numChunks; i += maxParallel) {
-        final batch = <Future<void>>[];
-        for (int j = i; j < i + maxParallel && j < numChunks; j++) {
-          batch.add(() async {
-            final offset = j * chunkBytes;
-            final partLen = min(chunkBytes, fileSize - offset);
-            final tmpPath = '${tmpDir.path}/lc_chunk_${taskId}_$j';
-            final tmpFile = io.File(tmpPath);
+      try {
+        for (int i = 0; i < numChunks; i += maxParallel) {
+          final batch = <Future<void>>[];
+          for (int j = i; j < i + maxParallel && j < numChunks; j++) {
+            batch.add(() async {
+              final offset = j * chunkBytes;
+              final partLen = min(chunkBytes, fileSize - offset);
+              final baseWithoutExt = p.withoutExtension(fileName);
+              final ext = p.extension(fileName);
+              final partFileName = j == 0
+                  ? fileName
+                  : '$baseWithoutExt.part${j + 1}of$numChunks$ext';
+              final tmpPath = p.join(chunkDir.path, partFileName);
+              final tmpFile = io.File(tmpPath);
 
-            try {
-              // 1. Buffer streaming to fix OOM
-              final sink = tmpFile.openWrite();
-              await file.openRead(offset, offset + partLen).pipe(sink);
-
-              final partName = j == 0 ? fileName : '$fileName.part${j + 1}of$numChunks';
-              final caption = j == 0
-                  ? _buildFileCaption(fileName: fileName, folderId: folderId, folderPath: folderPath)
-                  : _buildChunkCaption(
-                      fileName: fileName,
-                      partIndex: j,
-                      totalParts: numChunks,
-                      folderId: folderId,
-                      folderPath: folderPath,
-                    );
-
-              // 2. Upload
-              final msgId = await _uploadSingleFile(
-                localPath: tmpPath,
-                caption: caption,
-                onProgress: (prog) {
-                  chunkProgress[j] = prog;
-                  final totalProg = chunkProgress.reduce((a, b) => a + b) / numChunks;
-                  onProgress?.call(totalProg.clamp(0.0, 1.0));
-                },
-                fileName: partName,
-              );
-              msgIds[j] = msgId;
-            } finally {
-              // 3. Strict cleanup
               try {
-                if (await tmpFile.exists()) {
-                  await tmpFile.delete();
-                }
-              } catch (_) {}
-            }
-          }());
+                // 1. Buffer streaming to fix OOM
+                final sink = tmpFile.openWrite();
+                await file.openRead(offset, offset + partLen).pipe(sink);
+
+                final caption = _buildChunkCaption(
+                  fileName: fileName,
+                  partIndex: j,
+                  totalParts: numChunks,
+                  folderId: folderId,
+                  folderPath: folderPath,
+                );
+
+                // 2. Upload
+                final msgId = await _uploadSingleFile(
+                  localPath: tmpPath,
+                  caption: caption,
+                  onProgress: (prog) {
+                    chunkProgress[j] = prog;
+                    final totalProg = chunkProgress.reduce((a, b) => a + b) / numChunks;
+                    onProgress?.call(totalProg.clamp(0.0, 1.0));
+                  },
+                  fileName: partFileName,
+                );
+                msgIds[j] = msgId;
+              } finally {
+                // 3. Strict cleanup of part file
+                try {
+                  if (await tmpFile.exists()) {
+                    await tmpFile.delete();
+                  }
+                } catch (_) {}
+              }
+            }());
+          }
+          await Future.wait(batch);
         }
-        await Future.wait(batch);
+      } finally {
+        try {
+          if (await chunkDir.exists()) {
+            await chunkDir.delete(recursive: true);
+          }
+        } catch (_) {}
       }
 
       onProgress?.call(1.0);
@@ -547,24 +559,22 @@ class TdlibService {
 
     final file = io.File(localPath);
     final fileSize = await file.exists() ? await file.length() : 0;
-    final isSmall = fileSize < 10 * 1024 * 1024; // 10MB
+
+    // Fake animated progress for tiny files (<2 MB) where TDLib may finish
+    // before the first updateFile event arrives.
+    final isSmall = fileSize < 2 * 1024 * 1024;
     double fakePct = 0.0;
     Timer? fakeTimer;
-    
     if (isSmall && onProgress != null) {
-      // Scale fake-progress speed to file size: smaller files animate faster
-      // so the bar doesn't sit at low % while the upload already finished.
-      // ~0.5 MB → ~1.5 s to 90%; ~9 MB → ~4.5 s to 90%.
       final double mb = fileSize / (1024 * 1024);
-      final double step = 0.02 + (0.06 * (1.0 - (mb / 10.0)).clamp(0.0, 1.0));
-      final int intervalMs = 60 + (40 * (mb / 10.0)).round();
-
+      final double step = 0.05 + (0.05 * (1.0 - (mb / 2.0)).clamp(0.0, 1.0));
+      final int intervalMs = 40 + (40 * (mb / 2.0)).round();
       fakePct = step;
       onProgress(fakePct);
       fakeTimer = Timer.periodic(Duration(milliseconds: intervalMs), (t) {
-        if (fakePct < 0.90) {
+        if (fakePct < 0.85) {
           fakePct += step;
-          onProgress(fakePct.clamp(0.0, 0.90));
+          onProgress(fakePct.clamp(0.0, 0.85));
         } else {
           t.cancel();
         }
@@ -573,90 +583,121 @@ class TdlibService {
       onProgress?.call(0.0);
     }
 
-    // ── Step 1: Queue the message send ──────────────────────────────────────
-    // sendMessage returns IMMEDIATELY with a TEMPORARY negative ID.
-    // The real Telegram message ID arrives later via updateMessageSendSucceeded.
-    // If we return the temp ID, the DB will store a broken record that can never
-    // match real messages on sync — causing "files not appearing" after re-login.
-    final pending = await _send({
-      '@type': 'sendMessage',
-      'chat_id': chatId,
-      'message_thread_id': 0,
-      'input_message_content': {
-        '@type': 'inputMessageDocument',
-        'document': {'@type': 'inputFileLocal', 'path': localPath},
-        'caption': {
-          '@type': 'formattedText',
-          'text': caption,
-          'entities': []
+    // â”€â”€ Step 1: Send the message (returns instantly with temp negative ID) â”€â”€
+    final Map<String, dynamic> pending;
+    try {
+      pending = await _send({
+        '@type': 'sendMessage',
+        'chat_id': chatId,
+        'message_thread_id': 0,
+        'input_message_content': {
+          '@type': 'inputMessageDocument',
+          'document': {'@type': 'inputFileLocal', 'path': localPath},
+          'caption': {
+            '@type': 'formattedText',
+            'text': caption,
+            'entities': <dynamic>[],
+          },
+          'disable_content_type_detection': true,
         },
-        'disable_content_type_detection': true,
-      },
-    }, timeout: const Duration(minutes: 5));
+      }, timeout: const Duration(minutes: 5));
+    } catch (e) {
+      fakeTimer?.cancel();
+      rethrow;
+    }
 
     final tempId = pending['id'] as int; // negative temp ID
-    final fileId = _extractTdFileId(pending['content'] as Map<String, dynamic>? ?? {});
 
-    // ── Step 2: Subscribe to update events BEFORE yielding control ──────────
-    // We listen for:
-    //   updateFile                  → real byte-level upload progress (0→1)
-    //   updateMessageSendSucceeded  → real final message ID
-    //   updateMessageSendFailed     → upload error
+    // â”€â”€ Step 2: Listen for updateFile / send-result events â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    //
+    // CRITICAL: Upload progress is in file.REMOTE, NOT file.local.
+    // TDLib localFile tracks DOWNLOADS. TDLib remoteFile tracks UPLOADS:
+    //   remote.is_uploading_active  â†’ true while upload is in progress
+    //   remote.is_uploading_completed â†’ true when all bytes sent
+    //   remote.uploaded_size         â†’ bytes sent so far (Int53)
+    //
+    // All previous attempts were reading local['upload_offset'] and
+    // local['is_uploading_active'] â€” fields that do NOT exist in localFile â€”
+    // which is why every updateFile event was silently discarded.
+    int? trackedFileId;
+
     final completer = Completer<int>();
-
     StreamSubscription<Map<String, dynamic>>? sub;
+
     sub = updates.listen((upd) {
       final type = upd['@type'] as String?;
 
-      // ── Real upload progress via updateFile ──────────────────────────────
+      // â”€â”€ Upload progress via updateFile â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       if (type == 'updateFile') {
         try {
-          final fileMap = upd['file'] as Map<String, dynamic>?;
-          final local   = fileMap?['local'] as Map<String, dynamic>?;
-          
-          bool matchesId = (fileId != null && fileMap?['id'] == fileId && fileId != 0);
-          bool matchesPath = false;
-          if (local != null && local['path'] != null) {
-            matchesPath = p.basename(local['path'] as String) == p.basename(localPath);
-          }
-          
-          if (!matchesId && !matchesPath) return;
+          if (completer.isCompleted) return;
 
-          if (local != null) {
-            fakeTimer?.cancel();
-            final uploadOffset = (local['upload_offset'] as num?)?.toInt() ?? 0;
-            final expectedSize = (fileMap?['expected_size'] as num?)?.toInt()
-                              ?? (fileMap?['size'] as num?)?.toInt()
-                              ?? 0;
-            if (expectedSize > 0 && onProgress != null) {
-              // Clamp to 0.95 — leave 0.95→1.0 for the final ID confirmation step
-              final pct = (uploadOffset / expectedSize).clamp(0.0, 0.95);
-              onProgress(pct);
-            }
+          final fileMap = upd['file'] as Map<String, dynamic>?;
+          if (fileMap == null) return;
+
+          final tdId = fileMap['id'] as int?;
+          if (tdId == null || tdId == 0) return;
+
+          // Upload fields are in file.remote, NOT file.local.
+          final remote = fileMap['remote'] as Map<String, dynamic>?;
+          if (remote == null) return;
+
+          final isUploading = remote['is_uploading_active'] == true;
+          final isCompleted = remote['is_uploading_completed'] == true;
+          final uploadedSize =
+              (remote['uploaded_size'] as num?)?.toInt() ?? 0;
+
+          // Adopt the first file that is actively uploading.
+          // Downloads have is_downloading_active on local, never on remote.
+          // _claimedUploadFileIds prevents concurrent chunks stealing IDs.
+          if (trackedFileId == null) {
+            if (!isUploading) return;
+            if (_claimedUploadFileIds.contains(tdId)) return;
+            trackedFileId = tdId;
+            _claimedUploadFileIds.add(tdId);
+          }
+
+          if (tdId != trackedFileId) return;
+
+          // Cancel fake-progress once real bytes start flowing
+          if (uploadedSize > 0 || isCompleted) fakeTimer?.cancel();
+
+          final expectedSize =
+              (fileMap['expected_size'] as num?)?.toInt() ??
+              (fileMap['size'] as num?)?.toInt() ??
+              fileSize;
+
+          if (expectedSize > 0 && onProgress != null) {
+            // Clamp to 0.95 â€” reserve 0.95â†’1.0 for final send-confirmation
+            final pct = (uploadedSize / expectedSize).clamp(0.0, 0.95);
+            onProgress(pct);
           }
         } catch (_) {}
         return;
       }
 
-      // ── Real message ID when Telegram confirms the send ──────────────────
+      // â”€â”€ Telegram confirmed the message was delivered â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       if (type == 'updateMessageSendSucceeded') {
+        if (completer.isCompleted) return;
         final oldId = upd['old_message_id'] as int?;
-        if (oldId == tempId && !completer.isCompleted) {
+        if (oldId == tempId) {
           final msg    = upd['message'] as Map<String, dynamic>?;
           final realId = msg?['id'] as int?;
           if (realId != null) {
             completer.complete(realId);
           } else {
-            completer.completeError(Exception('updateMessageSendSucceeded missing id'));
+            completer.completeError(
+                Exception('updateMessageSendSucceeded: missing message id'));
           }
         }
         return;
       }
 
-      // ── Upload failure ───────────────────────────────────────────────────
+      // â”€â”€ Telegram rejected the upload â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       if (type == 'updateMessageSendFailed') {
+        if (completer.isCompleted) return;
         final oldId = upd['old_message_id'] as int?;
-        if (oldId == tempId && !completer.isCompleted) {
+        if (oldId == tempId) {
           final errMap = upd['error'] as Map<String, dynamic>?;
           final msg    = errMap?['message'] as String?
                       ?? 'Telegram rejected the file upload';
@@ -666,21 +707,27 @@ class TdlibService {
       }
     });
 
-    // ── Step 3: Wait for real ID (up to 60 min for large files) ─────────────
+    // â”€â”€ Step 3: Wait up to 90 min for Telegram to confirm send â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try {
       final realId = await completer.future.timeout(
-        const Duration(minutes: 60),
-        onTimeout: () {
-          throw Exception('Upload timed out after 60 minutes — check your connection');
-        },
+        const Duration(minutes: 90),
+        onTimeout: () => throw Exception(
+            'Upload timed out after 90 minutes â€” check your connection'),
       );
       onProgress?.call(1.0);
       return realId;
     } finally {
       fakeTimer?.cancel();
       await sub.cancel();
+      if (trackedFileId != null) {
+        _claimedUploadFileIds.remove(trackedFileId);
+      }
     }
   }
+
+  // Global set of TDLib file IDs currently being uploaded.
+  // Prevents concurrent chunk-uploads from adopting the same file ID.
+  final _claimedUploadFileIds = <int>{};
 
   // ════════════════════════════════════════════════════════════════════════════
   // DOWNLOAD API

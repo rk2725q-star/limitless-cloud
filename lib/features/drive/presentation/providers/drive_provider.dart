@@ -15,6 +15,7 @@ import '../../../../core/constants/app_constants.dart';
 import '../../../../core/utils/file_utils.dart';
 import '../../../../core/services/tdlib_service.dart';
 import '../../../../core/services/upload_background_service.dart';
+import '../../../../core/services/face_detection_service.dart';
 import 'package:mime/mime.dart';
 
 // ── Upload State ──────────────────────────────────────────────────────────────
@@ -121,6 +122,19 @@ class DriveNotifier extends StateNotifier<DriveState> {
   DriveNotifier(this._firestoreService, this._telegramService, this._ref)
       : super(DriveState()) {
     _loadPreferences();
+    _cleanupGhostChunks();
+  }
+
+  Future<void> _cleanupGhostChunks() async {
+    try {
+      final uid = await _userId;
+      if (uid != null) {
+        final purged = await _firestoreService.purgeChunkGhostFiles(uid);
+        if (purged > 0) {
+          _invalidateAll(null);
+        }
+      }
+    } catch (_) {}
   }
 
   Future<void> _loadPreferences() async {
@@ -242,6 +256,30 @@ class DriveNotifier extends StateNotifier<DriveState> {
     if (!mounted) return;
     final tasks = state.uploadTasks.where((t) => t.taskId != taskId).toList();
     state = state.copyWith(uploadTasks: tasks);
+  }
+
+  /// Upload a file captured by the in-app camera.
+  ///
+  /// The [file] is a temporary file written by the camera.
+  /// After a successful upload the local copy is automatically deleted —
+  /// freeing device storage immediately.  This is Method 2 of the
+  /// "zero local storage" camera feature.
+  Future<void> uploadCapturedFile({
+    required File file,
+    required String fileName,
+    String? folderId,
+    String folderPath = '/',
+  }) async {
+    final userId = await _userId;
+    if (userId == null) return;
+    await _runUpload(
+      file: file,
+      fileName: fileName,
+      folderId: folderId,
+      folderPath: folderPath,
+      userId: userId,
+      isCacheFile: true, // ← auto-delete local copy after upload
+    );
   }
 
   Future<void> uploadFiles({
@@ -602,6 +640,9 @@ class DriveNotifier extends StateNotifier<DriveState> {
         // flag cleared below, AFTER successful sync
       }
 
+      // ── STEP 0: Clean up any ghost chunk files from earlier buggy syncs ─────
+      await _firestoreService.purgeChunkGhostFiles(userId);
+
       // ── Check current DB state ───────────────────────────────────────────────
       final existingMsgIds     = await _firestoreService.getExistingMessageIds(userId);
       final existingFolderIds  = await _firestoreService.getExistingFolderIds(userId);
@@ -644,6 +685,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
       if (telegramFiles.isNotEmpty) {
         for (final tf in telegramFiles) {
           if (existingMsgIds.contains(tf.messageId)) continue;
+          if (tf.chunkMessageIds.any((id) => existingMsgIds.contains(id))) continue;
 
           String? folderId;
           String folderPath = '/';
@@ -686,11 +728,14 @@ class DriveNotifier extends StateNotifier<DriveState> {
             telegramMessageId: tf.messageId,
             telegramFileId: tf.messageId.toString(),
             mimeType: tf.mimeType, sizeBytes: tf.fileSize, extension: ext,
+            chunkMessageIds: tf.chunkMessageIds,
             telegramThumbnailId: tf.thumbnailId,
           );
           filesImported++;
         }
       }
+
+      await _firestoreService.purgeChunkGhostFiles(userId);
 
       // ── STEP 3: Only clear resync flag after everything succeeded ───────────
       // If an exception was thrown above, we never reach here and the flag
@@ -906,6 +951,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
       fileId: file.id,
       folderId: file.folderId,
     );
+    FaceDetectionService.instance.onFileDeleted(userId, file.id);
   }
 
   Future<bool> deleteFile(CloudFile file) async {
@@ -931,6 +977,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
       return false;
     }
     _invalidateAll(file.folderId);
+    FaceDetectionService.instance.onFileDeleted(userId, file.id);
     return true;
   }
 
