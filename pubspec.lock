@@ -488,6 +488,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.14.0"
+  google_mlkit_selfie_segmentation:
+    dependency: "direct main"
+    description:
+      name: google_mlkit_selfie_segmentation
+      sha256: "97b5030a066db72321395aded9fef0a12ba6afc182579280674c2443818c732a"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.11.0"
   handy_tdlib:
     dependency: "direct main"
     description:

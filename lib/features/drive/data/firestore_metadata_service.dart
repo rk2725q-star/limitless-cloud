@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
@@ -461,6 +462,77 @@ class LocalMetadataService {
       );
     }
 
+    // ── DEDUPLICATION CHECK 1: Existing Telegram Message ID ───────────────────
+    if (telegramMessageId > 0) {
+      final existingByMsg = await db.query(
+        'files',
+        where: 'userId = ? AND telegramMessageId = ? AND isTrashed = 0',
+        whereArgs: [userId, telegramMessageId],
+      );
+      if (existingByMsg.isNotEmpty) {
+        final existing = existingByMsg.first;
+        final existingId = existing['id'] as String;
+        final updates = <String, dynamic>{
+          'name': name,
+          'folderId': folderId,
+          'folderPath': folderPath,
+          'sizeBytes': sizeBytes,
+          'mimeType': mimeType,
+          'extension': extension,
+          'updatedAt': now,
+        };
+        if (thumbnailPath != null && thumbnailPath.isNotEmpty) {
+          updates['thumbnailPath'] = thumbnailPath;
+        }
+        if (telegramThumbnailId != null && telegramThumbnailId > 0) {
+          updates['telegramThumbnailId'] = telegramThumbnailId;
+        }
+        if (chunkMessageIds.isNotEmpty) {
+          updates['chunkMessageIds'] = jsonEncode(chunkMessageIds);
+        }
+        await db.update('files', updates, where: 'id = ?', whereArgs: [existingId]);
+        final updated = await db.query('files', where: 'id = ?', whereArgs: [existingId]);
+        return _fileFromMap(updated.first);
+      }
+    }
+
+    // ── DEDUPLICATION CHECK 2: Existing Offline-Pending or Matching File ───────
+    final existingByName = await db.query(
+      'files',
+      where: 'userId = ? AND name = ? AND folderPath = ? AND isTrashed = 0',
+      whereArgs: [userId, name, folderPath],
+    );
+    if (existingByName.isNotEmpty) {
+      final existing = existingByName.first;
+      final existingId = existing['id'] as String;
+      final existingMsgId = existing['telegramMessageId'] as int? ?? 0;
+
+      // Update existing record if it is pending OR if incoming has cloud msgId
+      if (existingMsgId <= 0 || telegramMessageId > 0) {
+        final updates = <String, dynamic>{
+          if (telegramMessageId > 0) 'telegramMessageId': telegramMessageId,
+          if (telegramMessageId > 0) 'telegramFileId': telegramFileId,
+          'folderId': folderId,
+          'sizeBytes': sizeBytes,
+          'mimeType': mimeType,
+          'extension': extension,
+          'updatedAt': now,
+        };
+        if (thumbnailPath != null && thumbnailPath.isNotEmpty) {
+          updates['thumbnailPath'] = thumbnailPath;
+        }
+        if (telegramThumbnailId != null && telegramThumbnailId > 0) {
+          updates['telegramThumbnailId'] = telegramThumbnailId;
+        }
+        if (chunkMessageIds.isNotEmpty) {
+          updates['chunkMessageIds'] = jsonEncode(chunkMessageIds);
+        }
+        await db.update('files', updates, where: 'id = ?', whereArgs: [existingId]);
+        final updated = await db.query('files', where: 'id = ?', whereArgs: [existingId]);
+        return _fileFromMap(updated.first);
+      }
+    }
+
     await db.insert('files', {
       'id': id,
       'userId': userId,
@@ -534,6 +606,7 @@ class LocalMetadataService {
   }) async* {
     final controller = StreamController<List<CloudFile>>();
     Future<void> emit() async {
+      await deduplicateFiles(userId);
       final db = await _DB.instance;
       final col = _sqlCol(sortBy);
       final dir = descending ? 'DESC' : 'ASC';
@@ -553,7 +626,16 @@ class LocalMetadataService {
           orderBy: '$col $dir',
         );
       }
-      controller.add(rows.map(_fileFromMap).toList());
+      final rawList = rows.map(_fileFromMap).toList();
+      final seen = <String>{};
+      final deduped = <CloudFile>[];
+      for (final f in rawList) {
+        final key = '${f.folderPath}/${f.name}';
+        if (seen.add(key)) {
+          deduped.add(f);
+        }
+      }
+      controller.add(deduped);
     }
 
     await emit();
@@ -568,6 +650,7 @@ class LocalMetadataService {
   }) async* {
     final controller = StreamController<List<CloudFile>>();
     Future<void> emit() async {
+      await deduplicateFiles(userId);
       final db = await _DB.instance;
       List<Map<String, dynamic>> rows;
       if (starredOnly) {
@@ -586,7 +669,16 @@ class LocalMetadataService {
             whereArgs: [userId],
             orderBy: 'uploadedAt DESC');
       }
-      controller.add(rows.map(_fileFromMap).toList());
+      final rawList = rows.map(_fileFromMap).toList();
+      final seen = <String>{};
+      final deduped = <CloudFile>[];
+      for (final f in rawList) {
+        final key = '${f.folderPath}/${f.name}';
+        if (seen.add(key)) {
+          deduped.add(f);
+        }
+      }
+      controller.add(deduped);
     }
 
     await emit();
@@ -601,13 +693,23 @@ class LocalMetadataService {
   }) async* {
     final controller = StreamController<List<CloudFile>>();
     Future<void> emit() async {
+      await deduplicateFiles(userId);
       final db = await _DB.instance;
       final mimeCond = category.mimeCondition;
       final rows = await db.rawQuery(
         "SELECT * FROM files WHERE userId = ? AND isTrashed = 0 AND name NOT LIKE 'lc_chunk_%' AND name NOT LIKE '%.part%of%' AND $mimeCond ORDER BY uploadedAt DESC",
         [userId],
       );
-      controller.add(rows.map(_fileFromMap).toList());
+      final rawList = rows.map(_fileFromMap).toList();
+      final seen = <String>{};
+      final deduped = <CloudFile>[];
+      for (final f in rawList) {
+        final key = '${f.folderPath}/${f.name}';
+        if (seen.add(key)) {
+          deduped.add(f);
+        }
+      }
+      controller.add(deduped);
     }
 
     await emit();
@@ -830,6 +932,120 @@ class LocalMetadataService {
       [userId],
     );
     return result.isNotEmpty ? Map<String, dynamic>.from(result.first) : {};
+  }
+
+  /// Returns all files that were saved locally when offline and are pending cloud backup.
+  Future<List<CloudFile>> getPendingOfflineFiles(String userId) async {
+    final db = await _DB.instance;
+    final rows = await db.query(
+      'files',
+      where: 'userId = ? AND (telegramMessageId <= 0 OR telegramFileId LIKE "offline_pending_%") AND isTrashed = 0',
+      whereArgs: [userId],
+      orderBy: 'uploadedAt ASC',
+    );
+    return rows.map(_fileFromMap).toList();
+  }
+
+  /// Scans files table for any duplicate rows (same userId + name + folderPath, or same msgId > 0)
+  /// and purges duplicate rows so each file exists exactly once.
+  Future<int> deduplicateFiles(String userId) async {
+    try {
+      final db = await _DB.instance;
+      final rows = await db.rawQuery('''
+        SELECT id, name, folderPath, telegramMessageId, thumbnailPath, updatedAt, uploadedAt
+        FROM files
+        WHERE userId = ? AND isTrashed = 0
+        ORDER BY CASE WHEN telegramMessageId > 0 THEN 1 ELSE 0 END DESC,
+                 CASE WHEN thumbnailPath IS NOT NULL AND thumbnailPath != '' THEN 1 ELSE 0 END DESC,
+                 updatedAt DESC
+      ''', [userId]);
+
+      final seenKeys = <String>{};
+      final seenMsgIds = <int>{};
+      final idsToDelete = <String>[];
+
+      for (final r in rows) {
+        final id = r['id'] as String;
+        final name = r['name'] as String;
+        final folderPath = r['folderPath'] as String? ?? '/';
+        final msgId = r['telegramMessageId'] as int? ?? 0;
+        final nameKey = '$folderPath/$name';
+
+        bool isDup = false;
+        if (msgId > 0 && seenMsgIds.contains(msgId)) {
+          isDup = true;
+        } else if (seenKeys.contains(nameKey)) {
+          isDup = true;
+        }
+
+        if (isDup) {
+          idsToDelete.add(id);
+        } else {
+          seenKeys.add(nameKey);
+          if (msgId > 0) seenMsgIds.add(msgId);
+        }
+      }
+
+      for (final dupId in idsToDelete) {
+        await db.delete('files', where: 'id = ?', whereArgs: [dupId]);
+      }
+      return idsToDelete.length;
+    } catch (e) {
+      debugPrint('[LocalMetadataService] deduplicateFiles error: $e');
+      return 0;
+    }
+  }
+
+  /// Updates an offline file record after it has been safely uploaded to Telegram.
+  Future<void> markFileUploaded({
+    required String fileId,
+    required String userId,
+    required int telegramMessageId,
+    required String telegramFileId,
+    List<int> chunkMessageIds = const [],
+    String? permanentThumbPath,
+  }) async {
+    final db = await _DB.instance;
+    final now = DateTime.now().toIso8601String();
+
+    // 1. Check if another row already has this telegramMessageId (race condition with syncFromTelegram)
+    final existingWithMsgId = await db.query(
+      'files',
+      where: 'userId = ? AND telegramMessageId = ? AND id != ? AND isTrashed = 0',
+      whereArgs: [userId, telegramMessageId, fileId],
+    );
+    if (existingWithMsgId.isNotEmpty) {
+      final winnerId = existingWithMsgId.first['id'] as String;
+      if (permanentThumbPath != null) {
+        await db.update(
+          'files',
+          {'thumbnailPath': permanentThumbPath, 'updatedAt': now},
+          where: 'id = ?',
+          whereArgs: [winnerId],
+        );
+      }
+      await db.delete('files', where: 'id = ?', whereArgs: [fileId]);
+      await deduplicateFiles(userId);
+      return;
+    }
+
+    final updates = <String, dynamic>{
+      'telegramMessageId': telegramMessageId,
+      'telegramFileId': telegramFileId,
+      'chunkMessageIds': jsonEncode(chunkMessageIds),
+      'updatedAt': now,
+    };
+    if (permanentThumbPath != null) {
+      updates['thumbnailPath'] = permanentThumbPath;
+    }
+    await db.update(
+      'files',
+      updates,
+      where: 'id = ? AND userId = ?',
+      whereArgs: [fileId, userId],
+    );
+
+    await deduplicateFiles(userId);
   }
 
   // ── SQL column name mapper ─────────────────────────────────────────────────

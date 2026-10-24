@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'core/theme/app_theme.dart';
 import 'core/constants/app_routes.dart';
+import 'core/services/offline_sync_service.dart';
 import 'core/services/tdlib_service.dart';
 
 class LimitlessCloudApp extends ConsumerStatefulWidget {
@@ -16,11 +17,13 @@ class _LimitlessCloudAppState extends ConsumerState<LimitlessCloudApp> with Widg
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    OfflineSyncService.instance.init(ref);
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    OfflineSyncService.instance.dispose();
     super.dispose();
   }
 

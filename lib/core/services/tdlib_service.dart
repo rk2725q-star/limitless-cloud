@@ -106,6 +106,7 @@ class TdlibService {
   // Auth state tracking
   String _authState = '';
   String get authState => _authState;
+  bool get isReady => _initialized && _authState == 'authorizationStateReady';
 
   // Initialization error
   String? initError;

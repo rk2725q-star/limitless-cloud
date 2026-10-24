@@ -736,6 +736,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
       }
 
       await _firestoreService.purgeChunkGhostFiles(userId);
+      await _firestoreService.deduplicateFiles(userId);
 
       // ── STEP 3: Only clear resync flag after everything succeeded ───────────
       // If an exception was thrown above, we never reach here and the flag
@@ -1024,6 +1025,10 @@ class DriveNotifier extends StateNotifier<DriveState> {
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
+
+  void invalidateCategoryStreams() {
+    _invalidateAll(null);
+  }
 
   void _invalidateAll(String? folderId) {
     _ref.invalidate(foldersProvider(folderId));

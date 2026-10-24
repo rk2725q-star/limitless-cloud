@@ -469,8 +469,9 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
   void _showFolderOptions(BuildContext context, WidgetRef ref, CloudFolder folder) {
     showModalBottomSheet(
       context: context,
-      backgroundColor: AppTheme.surface,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
       builder: (_) => _FolderOptionsSheet(folder: folder, ref: ref),
     );
   }
@@ -490,8 +491,9 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
           .toList();
       showModalBottomSheet(
         context: context,
-        backgroundColor: AppTheme.surface,
-        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
+        isScrollControlled: true,
+        useSafeArea: true,
+        backgroundColor: Colors.transparent,
         builder: (_) => _MultiFileOptionsSheet(
           selectedFiles: selectedFiles,
           outerScaffoldContext: context,
@@ -500,8 +502,9 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
     } else {
       showModalBottomSheet(
         context: context,
-        backgroundColor: AppTheme.surface,
-        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
+        isScrollControlled: true,
+        useSafeArea: true,
+        backgroundColor: Colors.transparent,
         builder: (_) => _FileOptionsSheet(file: tappedFile, ref: ref),
       );
     }
@@ -1432,24 +1435,54 @@ class _FolderOptionsSheet extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(width: 40, height: 4, decoration: BoxDecoration(color: AppTheme.cardBorder, borderRadius: BorderRadius.circular(2))),
-            const SizedBox(height: 16),
-            ListTile(leading: const Icon(Icons.drive_file_rename_outline_rounded), title: const Text('Rename'), onTap: () { Navigator.pop(context); _rename(context); }),
-            ListTile(
-              leading: const Icon(Icons.delete_forever_rounded, color: AppTheme.error),
-              title: const Text('Delete Permanently', style: TextStyle(color: AppTheme.error)),
-              onTap: () {
-                Navigator.pop(context);
-                _confirmDeleteFolder(context);
-              },
-            ),
-          ],
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+    return Container(
+      decoration: const BoxDecoration(
+        color: AppTheme.surface,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: SingleChildScrollView(
+          physics: const BouncingScrollPhysics(),
+          padding: EdgeInsets.fromLTRB(16, 12, 16, bottomInset + 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Center(
+                child: Container(
+                  width: 44,
+                  height: 5,
+                  decoration: BoxDecoration(color: AppTheme.cardBorder, borderRadius: BorderRadius.circular(3)),
+                ),
+              ),
+              const SizedBox(height: 16),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.drive_file_rename_outline_rounded),
+                title: const Text('Rename'),
+                onTap: () { Navigator.pop(context); _rename(context); },
+              ),
+              const SizedBox(height: 8),
+              Container(
+                margin: const EdgeInsets.symmetric(vertical: 4),
+                decoration: BoxDecoration(
+                  color: AppTheme.error.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: AppTheme.error.withValues(alpha: 0.25)),
+                ),
+                child: ListTile(
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                  leading: const Icon(Icons.delete_forever_rounded, color: AppTheme.error),
+                  title: const Text('Delete Permanently', style: TextStyle(color: AppTheme.error, fontWeight: FontWeight.w600)),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _confirmDeleteFolder(context);
+                  },
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -1521,81 +1554,146 @@ class _FileOptionsSheet extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(width: 40, height: 4, decoration: BoxDecoration(color: AppTheme.cardBorder, borderRadius: BorderRadius.circular(2))),
-            const SizedBox(height: 4),
-            ListTile(
-              leading: const Icon(Icons.download_rounded, color: AppTheme.primary),
-              title: const Text('Download'),
-              onTap: () {
-                Navigator.pop(context);
-                final auth = ref.read(telegramAuthServiceProvider);
-                final tg = TelegramStorageService(auth);
-                ref.read(dlManagerProvider.notifier).downloadCloudFile(file, tg);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: Row(children: [
-                      const Icon(Icons.download_rounded, color: Colors.white, size: 16),
-                      const SizedBox(width: 8),
-                      Expanded(child: Text('Downloading ${file.name}…', maxLines: 1, overflow: TextOverflow.ellipsis)),
-                    ]),
-                    backgroundColor: AppTheme.primary,
-                    duration: const Duration(seconds: 5),
-                    action: SnackBarAction(
-                      label: 'View',
-                      textColor: Colors.white,
-                      onPressed: () {
-                        ScaffoldMessenger.of(context).hideCurrentSnackBar();
-                        // Set jump signal FIRST, then switch tab — so when
-                        // DownloadManagerPage builds, initState already reads true
-                        ref.read(dlManagerJumpToActiveProvider.notifier).state = true;
-                        ref.read(homeNavIndexProvider.notifier).state = 3;
-                      },
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+    return Container(
+      decoration: const BoxDecoration(
+        color: AppTheme.surface,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: SingleChildScrollView(
+          physics: const BouncingScrollPhysics(),
+          padding: EdgeInsets.fromLTRB(16, 12, 16, bottomInset + 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Center(
+                child: Container(
+                  width: 44,
+                  height: 5,
+                  decoration: BoxDecoration(color: AppTheme.cardBorder, borderRadius: BorderRadius.circular(3)),
+                ),
+              ),
+              const SizedBox(height: 12),
+              // File name header
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                child: Row(children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: AppTheme.primary.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Icon(Icons.insert_drive_file_rounded, color: AppTheme.primary, size: 20),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      file.name,
+                      style: AppTheme.titleMedium.copyWith(
+                        fontWeight: FontWeight.w600,
+                        color: AppTheme.textPrimary,
+                        fontSize: 13,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                     ),
                   ),
-                );
-              },
-            ),
-            ListTile(leading: Icon(file.isStarred ? Icons.star_border_rounded : Icons.star_rounded, color: AppTheme.warning), title: Text(file.isStarred ? 'Remove Star' : 'Star'), onTap: () { Navigator.pop(context); ref.read(driveProvider.notifier).toggleStar(file); }),
-            ListTile(leading: const Icon(Icons.share_rounded, color: AppTheme.accent), title: const Text('Share'), onTap: () { Navigator.pop(context); }),
-            ListTile(
-              leading: const Icon(Icons.drive_file_rename_outline_rounded),
-              title: const Text('Rename'),
-              onTap: () {
-                Navigator.pop(context);
-                _showRenameDialog(context, file);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.drive_file_move_rounded, color: AppTheme.secondary),
-              title: const Text('Move to Folder'),
-              onTap: () {
-                Navigator.pop(context);
-                _showFolderPicker(context, mode: 'move');
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.copy_rounded, color: AppTheme.accent),
-              title: const Text('Copy to Folder'),
-              onTap: () {
-                Navigator.pop(context);
-                _showFolderPicker(context, mode: 'copy');
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_forever_rounded, color: AppTheme.error),
-              title: const Text('Delete Permanently', style: TextStyle(color: AppTheme.error)),
-              onTap: () {
-                Navigator.pop(context);
-                _confirmDelete(context);
-              },
-            ),
-          ],
+                ]),
+              ),
+              const Divider(height: 18),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.download_rounded, color: AppTheme.primary),
+                title: const Text('Download'),
+                onTap: () {
+                  Navigator.pop(context);
+                  final auth = ref.read(telegramAuthServiceProvider);
+                  final tg = TelegramStorageService(auth);
+                  ref.read(dlManagerProvider.notifier).downloadCloudFile(file, tg);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Row(children: [
+                        const Icon(Icons.download_rounded, color: Colors.white, size: 16),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text('Downloading ${file.name}…', maxLines: 1, overflow: TextOverflow.ellipsis)),
+                      ]),
+                      backgroundColor: AppTheme.primary,
+                      duration: const Duration(seconds: 5),
+                      action: SnackBarAction(
+                        label: 'View',
+                        textColor: Colors.white,
+                        onPressed: () {
+                          ScaffoldMessenger.of(context).hideCurrentSnackBar();
+                          ref.read(dlManagerJumpToActiveProvider.notifier).state = true;
+                          ref.read(homeNavIndexProvider.notifier).state = 3;
+                        },
+                      ),
+                    ),
+                  );
+                },
+              ),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: Icon(file.isStarred ? Icons.star_border_rounded : Icons.star_rounded, color: AppTheme.warning),
+                title: Text(file.isStarred ? 'Remove Star' : 'Star'),
+                onTap: () { Navigator.pop(context); ref.read(driveProvider.notifier).toggleStar(file); },
+              ),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.share_rounded, color: AppTheme.accent),
+                title: const Text('Share'),
+                onTap: () { Navigator.pop(context); },
+              ),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.drive_file_rename_outline_rounded),
+                title: const Text('Rename'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showRenameDialog(context, file);
+                },
+              ),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.drive_file_move_rounded, color: AppTheme.secondary),
+                title: const Text('Move to Folder'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showFolderPicker(context, mode: 'move');
+                },
+              ),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.copy_rounded, color: AppTheme.accent),
+                title: const Text('Copy to Folder'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showFolderPicker(context, mode: 'copy');
+                },
+              ),
+              const SizedBox(height: 8),
+              Container(
+                margin: const EdgeInsets.symmetric(vertical: 4),
+                decoration: BoxDecoration(
+                  color: AppTheme.error.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: AppTheme.error.withValues(alpha: 0.25)),
+                ),
+                child: ListTile(
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                  leading: const Icon(Icons.delete_forever_rounded, color: AppTheme.error),
+                  title: const Text('Delete Permanently', style: TextStyle(color: AppTheme.error, fontWeight: FontWeight.w600)),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _confirmDelete(context);
+                  },
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

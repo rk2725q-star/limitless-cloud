@@ -82,6 +82,17 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
 
   Future<void> _loadImage(int index) async {
     if (_loading[index] == true || _localFiles.containsKey(index)) return;
+
+    final target = _allFiles[index];
+    if (target.thumbnailPath != null &&
+        !target.thumbnailPath!.startsWith('http') &&
+        File(target.thumbnailPath!).existsSync()) {
+      _localFiles[index] = File(target.thumbnailPath!);
+      _loading[index] = false;
+      if (mounted) setState(() {});
+      return;
+    }
+
     _loading[index] = true;
     if (mounted) setState(() {});
     try {
@@ -143,9 +154,9 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
     final localFile = _localFiles[_currentIndex];
     showModalBottomSheet(
       context: context,
-      backgroundColor: AppTheme.surface,
-      shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
       builder: (_) => _ImageActionsSheet(
         file: file,
         localFile: localFile,
@@ -481,81 +492,123 @@ class _ImageActionsSheet extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // Handle
-            Container(
-              width: 40, height: 4,
-              decoration: BoxDecoration(
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+    return Container(
+      decoration: const BoxDecoration(
+        color: AppTheme.surface,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: SingleChildScrollView(
+          physics: const BouncingScrollPhysics(),
+          padding: EdgeInsets.fromLTRB(16, 12, 16, bottomInset + 28),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Handle
+              Container(
+                width: 44,
+                height: 5,
+                decoration: BoxDecoration(
                   color: AppTheme.cardBorder,
-                  borderRadius: BorderRadius.circular(2)),
-            ),
-            const SizedBox(height: 8),
-            // File name header
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Row(children: [
-                const Icon(Icons.image_rounded, color: AppTheme.primary, size: 20),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    file.name,
-                    style: AppTheme.bodyMedium.copyWith(
-                        fontWeight: FontWeight.w600, color: AppTheme.textPrimary),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
+                  borderRadius: BorderRadius.circular(3),
                 ),
-              ]),
-            ),
-            const Divider(),
-            ListTile(
-              leading: const Icon(Icons.save_alt_rounded, color: AppTheme.accent),
-              title: const Text('Save to Device'),
-              subtitle: const Text('Save to Downloads/LimitlessCloud',
-                  style: TextStyle(fontSize: 11)),
-              onTap: onSave,
-            ),
-            ListTile(
-              leading: const Icon(Icons.open_in_new_rounded, color: AppTheme.primary),
-              title: const Text('Open with…'),
-              subtitle: const Text('Choose an app to view this image',
-                  style: TextStyle(fontSize: 11)),
-              onTap: onOpenWith,
-            ),
-            ListTile(
-              leading: Icon(
-                file.isStarred ? Icons.star_rounded : Icons.star_border_rounded,
-                color: AppTheme.warning,
               ),
-              title: Text(file.isStarred ? 'Remove Star' : 'Star'),
-              onTap: onStar,
-            ),
-            ListTile(
-              leading: const Icon(Icons.share_rounded, color: AppTheme.accent),
-              title: const Text('Share'),
-              subtitle: const Text('Send image to other apps',
-                  style: TextStyle(fontSize: 11)),
-              onTap: onShareImage,
-            ),
-            ListTile(
-              leading: const Icon(Icons.link_rounded, color: AppTheme.textSecondary),
-              title: const Text('Share Link'),
-              subtitle: const Text('Copy Telegram link',
-                  style: TextStyle(fontSize: 11)),
-              onTap: onShareLink,
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_forever_rounded, color: AppTheme.error),
-              title: const Text('Delete Permanently',
-                  style: TextStyle(color: AppTheme.error)),
-              onTap: onDelete,
-            ),
-          ],
+              const SizedBox(height: 12),
+              // File name header
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+                child: Row(children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: AppTheme.primary.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Icon(Icons.image_rounded, color: AppTheme.primary, size: 20),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      file.name,
+                      style: AppTheme.titleMedium.copyWith(
+                        fontWeight: FontWeight.w600,
+                        color: AppTheme.textPrimary,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ]),
+              ),
+              const Divider(height: 20),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.save_alt_rounded, color: AppTheme.accent),
+                title: const Text('Save to Device'),
+                subtitle: const Text('Save to Downloads/LimitlessCloud',
+                    style: TextStyle(fontSize: 11)),
+                onTap: onSave,
+              ),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.open_in_new_rounded, color: AppTheme.primary),
+                title: const Text('Open with…'),
+                subtitle: const Text('Choose an app to view this image',
+                    style: TextStyle(fontSize: 11)),
+                onTap: onOpenWith,
+              ),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: Icon(
+                  file.isStarred ? Icons.star_rounded : Icons.star_border_rounded,
+                  color: AppTheme.warning,
+                ),
+                title: Text(file.isStarred ? 'Remove Star' : 'Star'),
+                onTap: onStar,
+              ),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.share_rounded, color: AppTheme.accent),
+                title: const Text('Share'),
+                subtitle: const Text('Send image to other apps',
+                    style: TextStyle(fontSize: 11)),
+                onTap: onShareImage,
+              ),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.link_rounded, color: AppTheme.textSecondary),
+                title: const Text('Share Link'),
+                subtitle: const Text('Copy Telegram link',
+                    style: TextStyle(fontSize: 11)),
+                onTap: onShareLink,
+              ),
+              const SizedBox(height: 8),
+              // Elevated & padded Delete button for flawless access on curved/edge screens
+              Container(
+                margin: const EdgeInsets.symmetric(vertical: 4),
+                decoration: BoxDecoration(
+                  color: AppTheme.error.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: AppTheme.error.withValues(alpha: 0.25)),
+                ),
+                child: ListTile(
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                  leading: const Icon(Icons.delete_forever_rounded, color: AppTheme.error),
+                  title: const Text(
+                    'Delete Permanently',
+                    style: TextStyle(color: AppTheme.error, fontWeight: FontWeight.w600),
+                  ),
+                  subtitle: const Text(
+                    'Permanently delete from cloud and device',
+                    style: TextStyle(color: AppTheme.error, fontSize: 11),
+                  ),
+                  onTap: onDelete,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

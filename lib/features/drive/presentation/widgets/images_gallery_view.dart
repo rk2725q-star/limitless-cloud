@@ -117,7 +117,17 @@ class _ImagesGalleryViewState extends ConsumerState<ImagesGalleryView> {
     return filesAsync.when(
       loading: () => const Center(child: CircularProgressIndicator()),
       error: (e, _) => Center(child: Text('Error: $e', style: AppTheme.bodyMedium)),
-      data: (allImages) {
+      data: (rawImages) {
+        // Guarantee unique images by folder + name
+        final seen = <String>{};
+        final allImages = <CloudFile>[];
+        for (final img in rawImages) {
+          final key = '${img.folderPath}/${img.name}';
+          if (seen.add(key)) {
+            allImages.add(img);
+          }
+        }
+
         final activeFileIds = allImages.map((f) => f.id).toSet();
         if (_userId != null) {
           FaceDetectionService.instance.purgeOrphanedPeople(_userId!, activeFileIds);
@@ -1228,8 +1238,9 @@ class _ImagesGalleryViewState extends ConsumerState<ImagesGalleryView> {
   void _showFileOptions(BuildContext context, CloudFile file) {
     showModalBottomSheet(
       context: context,
-      backgroundColor: AppTheme.surface,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
       builder: (_) => _ImagesFileOptionsSheet(file: file, ref: ref),
     );
   }
@@ -1603,6 +1614,32 @@ class _ImageTileState extends ConsumerState<_ImageTile> {
                   ),
                 ),
               ),
+
+              // Offline / Pending backup badge
+              if (f.telegramMessageId <= 0 || f.telegramFileId.startsWith('offline_pending_'))
+                Positioned(
+                  top: 4,
+                  right: 4,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.75),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: Colors.amber.withValues(alpha: 0.85), width: 0.8),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.cloud_upload_outlined, color: Colors.amber, size: 10),
+                        SizedBox(width: 3),
+                        Text(
+                          'Pending',
+                          style: TextStyle(color: Colors.amber, fontSize: 8.5, fontWeight: FontWeight.w700),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
             ],
           ),
         ),
@@ -1628,92 +1665,114 @@ class _ImagesFileOptionsSheet extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Center(
-              child: Container(
-                width: 40,
-                height: 4,
-                decoration: BoxDecoration(color: AppTheme.cardBorder, borderRadius: BorderRadius.circular(2)),
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+    return Container(
+      decoration: const BoxDecoration(
+        color: AppTheme.surface,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: SingleChildScrollView(
+          physics: const BouncingScrollPhysics(),
+          padding: EdgeInsets.fromLTRB(16, 12, 16, bottomInset + 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 44,
+                  height: 5,
+                  decoration: BoxDecoration(color: AppTheme.cardBorder, borderRadius: BorderRadius.circular(3)),
+                ),
               ),
-            ),
-            const SizedBox(height: 14),
-            Row(
-              children: [
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(6),
-                  child: SizedBox(
-                    width: 40,
-                    height: 40,
-                    child: file.thumbnailPath != null && io.File(file.thumbnailPath!).existsSync()
-                        ? Image.file(io.File(file.thumbnailPath!), fit: BoxFit.cover)
-                        : Container(color: AppTheme.cardBorder, child: const Icon(Icons.image_rounded)),
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: SizedBox(
+                      width: 44,
+                      height: 44,
+                      child: file.thumbnailPath != null && io.File(file.thumbnailPath!).existsSync()
+                          ? Image.file(io.File(file.thumbnailPath!), fit: BoxFit.cover)
+                          : Container(color: AppTheme.cardBorder, child: const Icon(Icons.image_rounded)),
+                    ),
                   ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        file.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: AppTheme.titleMedium.copyWith(fontSize: 13, fontWeight: FontWeight.w700),
-                      ),
-                      Text(
-                        '${FileUtils.formatFileSize(file.sizeBytes)} • ${AppDateUtils.formatDateTime(file.uploadedAt)}',
-                        style: AppTheme.bodyMedium.copyWith(fontSize: 11, color: AppTheme.textSecondary),
-                      ),
-                    ],
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          file.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: AppTheme.titleMedium.copyWith(fontSize: 13, fontWeight: FontWeight.w700),
+                        ),
+                        Text(
+                          '${FileUtils.formatFileSize(file.sizeBytes)} • ${AppDateUtils.formatDateTime(file.uploadedAt)}',
+                          style: AppTheme.bodyMedium.copyWith(fontSize: 11, color: AppTheme.textSecondary),
+                        ),
+                      ],
+                    ),
                   ),
+                ],
+              ),
+              const Divider(height: 20),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.download_rounded, color: AppTheme.primary),
+                title: const Text('Download'),
+                onTap: () {
+                  Navigator.pop(context);
+                  final auth = ref.read(telegramAuthServiceProvider);
+                  final tg = TelegramStorageService(auth);
+                  ref.read(dlManagerProvider.notifier).downloadCloudFile(file, tg);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Downloading ${file.name}…'), backgroundColor: AppTheme.primary),
+                  );
+                },
+              ),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: Icon(file.isStarred ? Icons.star_border_rounded : Icons.star_rounded, color: AppTheme.warning),
+                title: Text(file.isStarred ? 'Remove Star' : 'Star'),
+                onTap: () {
+                  Navigator.pop(context);
+                  ref.read(driveProvider.notifier).toggleStar(file);
+                },
+              ),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.drive_file_rename_outline_rounded),
+                title: const Text('Rename'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showRenameDialog(context, file);
+                },
+              ),
+              const SizedBox(height: 8),
+              Container(
+                margin: const EdgeInsets.symmetric(vertical: 4),
+                decoration: BoxDecoration(
+                  color: AppTheme.error.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: AppTheme.error.withValues(alpha: 0.25)),
                 ),
-              ],
-            ),
-            const Divider(height: 20),
-            ListTile(
-              leading: const Icon(Icons.download_rounded, color: AppTheme.primary),
-              title: const Text('Download'),
-              onTap: () {
-                Navigator.pop(context);
-                final auth = ref.read(telegramAuthServiceProvider);
-                final tg = TelegramStorageService(auth);
-                ref.read(dlManagerProvider.notifier).downloadCloudFile(file, tg);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text('Downloading ${file.name}…'), backgroundColor: AppTheme.primary),
-                );
-              },
-            ),
-            ListTile(
-              leading: Icon(file.isStarred ? Icons.star_border_rounded : Icons.star_rounded, color: AppTheme.warning),
-              title: Text(file.isStarred ? 'Remove Star' : 'Star'),
-              onTap: () {
-                Navigator.pop(context);
-                ref.read(driveProvider.notifier).toggleStar(file);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.drive_file_rename_outline_rounded),
-              title: const Text('Rename'),
-              onTap: () {
-                Navigator.pop(context);
-                _showRenameDialog(context, file);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_outline_rounded, color: AppTheme.error),
-              title: const Text('Move to Trash', style: TextStyle(color: AppTheme.error)),
-              onTap: () {
-                Navigator.pop(context);
-                ref.read(driveProvider.notifier).trashFile(file);
-              },
-            ),
-          ],
+                child: ListTile(
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                  leading: const Icon(Icons.delete_outline_rounded, color: AppTheme.error),
+                  title: const Text('Move to Trash', style: TextStyle(color: AppTheme.error, fontWeight: FontWeight.w600)),
+                  onTap: () {
+                    Navigator.pop(context);
+                    ref.read(driveProvider.notifier).trashFile(file);
+                  },
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
