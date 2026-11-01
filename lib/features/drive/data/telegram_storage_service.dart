@@ -46,16 +46,23 @@ class TelegramFile {
     this.chunkMessageIds = const [],
   });
 
-  factory TelegramFile.fromSavedMessage(TdSavedMessage msg) => TelegramFile(
-        messageId: msg.messageId,
-        fileName:  msg.fileName ?? 'unknown',
-        fileSize:  msg.fileSize,
-        mimeType:  msg.mimeType,
-        date:      msg.date,
-        caption:   msg.caption,
-        thumbnailId: msg.thumbnailId,
-        chunkMessageIds: const [],
-      );
+  factory TelegramFile.fromSavedMessage(TdSavedMessage msg) {
+    String name = msg.fileName ?? 'unknown';
+    final meta = TelegramStorageService.parseFileCaption(msg.caption);
+    if (meta != null && meta['n'] != null && (meta['n'] as String).isNotEmpty) {
+      name = meta['n'] as String;
+    }
+    return TelegramFile(
+      messageId: msg.messageId,
+      fileName:  name,
+      fileSize:  msg.fileSize,
+      mimeType:  msg.mimeType,
+      date:      msg.date,
+      caption:   msg.caption,
+      thumbnailId: msg.thumbnailId,
+      chunkMessageIds: const [],
+    );
+  }
 }
 
 // ── Folder metadata ────────────────────────────────────────────────────────────
@@ -110,6 +117,19 @@ const _fileMetaPrefix    = 'LIMITLESS_FILE:';
 //   📂 /NewFolder/Path
 //   🆔 newFolderIdIfAny
 const _moveOverridePrefix = '☁️📍 ';
+
+// ── Unified Sync Result ───────────────────────────────────────────────────────
+class TelegramSyncData {
+  final List<TelegramFolderMeta> folders;
+  final Map<int, Map<String, dynamic>> moveOverrides;
+  final List<TelegramFile> files;
+
+  const TelegramSyncData({
+    required this.folders,
+    required this.moveOverrides,
+    required this.files,
+  });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  TelegramStorageService  — serverless direct-to-Telegram
@@ -318,16 +338,16 @@ class TelegramStorageService {
   // LIST / INFO / DELETE
   // ══════════════════════════════════════════════════════════════════════════
 
-  /// List all files from dedicated storage channel (and merge legacy files from Saved Messages).
-  /// Multi-part / chunked files are unified into a single TelegramFile
-  /// with chunkMessageIds and combined total fileSize populated.
-  /// Standalone chunks are strictly excluded and never returned individually.
-  Future<List<TelegramFile>> listFiles() async {
+  /// High-speed unified single-pass sync scan.
+  /// Fetches Telegram storage messages once and extracts folders, move overrides,
+  /// and all uploaded files (documents, photos, videos, audio, etc.).
+  Future<TelegramSyncData> unifiedSyncScan() async {
     final storageChatId = await _tdlib.getStorageChatId();
 
-    final msgs = await _tdlib.listSavedMessages(chatId: storageChatId, limit: 2000);
+    // 1. Fetch all storage messages in a single continuous stream
+    final msgs = await _tdlib.listSavedMessages(chatId: storageChatId, limit: 3000);
 
-    // Merge legacy files from private channel if one was previously created
+    // Also check legacy private channel if one was previously used
     try {
       final legacyChannelId = await _tdlib.getLegacyChannelId();
       if (legacyChannelId != 0 && legacyChannelId != storageChatId) {
@@ -341,28 +361,51 @@ class TelegramStorageService {
       }
     } catch (_) {}
 
-    // 1. Separate folder metadata and non-file messages
-    final fileMsgs = msgs.where((m) =>
-        TdlibService.isFileCaption(m.caption) &&
-        !TdlibService.isFolderCaption(m.caption)).toList();
+    final folders = <TelegramFolderMeta>[];
+    final moveOverrides = <int, Map<String, dynamic>>{};
+    final fileMsgs = <TdSavedMessage>[];
 
-    // Regex for part indicator in caption: e.g. "(part 1/2)" or "(part 2/2)"
+    for (final m in msgs) {
+      final caption = m.caption;
+
+      // 1. Check folder metadata
+      if (TdlibService.isFolderCaption(caption)) {
+        final f = parseFolderMeta(m);
+        if (f != null) folders.add(f);
+        continue;
+      }
+
+      // 2. Check move override
+      final override = parseMoveOverride(caption);
+      if (override != null) {
+        final msgId = override['msgId'] as int;
+        moveOverrides.putIfAbsent(msgId, () => override);
+        continue;
+      }
+
+      // 3. File messages: accept any message that contains a real file or non-plain-text payload
+      final hasFile = (m.fileName != null && m.fileName!.isNotEmpty) ||
+          m.fileSize > 0 ||
+          (m.mimeType.isNotEmpty && m.mimeType != 'text/plain');
+
+      if (hasFile) {
+        fileMsgs.add(m);
+      }
+    }
+
+    // 4. Process chunked files and normal files
     final partRegex = RegExp(r'\(part\s*(\d+)/(\d+)\)');
-
-    // Map: "$folderPath:$cleanFileName" -> list of chunk messages
     final chunkGroups = <String, List<TdSavedMessage>>{};
     final consumedChunkMsgIds = <int>{};
 
-    // First pass: identify explicit chunk parts by caption or filename
     for (final m in fileMsgs) {
       final isChunk = TdlibService.isChunkCaption(m.caption) ||
           (m.fileName?.startsWith('lc_chunk_') ?? false) ||
           (m.fileName?.contains(RegExp(r'\.part\d+of\d+')) ?? false);
 
       if (isChunk) {
-        final meta = TdlibService.parseFileCaption(m.caption);
+        final meta = parseFileCaption(m.caption);
         String cleanName = meta?['n'] as String? ?? m.fileName ?? 'unknown';
-        // Strip lc_chunk prefix if name is raw temp name
         if (cleanName.startsWith('lc_chunk_') && m.caption.contains('☁️ ')) {
           final lines = m.caption.split('\n');
           String first = lines[0].substring(lines[0].indexOf('☁️ ') + 3);
@@ -377,8 +420,7 @@ class TelegramStorageService {
       }
     }
 
-    // Second pass: for each chunk group, check if Part 1 was uploaded without "(part 1/N)"
-    // (handles backward compatibility with earlier uploads where j == 0 used standard caption)
+    // Second pass: for chunk groups, link part 1 if uploaded with standard caption
     for (final entry in chunkGroups.entries) {
       final group = entry.value;
       bool hasPart1 = false;
@@ -396,7 +438,7 @@ class TelegramStorageService {
 
         for (final m in fileMsgs) {
           if (consumedChunkMsgIds.contains(m.messageId)) continue;
-          final meta = TdlibService.parseFileCaption(m.caption);
+          final meta = parseFileCaption(m.caption);
           if (meta == null) continue;
           final name = meta['n'] as String?;
           final path = (meta['fp'] as String?) ?? '/';
@@ -409,14 +451,13 @@ class TelegramStorageService {
       }
     }
 
-    final result = <TelegramFile>[];
+    final unifiedFiles = <TelegramFile>[];
 
-    // 3. Convert unified chunk groups to single TelegramFiles
+    // Unify chunk groups into single files
     for (final entry in chunkGroups.entries) {
       final group = entry.value;
       if (group.isEmpty) continue;
 
-      // Sort parts: part 1 first, then part 2, etc.
       group.sort((a, b) {
         final matchA = partRegex.firstMatch(a.caption);
         final matchB = partRegex.firstMatch(b.caption);
@@ -425,18 +466,16 @@ class TelegramStorageService {
           final idxB = int.tryParse(matchB.group(1)!) ?? 0;
           return idxA.compareTo(idxB);
         }
-        if (matchA == null && matchB != null) return -1;
-        if (matchA != null && matchB == null) return 1;
         return a.messageId.compareTo(b.messageId);
       });
 
       final primary = group.first;
-      final meta = TdlibService.parseFileCaption(primary.caption) ??
-          TdlibService.parseFileCaption(group.last.caption);
+      final meta = parseFileCaption(primary.caption) ??
+          parseFileCaption(group.last.caption);
       var cleanName = meta?['n'] as String? ?? primary.fileName ?? 'unknown';
       if (cleanName.startsWith('lc_chunk_')) {
         for (final gm in group) {
-          final gMeta = TdlibService.parseFileCaption(gm.caption);
+          final gMeta = parseFileCaption(gm.caption);
           if (gMeta?['n'] != null && !(gMeta!['n'] as String).startsWith('lc_chunk_')) {
             cleanName = gMeta['n'] as String;
             break;
@@ -456,7 +495,7 @@ class TelegramStorageService {
         }
       }
 
-      result.add(TelegramFile(
+      unifiedFiles.add(TelegramFile(
         messageId: primary.messageId,
         fileName: cleanName,
         fileSize: totalSize,
@@ -468,18 +507,27 @@ class TelegramStorageService {
       ));
     }
 
-    // 4. Add normal non-chunk files
+    // Add all normal files (including photos, videos, audios with or without ☁️ caption)
     for (final m in fileMsgs) {
       if (consumedChunkMsgIds.contains(m.messageId)) continue;
-      // Exclude any leftover ghost chunk filenames or captions
       if (m.fileName?.startsWith('lc_chunk_') ?? false) continue;
       if (m.fileName?.contains(RegExp(r'\.part\d+of\d+')) ?? false) continue;
       if (TdlibService.isChunkCaption(m.caption)) continue;
 
-      result.add(TelegramFile.fromSavedMessage(m));
+      unifiedFiles.add(TelegramFile.fromSavedMessage(m));
     }
 
-    return result;
+    return TelegramSyncData(
+      folders: folders,
+      moveOverrides: moveOverrides,
+      files: unifiedFiles,
+    );
+  }
+
+  /// List all files using the unified scan
+  Future<List<TelegramFile>> listFiles() async {
+    final syncData = await unifiedSyncScan();
+    return syncData.files;
   }
 
   /// Delete a single Telegram message (file or metadata).
@@ -600,34 +648,9 @@ class TelegramStorageService {
   }
 
   /// Read all move-override messages from Telegram Saved Messages.
-  /// Returns a map: originalMessageId → {folderPath, folderId?}
-  /// Only the LATEST override per file is kept (in case the file was moved
-  /// multiple times after the 48-hour window).
   Future<Map<int, Map<String, dynamic>>> listMoveOverrides() async {
-    final storageChatId = await _tdlib.getStorageChatId();
-
-    final msgs = await _tdlib.listSavedMessages(chatId: storageChatId, limit: 500);
-    try {
-      final legacyChannelId = await _tdlib.getLegacyChannelId();
-      if (legacyChannelId != 0 && legacyChannelId != storageChatId) {
-        final legacyMsgs = await _tdlib.listSavedMessages(chatId: legacyChannelId, limit: 500);
-        final seen = msgs.map((m) => m.messageId).toSet();
-        for (final lm in legacyMsgs) {
-          if (!seen.contains(lm.messageId)) msgs.add(lm);
-        }
-      }
-    } catch (_) {}
-    final overrides = <int, Map<String, dynamic>>{};
-    for (final msg in msgs) {
-      // Move overrides are text messages (fileSize == 0)
-      if (msg.fileSize > 0) continue;
-      final parsed = parseMoveOverride(msg.caption);
-      if (parsed == null) continue;
-      final msgId = parsed['msgId'] as int;
-      // Keep the most recent override (list is newest-first from Telegram)
-      overrides.putIfAbsent(msgId, () => parsed);
-    }
-    return overrides;
+    final syncData = await unifiedSyncScan();
+    return syncData.moveOverrides;
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -664,65 +687,56 @@ class TelegramStorageService {
     await _tdlib.deleteMessages([metaMessageId]);
   }
 
-  /// List all folder metadata messages from Saved Messages.
-  /// Supports both new clean format and legacy LIMITLESS_FOLDER: format.
-  Future<List<TelegramFolderMeta>> listFolderMeta() async {
-    final storageChatId = await _tdlib.getStorageChatId();
+  /// Parse a folder metadata message from Saved Messages.
+  static TelegramFolderMeta? parseFolderMeta(TdSavedMessage msg) {
+    final caption = msg.caption;
+    if (caption.startsWith('☁️📁 ')) {
+      try {
+        final lines = caption.split('\n');
+        final name = lines[0].substring('☁️📁 '.length).trim();
+        String path = '/';
+        String id = msg.messageId.toString(); // fallback
+        String? parentId;
+        String color = '#4F8CFF';
 
-    final msgs = await _tdlib.listSavedMessages(chatId: storageChatId, limit: 200);
-    try {
-      final legacyChannelId = await _tdlib.getLegacyChannelId();
-      if (legacyChannelId != 0 && legacyChannelId != storageChatId) {
-        final legacyMsgs = await _tdlib.listSavedMessages(chatId: legacyChannelId, limit: 200);
-        final seen = msgs.map((m) => m.messageId).toSet();
-        for (final lm in legacyMsgs) {
-          if (!seen.contains(lm.messageId)) msgs.add(lm);
-        }
-      }
-    } catch (_) {}
-    final result = <TelegramFolderMeta>[];
-
-    for (final msg in msgs) {
-      final caption = msg.caption;
-
-      // ── New clean format: starts with ☁️📁 ────────────────────────────────
-      if (caption.startsWith('☁️📁 ')) {
-        try {
-          final lines = caption.split('\n');
-          final name = lines[0].substring('☁️📁 '.length);
-          String path = '/';
-          String id = msg.messageId.toString(); // fallback
-          String? parentId;
-          String color = '#4F8CFF';
-
-          for (int i = 1; i < lines.length; i++) {
-            final line = lines[i];
-            if (line.startsWith('📂 '))      { path     = line.substring('📂 '.length); }
-            else if (line.startsWith('🆔 ')) { id       = line.substring('🆔 '.length); }
-            else if (line.startsWith('👆 ')) { parentId = line.substring('👆 '.length); }
-            else if (line.startsWith('🎨 ')) { color    = line.substring('🎨 '.length); }
+        for (int i = 1; i < lines.length; i++) {
+          final line = lines[i];
+          if (line.startsWith('📂 ')) {
+            path = line.substring('📂 '.length).trim();
+          } else if (line.startsWith('🆔 ')) {
+            id = line.substring('🆔 '.length).trim();
+          } else if (line.startsWith('👆 ')) {
+            parentId = line.substring('👆 '.length).trim();
+          } else if (line.startsWith('🎨 ')) {
+            color = line.substring('🎨 '.length).trim();
           }
-          result.add(TelegramFolderMeta(
-            metaMessageId: msg.messageId,
-            id:            id,
-            name:          name,
-            parentId:      parentId,
-            path:          path,
-            color:         color,
-          ));
-        } catch (_) {}
-        continue;
-      }
+        }
+        return TelegramFolderMeta(
+          metaMessageId: msg.messageId,
+          id:            id,
+          name:          name,
+          parentId:      parentId,
+          path:          path,
+          color:         color,
+        );
+      } catch (_) {}
+      return null;
+    }
 
-      // ── Legacy format: LIMITLESS_FOLDER:{...} ──────────────────────────────
-      if (!caption.startsWith(_folderPrefix)) continue;
+    if (caption.startsWith(_folderPrefix)) {
       try {
         final json = jsonDecode(caption.substring(_folderPrefix.length))
             as Map<String, dynamic>;
-        result.add(TelegramFolderMeta.fromJson(msg.messageId, json));
+        return TelegramFolderMeta.fromJson(msg.messageId, json);
       } catch (_) {}
     }
-    return result;
+    return null;
+  }
+
+  /// List all folder metadata messages from Saved Messages.
+  Future<List<TelegramFolderMeta>> listFolderMeta() async {
+    final syncData = await unifiedSyncScan();
+    return syncData.folders;
   }
 
   // ══════════════════════════════════════════════════════════════════════════

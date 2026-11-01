@@ -336,6 +336,76 @@ class LocalMetadataService {
     );
   }
 
+  /// Returns all active folders for a user as a flat list
+  Future<List<CloudFolder>> getAllFoldersList(String userId) async {
+    final db = await _DB.instance;
+    final rows = await db.query(
+      'folders',
+      where: 'userId = ? AND isTrashed = 0',
+      whereArgs: [userId],
+    );
+    return rows.map(_folderFromMap).toList();
+  }
+
+  /// Ensures that all directory levels for [folderPath] exist in SQLite.
+  /// Example: '/Anime/AOT/S01' -> ensures '/Anime', '/Anime/AOT', '/Anime/AOT/S01' exist.
+  /// Returns the folder ID of the innermost folder, or null if [folderPath] is '/' or empty.
+  Future<String?> ensureFolderHierarchyExists({
+    required String userId,
+    required String folderPath,
+    Map<String, String>? pathCache,
+  }) async {
+    if (folderPath.isEmpty || folderPath == '/') return null;
+
+    final trimmed = folderPath.replaceAll(RegExp(r'^/+|/+$'), '');
+    if (trimmed.isEmpty) return null;
+
+    final segments = trimmed.split('/');
+    String currentPath = '';
+    String? currentParentId;
+
+    for (final seg in segments) {
+      if (seg.trim().isEmpty) continue;
+      currentPath = '$currentPath/$seg';
+
+      if (pathCache != null && pathCache.containsKey(currentPath)) {
+        currentParentId = pathCache[currentPath];
+        continue;
+      }
+
+      final db = await _DB.instance;
+      final existing = await db.query(
+        'folders',
+        where: 'userId = ? AND path = ? AND isTrashed = 0',
+        whereArgs: [userId, currentPath],
+        limit: 1,
+      );
+
+      if (existing.isNotEmpty) {
+        currentParentId = existing.first['id'] as String;
+      } else {
+        final parentPath = currentPath.contains('/')
+            ? (currentPath.substring(0, currentPath.lastIndexOf('/')).isEmpty
+                ? '/'
+                : currentPath.substring(0, currentPath.lastIndexOf('/')))
+            : '/';
+        final newFolder = await createFolder(
+          userId: userId,
+          name: seg,
+          parentFolderId: currentParentId,
+          parentPath: parentPath,
+        );
+        currentParentId = newFolder.id;
+      }
+
+      if (pathCache != null) {
+        pathCache[currentPath] = currentParentId;
+      }
+    }
+
+    return currentParentId;
+  }
+
   Stream<List<CloudFolder>> getFolders({
     required String userId,
     String? parentFolderId,

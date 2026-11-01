@@ -1357,6 +1357,23 @@ class TdlibService {
         final audio = content['audio'] as Map<String, dynamic>?;
         final file = audio?['audio'] as Map<String, dynamic>?;
         return file?['id'] as int?;
+      case 'messagePhoto':
+        final photo = content['photo'] as Map<String, dynamic>?;
+        final sizes = (photo?['sizes'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+        if (sizes.isNotEmpty) {
+          final largest = sizes.last;
+          final largestFile = largest['photo'] as Map<String, dynamic>?;
+          return largestFile?['id'] as int?;
+        }
+        return null;
+      case 'messageAnimation':
+        final anim = content['animation'] as Map<String, dynamic>?;
+        final file = anim?['animation'] as Map<String, dynamic>?;
+        return file?['id'] as int?;
+      case 'messageVoiceNote':
+        final vn = content['voice_note'] as Map<String, dynamic>?;
+        final file = vn?['voice'] as Map<String, dynamic>?;
+        return file?['id'] as int?;
       default:
         return null;
     }
@@ -1524,18 +1541,44 @@ class TdlibService {
         final content = msg['content'] as Map<String, dynamic>?;
         if (content == null) continue;
         final caption = _extractCaption(content);
-        if (caption == null) continue;
         if (prefix != null && !caption.startsWith(prefix)) continue;
 
         final fileInfo = _extractFileInfo(content);
+        // Only skip regular text messages that have NO file content and are NOT metadata
+        final isText = content['@type'] == 'messageText';
+        if (isText &&
+            !isFolderCaption(caption) &&
+            !caption.startsWith('MOVE_OVERRIDE:') &&
+            !caption.startsWith('☁️📍 ')) {
+          continue;
+        }
+
+        final date = DateTime.fromMillisecondsSinceEpoch((msg['date'] as int) * 1000);
+        String? resolvedFileName = fileInfo?['name'] as String?;
+        if (resolvedFileName == null || resolvedFileName.isEmpty) {
+          final meta = parseFileCaption(caption);
+          if (meta?['n'] != null && (meta!['n'] as String).isNotEmpty) {
+            resolvedFileName = meta['n'] as String;
+          }
+        }
+        if (resolvedFileName == null || resolvedFileName.isEmpty) {
+          final mime = fileInfo?['mime'] as String? ?? '';
+          if (mime.startsWith('image/')) {
+            resolvedFileName = 'IMG_${date.year}${date.month.toString().padLeft(2, '0')}${date.day.toString().padLeft(2, '0')}_$msgId.jpg';
+          } else if (mime.startsWith('video/')) {
+            resolvedFileName = 'VID_${date.year}${date.month.toString().padLeft(2, '0')}${date.day.toString().padLeft(2, '0')}_$msgId.mp4';
+          } else if (mime.startsWith('audio/')) {
+            resolvedFileName = 'AUD_${date.year}${date.month.toString().padLeft(2, '0')}${date.day.toString().padLeft(2, '0')}_$msgId.mp3';
+          }
+        }
+
         results.add(TdSavedMessage(
           messageId: msgId,
           caption: caption,
-          fileName: fileInfo?['name'] as String?,
+          fileName: resolvedFileName,
           fileSize: fileInfo?['size'] as int? ?? 0,
           mimeType: fileInfo?['mime'] as String? ?? 'application/octet-stream',
-          date: DateTime.fromMillisecondsSinceEpoch(
-              (msg['date'] as int) * 1000),
+          date: date,
           thumbnailId: fileInfo?['thumbnailId'] as int?,
         ));
       }
@@ -1724,15 +1767,15 @@ class TdlibService {
       caption.startsWith('☁️📁 ') ||
       caption.startsWith(_folderPrefix);
 
-  String? _extractCaption(Map<String, dynamic> content) {
+  String _extractCaption(Map<String, dynamic> content) {
     final type = content['@type'] as String?;
     switch (type) {
       case 'messageText':
-        return (content['text'] as Map<String, dynamic>?)?['text'] as String?;
+        return (content['text'] as Map<String, dynamic>?)?['text'] as String? ?? '';
       default:
-        // messageDocument, messageVideo, messagePhoto, etc. all have 'caption' on the root content object
+        // messageDocument, messageVideo, messagePhoto, etc. all have 'caption' on root content object
         final cap = content['caption'] as Map<String, dynamic>?;
-        return cap?['text'] as String?;
+        return cap?['text'] as String? ?? '';
     }
   }
 
@@ -1748,6 +1791,63 @@ class TdlibService {
         'size': file?['size'] ?? 0,
         'mime': doc?['mime_type'] ?? 'application/octet-stream',
         'thumbnailId': thumbFile?['id'],
+      };
+    } else if (type == 'messagePhoto') {
+      final photo = content['photo'] as Map<String, dynamic>?;
+      final sizes = (photo?['sizes'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+      if (sizes.isNotEmpty) {
+        final largest = sizes.last;
+        final largestFile = largest['photo'] as Map<String, dynamic>?;
+        final thumbSize = sizes.first;
+        final thumbFile = thumbSize['photo'] as Map<String, dynamic>?;
+        return {
+          'name': null,
+          'size': largestFile?['size'] ?? 0,
+          'mime': 'image/jpeg',
+          'thumbnailId': thumbFile?['id'] ?? largestFile?['id'],
+        };
+      }
+    } else if (type == 'messageVideo') {
+      final video = content['video'] as Map<String, dynamic>?;
+      final file = video?['video'] as Map<String, dynamic>?;
+      final thumb = video?['thumbnail'] as Map<String, dynamic>?;
+      final thumbFile = thumb?['file'] as Map<String, dynamic>?;
+      return {
+        'name': video?['file_name'],
+        'size': file?['size'] ?? 0,
+        'mime': video?['mime_type'] ?? 'video/mp4',
+        'thumbnailId': thumbFile?['id'],
+      };
+    } else if (type == 'messageAudio') {
+      final audio = content['audio'] as Map<String, dynamic>?;
+      final file = audio?['audio'] as Map<String, dynamic>?;
+      final thumb = audio?['album_cover_thumbnail'] as Map<String, dynamic>?;
+      final thumbFile = thumb?['file'] as Map<String, dynamic>?;
+      return {
+        'name': audio?['file_name'] ?? (audio?['title'] != null ? '${audio!['title']}.mp3' : null),
+        'size': file?['size'] ?? 0,
+        'mime': audio?['mime_type'] ?? 'audio/mpeg',
+        'thumbnailId': thumbFile?['id'],
+      };
+    } else if (type == 'messageAnimation') {
+      final anim = content['animation'] as Map<String, dynamic>?;
+      final file = anim?['animation'] as Map<String, dynamic>?;
+      final thumb = anim?['thumbnail'] as Map<String, dynamic>?;
+      final thumbFile = thumb?['file'] as Map<String, dynamic>?;
+      return {
+        'name': anim?['file_name'],
+        'size': file?['size'] ?? 0,
+        'mime': anim?['mime_type'] ?? 'video/mp4',
+        'thumbnailId': thumbFile?['id'],
+      };
+    } else if (type == 'messageVoiceNote') {
+      final vn = content['voice_note'] as Map<String, dynamic>?;
+      final file = vn?['voice'] as Map<String, dynamic>?;
+      return {
+        'name': 'voice_note.ogg',
+        'size': file?['size'] ?? 0,
+        'mime': vn?['mime_type'] ?? 'audio/ogg',
+        'thumbnailId': null,
       };
     }
     return null;

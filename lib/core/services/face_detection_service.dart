@@ -57,7 +57,7 @@ class FaceDetectionService extends ChangeNotifier {
   static final FaceDetectionService instance = FaceDetectionService._();
   FaceDetectionService._();
 
-  static const int _kFaceAlgoVersion = 4;
+  static const int _kFaceAlgoVersion = 5;
   FaceDetector? _detector;
   bool _isScanning = false;
   bool get isScanning => _isScanning;
@@ -288,8 +288,12 @@ class FaceDetectionService extends ChangeNotifier {
         }
 
         if (localPath != null && File(localPath).existsSync()) {
-          await _processFileFaces(userId, file, localPath, people);
+          final changed = await _processFileFaces(userId, file, localPath, people);
           scannedSet.add(file.id);
+          if (changed) {
+            await _savePeople(userId);
+            notifyListeners();
+          }
           // Yield to main event loop
           await Future.delayed(const Duration(milliseconds: 30));
         }
@@ -328,20 +332,21 @@ class FaceDetectionService extends ChangeNotifier {
     }
   }
 
-  Future<void> _processFileFaces(
+  Future<bool> _processFileFaces(
     String userId,
     CloudFile file,
     String localPath,
     List<PersonGroup> people,
   ) async {
+    bool changed = false;
     try {
       final inputImage = InputImage.fromFilePath(localPath);
       final faces = await _getDetector.processImage(inputImage);
-      if (faces.isEmpty) return;
+      if (faces.isEmpty) return false;
 
       final fileBytes = await File(localPath).readAsBytes();
       final decoded = img.decodeImage(fileBytes);
-      if (decoded == null) return;
+      if (decoded == null) return false;
 
       final appDir = await getApplicationDocumentsDirectory();
       final facesDir = Directory(p.join(appDir.path, 'faces'));
@@ -390,14 +395,15 @@ class FaceDetectionService extends ChangeNotifier {
           }
         }
 
-        // Strict threshold for matching the exact same person
-        if (bestMatch != null && highestSimilarity >= 0.70) {
+        // Calibrated threshold for matching the exact same person
+        if (bestMatch != null && highestSimilarity >= 0.80) {
           matchedInThisFile.add(bestMatch.id);
           if (!bestMatch.fileIds.contains(file.id)) {
             bestMatch.fileIds.add(file.id);
             bestMatch.updatedAt = DateTime.now();
+            changed = true;
           }
-          // Adapt feature vector
+          // Conservative adaptation to prevent feature drift
           _adaptFeatureVector(bestMatch.featureVector, features);
         } else {
           // New person cluster
@@ -413,16 +419,18 @@ class FaceDetectionService extends ChangeNotifier {
             name: personName,
             avatarPath: avatarFile.path,
             fileIds: [file.id],
-            featureVector: features,
+            featureVector: List<double>.from(features),
             updatedAt: DateTime.now(),
           );
           matchedInThisFile.add(newPerson.id);
           people.add(newPerson);
+          changed = true;
         }
       }
     } catch (e) {
       debugPrint('[FaceDetectionService] Face crop error on ${file.id}: $e');
     }
+    return changed;
   }
 
   /// Calculates a 268-element vector:
@@ -596,13 +604,21 @@ class FaceDetectionService extends ChangeNotifier {
     contrastDist /= 4.0;
     final contrastSim = (1.0 - contrastDist * 1.5).clamp(0.0, 1.0);
 
-    return 0.70 * appCorr + 0.20 * geomSim + 0.10 * contrastSim;
+    double score = 0.65 * appCorr + 0.20 * geomSim + 0.15 * contrastSim;
+
+    // Strong discriminator: if glasses or facial hair contrast differs notably
+    final glassesDiff = (v1[264] - v2[264]).abs();
+    if (glassesDiff > 0.35) {
+      score -= 0.15; // strong penalty: one has glasses/frames, the other does not
+    }
+
+    return score.clamp(0.0, 1.0);
   }
 
   void _adaptFeatureVector(List<double> target, List<double> incoming) {
     if (target.length != incoming.length) return;
     for (int i = 0; i < target.length; i++) {
-      target[i] = 0.85 * target[i] + 0.15 * incoming[i];
+      target[i] = 0.92 * target[i] + 0.08 * incoming[i];
     }
   }
 

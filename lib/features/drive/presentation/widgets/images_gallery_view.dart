@@ -104,7 +104,9 @@ class _ImagesGalleryViewState extends ConsumerState<ImagesGalleryView> {
     final profile = await authService.getProfile();
     final uid = profile['userId'];
     if (mounted && uid != null && uid.isNotEmpty) {
-      setState(() => _userId = uid);
+      // Pre-warm cached people from SQLite into memory for instant rendering
+      await FaceDetectionService.instance.getPeople(uid);
+      if (mounted) setState(() => _userId = uid);
     }
   }
 
@@ -347,9 +349,36 @@ class _ImagesGalleryViewState extends ConsumerState<ImagesGalleryView> {
         final people = FaceDetectionService.instance.getCachedPeople(_userId!, activeFileIds);
         final isScanning = FaceDetectionService.instance.isScanning;
 
-        // If no people with existing photos, hide completely
+        // If no people detected yet, show sleek discovery card while scanning
         if (people.isEmpty) {
-          return const SizedBox.shrink();
+          if (!isScanning) return const SizedBox.shrink();
+          return Container(
+            margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
+            decoration: BoxDecoration(
+              color: AppTheme.surface,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: AppTheme.cardBorder),
+            ),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: widget.accentColor),
+                ),
+                const SizedBox(width: 10),
+                const Text(
+                  'Discovering People & Faces in photos…',
+                  style: TextStyle(
+                    color: AppTheme.textSecondary,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          );
         }
 
         // Auto-deselect if selected person was deleted
