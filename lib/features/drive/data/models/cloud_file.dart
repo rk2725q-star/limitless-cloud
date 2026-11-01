@@ -21,7 +21,7 @@ class CloudFile {
   /// Empty list means the file is a single message (stored in [telegramMessageId]).
   final List<int> chunkMessageIds;
 
-  bool get isChunked => chunkMessageIds.isNotEmpty;
+  bool get isChunked => chunkMessageIds.length > 1;
 
   CloudFile({
     required this.id,

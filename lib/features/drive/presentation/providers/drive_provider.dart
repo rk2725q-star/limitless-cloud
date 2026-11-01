@@ -16,6 +16,7 @@ import '../../../../core/utils/file_utils.dart';
 import '../../../../core/services/tdlib_service.dart';
 import '../../../../core/services/upload_background_service.dart';
 import '../../../../core/services/face_detection_service.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:mime/mime.dart';
 
 // ── Upload State ──────────────────────────────────────────────────────────────
@@ -130,6 +131,8 @@ class DriveNotifier extends StateNotifier<DriveState> {
       final uid = await _userId;
       if (uid != null) {
         final purged = await _firestoreService.purgeChunkGhostFiles(uid);
+        // Always reconcile itemCounts on startup to fix any drift from previous sessions.
+        await _firestoreService.recalculateFolderItemCounts(uid);
         if (purged > 0) {
           _invalidateAll(null);
         }
@@ -174,7 +177,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
   /// guard, operations fired before the handshake completes hang forever
   /// (2-hour upload timeout) or fail silently (sync catch block).
   Future<void> _waitForTdlib({
-    Duration timeout = const Duration(seconds: 30),
+    Duration timeout = const Duration(seconds: 45),
   }) async {
     final tdlib = TdlibService.instance;
     final deadline = DateTime.now().add(timeout);
@@ -182,26 +185,36 @@ class DriveNotifier extends StateNotifier<DriveState> {
 
     while (tdlib.authState != 'authorizationStateReady') {
       if (tdlib.initError != null) {
-        if (!retried && tdlib.initError!.contains('lock file')) {
+        if (!retried && (tdlib.initError!.contains('lock file') || tdlib.initError!.contains('closed'))) {
           retried = true;
           await tdlib.retryInit();
           continue;
         }
         throw Exception(
-            'Telegram core failed to load: ${tdlib.initError}. Please force-close the app and reopen.');
+            'Telegram core is reconnecting (${tdlib.initError}). Please wait a moment.');
       }
       if (DateTime.now().isAfter(deadline)) {
         throw Exception(
-            'Telegram is stuck connecting (State: "${tdlib.authState}"). Please clear app data and log in again.');
+            'Telegram connection is taking longer than usual. Retrying in background…');
       }
       final s = tdlib.authState;
-      if (s == 'authorizationStateWaitPhoneNumber' ||
-          s == 'authorizationStateClosed' ||
-          s == 'authorizationStateClosing') {
-        throw Exception(
-            'Not logged in to Telegram. Please log in again.');
+      if (s == 'authorizationStateClosed' || s == 'authorizationStateClosing') {
+        if (!retried) {
+          retried = true;
+          await tdlib.retryInit();
+          continue;
+        }
       }
-      await Future.delayed(const Duration(milliseconds: 400));
+      if (s == 'authorizationStateWaitPhoneNumber') {
+        final authService = _ref.read(telegramAuthServiceProvider);
+        final hasSession = await authService.isLoggedIn();
+        if (!hasSession) {
+          throw Exception(
+              'Not logged in to Telegram. Please log in again.');
+        }
+        // If session exists in SharedPreferences, TDLib is still restoring its local database.
+      }
+      await Future.delayed(const Duration(milliseconds: 300));
     }
   }
 
@@ -423,12 +436,8 @@ class DriveNotifier extends StateNotifier<DriveState> {
     final mimeType = lookupMimeType(file.path) ?? 'application/octet-stream';
     final fileSize = await file.length();
 
-    // Mirrors chunk logic in TelegramStorageService.
-    const telegramLimit = 2 * 1024 * 1024 * 1024; // 2 GB
-    const maxChunkBytes = 1.95 * 1024 * 1024 * 1024; // 1.95 GB
-    final totalChunks = fileSize < telegramLimit
-        ? 1
-        : (fileSize / maxChunkBytes).ceil();
+    // Dynamically calculate total chunks matching TdlibService parallel stream engine
+    final totalChunks = TdlibService.calculateTotalChunks(fileSize);
 
     final taskId = '${fileName}_${DateTime.now().microsecondsSinceEpoch}';
 
@@ -617,12 +626,18 @@ class DriveNotifier extends StateNotifier<DriveState> {
     final userId = await _userId;
     if (userId == null) return (folders: 0, files: 0);
 
+    // If offline, silently display local SQLite files without failing or showing error banner
+    try {
+      final connectivity = await Connectivity().checkConnectivity();
+      if (!connectivity.any((r) => r != ConnectivityResult.none)) {
+        return (folders: 0, files: 0);
+      }
+    } catch (_) {}
+
     state = state.copyWith(isSyncing: true);
 
     try {
       // ── Guard: wait for TDLib before ANY Telegram API call ────────────────
-      // Without this, listFolderMeta + listFiles throw before auth is ready,
-      // the catch block swallowed it, and the user saw an empty drive.
       await _waitForTdlib(timeout: const Duration(seconds: 45));
 
       int foldersImported = 0;
@@ -738,7 +753,13 @@ class DriveNotifier extends StateNotifier<DriveState> {
       await _firestoreService.purgeChunkGhostFiles(userId);
       await _firestoreService.deduplicateFiles(userId);
 
-      // ── STEP 3: Only clear resync flag after everything succeeded ───────────
+      // ── STEP 3: Recalculate all folder item counts (files + subfolders) ────
+      // Must run AFTER all upsertFolder + saveFileMetadata calls so the count
+      // reflects the final state. Fixes "0 items" on folders that only contain
+      // subfolders (subfolders are now included in the count).
+      await _firestoreService.recalculateFolderItemCounts(userId);
+
+      // ── STEP 4: Only clear resync flag after everything succeeded ───────────
       // If an exception was thrown above, we never reach here and the flag
       // persists — the next app open will retry the wipe + full reimport.
       if (needsWipe) {
@@ -998,6 +1019,7 @@ class DriveNotifier extends StateNotifier<DriveState> {
         localFile = await _telegramService.downloadFile(
           file.telegramMessageId,
           file.name,
+          onProgress: onProgress,
         );
       }
       return localFile.path;
@@ -1113,9 +1135,15 @@ final userStatsProvider = FutureProvider<Map<String, dynamic>>((ref) async {
   final authService = ref.read(telegramAuthServiceProvider);
   final profile = await authService.getProfile();
   final userId = profile['userId'] ?? '';
-  if (userId.isEmpty) return {};
+  if (userId.isEmpty) return profile;
   final firestoreService = ref.read(firestoreServiceProvider);
-  return firestoreService.getUserStats(userId);
+  final stats = await firestoreService.getUserStats(userId);
+  return {
+    ...profile,
+    'displayName': profile['displayName'] ?? 'User',
+    'phoneNumber': profile['phone'] ?? '',
+    ...stats,
+  };
 });
 
 /// Exposes the authenticated Telegram session string so widgets can build

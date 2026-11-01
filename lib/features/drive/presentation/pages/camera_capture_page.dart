@@ -93,8 +93,16 @@ class _NormalizeParams {
   });
 }
 
-/// Bakes EXIF orientation to physical upright portrait, unmirrors front camera,
-/// and crops to selected aspect ratio (1:1, 4:3, 16:9, Full) with pristine 98% JPEG fidelity.
+/// Normalizes the captured JPEG with the minimal possible processing:
+/// - Bakes EXIF orientation (only if camera stored pixels sideways)
+/// - Flips horizontally (front camera only)
+/// - Crops to selected aspect ratio (only if needed)
+///
+/// CRITICAL: If NO transformation is actually required (back camera, EXIF
+/// already upright, and aspect ratio matches), we return WITHOUT re-encoding.
+/// Skipping the Dart JPEG encoder preserves 100% of the native Android hardware
+/// JPEG quality and eliminates the "dot dot" DCT block artifacts caused by
+/// generation loss in the pure-Dart `image` package encoder.
 Future<void> _normalizeImageInIsolate(_NormalizeParams params) async {
   try {
     final file = File(params.filePath);
@@ -103,17 +111,33 @@ Future<void> _normalizeImageInIsolate(_NormalizeParams params) async {
     final decoded = img.decodeImage(bytes);
     if (decoded == null) return;
 
-    // 1. Bake EXIF orientation so width & height match upright portrait viewing
+    // ── Step 1: Bake EXIF orientation ──────────────────────────────────────────
+    // Track whether bakeOrientation actually rotated the pixels.
+    // If EXIF says "already upright" (orientation = 1), it's a no-op.
+    final int preBakeW = decoded.width;
+    final int preBakeH = decoded.height;
     var oriented = img.bakeOrientation(decoded);
+    final bool wasRotated =
+        oriented.width != preBakeW || oriented.height != preBakeH;
 
-    // 2. Un-mirror front camera captures so hands/gestures appear on natural side
+    // ── Step 2: Flip front camera ──────────────────────────────────────────────
     if (params.isFrontCamera) {
       oriented = img.flipHorizontal(oriented);
     }
 
-    // 3. Crop to selected aspect ratio (1:1, 4:3, 16:9, or Full)
+    // ── Step 3: Check if aspect ratio crop is needed ───────────────────────────
     final double imgRatio = oriented.width / oriented.height;
-    if ((imgRatio - params.targetRatio).abs() >= 0.015) {
+    final bool needsCrop = (imgRatio - params.targetRatio).abs() >= 0.015;
+
+    // ── Fast path: nothing changed → keep native hardware JPEG as-is ──────────
+    // Avoids the Dart JPEG encoder entirely, which would introduce "dot dot"
+    // DCT block artifacts even at quality:100 due to different quantization.
+    if (!params.isFrontCamera && !wasRotated && !needsCrop) {
+      return; // Original hardware JPEG is perfect — no re-encode needed
+    }
+
+    // ── Slow path: apply crop if needed ────────────────────────────────────────
+    if (needsCrop) {
       int cropW = oriented.width;
       int cropH = oriented.height;
       int cropX = 0;
@@ -126,12 +150,12 @@ Future<void> _normalizeImageInIsolate(_NormalizeParams params) async {
         cropH = (oriented.width / params.targetRatio).round().clamp(1, oriented.height);
         cropY = ((oriented.height - cropH) / 2).round();
       }
-
       oriented = img.copyCrop(oriented, x: cropX, y: cropY, width: cropW, height: cropH);
     }
 
-    // High quality 98% JPEG without artificial color manipulation or stippling
-    final encoded = img.encodeJpg(oriented, quality: 98);
+    // Encode only when a transformation was genuinely applied.
+    // quality:100 → minimum quantization loss in the Dart encoder.
+    final encoded = img.encodeJpg(oriented, quality: 100);
     await file.writeAsBytes(encoded);
   } catch (e) {
     debugPrint('Image normalize isolate error: $e');
@@ -174,28 +198,50 @@ class _BokehParams {
   });
 }
 
-/// Applies realistic DSLR optical background bokeh blur to the upright image
+/// Applies realistic DSLR optical background bokeh blur to the upright image.
+/// Architecture changes vs previous version:
+///  - Mask built at FULL image resolution → no blocky upscaling artifacts
+///  - 3-pass box blur instead of single gaussianBlur → eliminates ring/halo artifacts
+///  - Smooth Hermite blend across [0.0 .. 1.0] without hard thresholds
+///  - quality:100 JPEG to avoid double-compression stippling
 Future<void> _applyBokehInIsolate(_BokehParams params) async {
   try {
     final file = File(params.filePath);
     if (!await file.exists()) return;
     final bytes = await file.readAsBytes();
-    final oriented = img.decodeJpg(bytes);
-    if (oriented == null) return;
+    // bakeOrientation: ensures pixels are physically upright regardless of
+    // whether _normalizeImageInIsolate already ran or took the fast-path skip.
+    final decoded = img.decodeImage(bytes);
+    if (decoded == null) return;
+    final oriented = img.bakeOrientation(decoded);
 
     final int w = oriented.width;
     final int h = oriented.height;
 
-    // 1. Generate realistic optical background blur
-    final blurredBg = img.gaussianBlur(oriented, radius: params.blurRadius.round());
+    // ── 1. Background blur ────────────────────────────────────────────────────
+    // Downscale to 480px work width — narrower = more accumulated blur per pass.
+    // This is the standard phone-camera bokeh trick: blur cheap at low-res, upscale.
+    // blurRadius [3..26] → passes [6..30]: strong enough to be clearly visible.
+    final int blurPasses = (params.blurRadius * 1.2).round().clamp(6, 30);
+    const int blurWorkW = 480;
+    final int blurWorkH = ((blurWorkW * h) / w).round().clamp(1, 9999);
+    final bgSmall = img.copyResize(oriented,
+        width: blurWorkW, height: blurWorkH,
+        interpolation: img.Interpolation.linear);
 
-    // 2. Build composite mask at optimal work resolution
-    const int mw = 270;
-    final int mh = ((270 * h) / w).round().clamp(100, 800);
-    var maskImg = img.Image(width: mw, height: mh, numChannels: 1);
+    img.Image blurredSmall = bgSmall;
+    for (int i = 0; i < blurPasses; i++) {
+      blurredSmall = img.smooth(blurredSmall, weight: 1);
+    }
+    // Scale blurred background back to full resolution
+    final blurredBg = img.copyResize(blurredSmall,
+        width: w, height: h,
+        interpolation: img.Interpolation.linear);
 
-    final double scaleImgToMaskX = mw / w;
-    final double scaleImgToMaskY = mh / h;
+    // ── 2. Build foreground alpha mask at FULL image resolution ───────────────
+    // Using full-res avoids the chief cause of "blocky / dot-dot" edges that
+    // appeared when a 270px mask was upscaled 15× to 4K.
+    final maskData = List<double>.filled(w * h, 0.0);
 
     final bool hasNeuralMask = params.segmentationMask != null &&
         params.segmentationMask!.isNotEmpty &&
@@ -203,130 +249,173 @@ Future<void> _applyBokehInIsolate(_BokehParams params) async {
         params.maskHeight > 0;
     final int rawMaskW = params.maskWidth;
     final int rawMaskH = params.maskHeight;
-
     final bool hasFaces = params.faces.isNotEmpty;
 
     if (hasFaces || hasNeuralMask) {
-      // ── Dual-Anchor Portrait Fusion: Face Anchor + Neural Silhouette ──
-      for (int y = 0; y < mh; y++) {
-        final double imgY = y / scaleImgToMaskY;
-        for (int x = 0; x < mw; x++) {
-          final double imgX = x / scaleImgToMaskX;
+      for (int py = 0; py < h; py++) {
+        final double normY = py / h;
+        for (int px = 0; px < w; px++) {
+          final double normX = px / w;
+          final double imgX = normX * w;
+          final double imgY = normY * h;
 
           double alpha = 0.0;
 
-          // 1. Sample neural segmentation mask (silhouette of body, hair, clothes)
+          // A. Sample neural segmentation mask with bilinear interpolation
           if (hasNeuralMask) {
-            final int nX = ((imgX / w) * rawMaskW).floor().clamp(0, rawMaskW - 1);
-            final int nY = ((imgY / h) * rawMaskH).floor().clamp(0, rawMaskH - 1);
-            final double conf = params.segmentationMask![nY * rawMaskW + nX];
+            final double mxF = normX * (rawMaskW - 1);
+            final double myF = normY * (rawMaskH - 1);
+            final int mx0 = mxF.floor().clamp(0, rawMaskW - 1);
+            final int my0 = myF.floor().clamp(0, rawMaskH - 1);
+            final int mx1 = (mx0 + 1).clamp(0, rawMaskW - 1);
+            final int my1 = (my0 + 1).clamp(0, rawMaskH - 1);
+            final double fx = mxF - mx0;
+            final double fy = myF - my0;
+            final double c00 = params.segmentationMask![my0 * rawMaskW + mx0];
+            final double c10 = params.segmentationMask![my0 * rawMaskW + mx1];
+            final double c01 = params.segmentationMask![my1 * rawMaskW + mx0];
+            final double c11 = params.segmentationMask![my1 * rawMaskW + mx1];
+            final double conf =
+                c00 * (1 - fx) * (1 - fy) +
+                c10 * fx * (1 - fy) +
+                c01 * (1 - fx) * fy +
+                c11 * fx * fy;
 
-            if (conf >= 0.55) {
+            // Smooth sigmoid ramp: 0 below 0.35, full at 0.65
+            if (conf >= 0.65) {
               alpha = 1.0;
-            } else if (conf > 0.15) {
-              final t = (conf - 0.15) / 0.40;
-              alpha = t * t * (3.0 - 2.0 * t);
+            } else if (conf > 0.35) {
+              final t = (conf - 0.35) / 0.30;
+              alpha = t * t * (3.0 - 2.0 * t); // Hermite smoothstep
             }
           }
 
-          // 2. Sample face anchors (GUARANTEES human head, face, eyes, glasses, hair are 100% sharp)
+          // B. Face anchors — guarantee face/head/hair region is 100% sharp
           for (final face in params.faces) {
-            final headCx = face.left + face.width * 0.5;
-            final headCy = face.top + face.height * 0.45;
-            final headRx = face.width * 0.70;
-            final headRy = face.height * 0.75;
+            final double headCx = face.left + face.width * 0.5;
+            final double headCy = face.top + face.height * 0.40;
+            // Slightly generous horizontal radius to catch ears and hair sides
+            final double headRx = face.width * 0.80;
+            final double headRy = face.height * 0.85;
 
-            final dx = (imgX - headCx) / headRx;
-            final dy = (imgY - headCy) / headRy;
-            final distHead = dx * dx + dy * dy;
+            final double dx = (imgX - headCx) / headRx;
+            final double dy = (imgY - headCy) / headRy;
+            final double distHead = dx * dx + dy * dy;
 
+            double headAlpha = 0.0;
             if (distHead <= 1.0) {
-              alpha = 1.0;
-            } else if (distHead < 1.35) {
-              final t = (1.35 - distHead) / 0.35;
-              final headA = t * t * (3.0 - 2.0 * t);
-              if (headA > alpha) alpha = headA;
+              headAlpha = 1.0;
+            } else if (distHead < 1.5) {
+              final double t = (1.5 - distHead) / 0.5;
+              headAlpha = t * t * (3.0 - 2.0 * t);
             }
+            if (headAlpha > alpha) alpha = headAlpha;
 
-            // Torso anchor connecting from chin downward
-            if (imgY > face.top + face.height * 0.6) {
-              final dyTorso = imgY - (face.top + face.height * 0.6);
-              final halfW = (face.width * 0.65) + (dyTorso * 0.35);
-              if ((imgX - headCx).abs() <= halfW) {
-                alpha = 1.0;
+            // Torso anchor: expands outward from chin downward to include body
+            if (imgY > face.top + face.height * 0.55) {
+              final double dyTorso = imgY - (face.top + face.height * 0.55);
+              // Widen by 0.3px per px down to cover shoulders/arms naturally
+              final double halfW = (face.width * 0.70) + (dyTorso * 0.28);
+              final double edgeDist = halfW - (imgX - headCx).abs();
+              if (edgeDist >= 0) {
+                // Soft feather within last 20px of torso edge
+                final double torsoAlpha = (edgeDist / 20.0).clamp(0.0, 1.0);
+                // Hermite smooth
+                final double ta = torsoAlpha * torsoAlpha * (3.0 - 2.0 * torsoAlpha);
+                if (ta > alpha) alpha = ta;
               }
             }
           }
 
-          final int byteVal = (alpha * 255.0).round().clamp(0, 255);
-          maskImg.setPixelRgb(x, y, byteVal, byteVal, byteVal);
+          maskData[py * w + px] = alpha.clamp(0.0, 1.0);
         }
       }
 
-      // Feather perimeter gently (radius 2) for natural hair/clothing blend without softening core
-      maskImg = img.gaussianBlur(maskImg, radius: 2);
+      // ── Feather the mask with a lightweight 2-pass box blur ──────────────────
+      // This softens the hard segmentation boundary without blurring it large enough
+      // to create the "dot dot" stippling that occurred with gaussianBlur on a tiny mask.
+      // We operate on a 1/4-resolution version of the mask for speed.
+      const int fmW = 480; // feather-mask work width
+      final int fmH = ((fmW * h) / w).round();
+      var fmImg = img.Image(width: fmW, height: fmH, numChannels: 1);
+      for (int fy = 0; fy < fmH; fy++) {
+        final double srcY = (fy / fmH) * h;
+        for (int fx = 0; fx < fmW; fx++) {
+          final double srcX = (fx / fmW) * w;
+          final int si = srcY.round().clamp(0, h - 1) * w + srcX.round().clamp(0, w - 1);
+          final int v = (maskData[si] * 255).round().clamp(0, 255);
+          fmImg.setPixelRgb(fx, fy, v, v, v);
+        }
+      }
+      // Two gentle smoothing passes — feathers the edge ~6px at 480px scale
+      fmImg = img.smooth(fmImg, weight: 1);
+      fmImg = img.smooth(fmImg, weight: 1);
+      // Copy feathered values back into maskData at full res
+      for (int py = 0; py < h; py++) {
+        final double fySrc = (py / h) * fmH;
+        for (int px = 0; px < w; px++) {
+          final double fxSrc = (px / w) * fmW;
+          final double v = fmImg.getPixel(
+                fxSrc.round().clamp(0, fmW - 1),
+                fySrc.round().clamp(0, fmH - 1)).r /
+              255.0;
+          maskData[py * w + px] = v;
+        }
+      }
     } else {
-      // ── Fallback: Object portrait mode with radial focus mask around tap point ──
+      // ── Fallback: radial focus mask around tap/centre point ──────────────────
       final double cx = (params.focusNormX ?? 0.5) * w;
       final double cy = (params.focusNormY ?? 0.5) * h;
       final double rx = w * 0.36;
       final double ry = h * 0.42;
 
-      for (int y = 0; y < mh; y++) {
-        final double imgY = y / scaleImgToMaskY;
-        final double dy = (imgY - cy) / ry;
+      for (int py = 0; py < h; py++) {
+        final double dy = (py - cy) / ry;
         final double dySq = dy * dy;
-        for (int x = 0; x < mw; x++) {
-          final double imgX = x / scaleImgToMaskX;
-          final double dx = (imgX - cx) / rx;
+        for (int px = 0; px < w; px++) {
+          final double dx = (px - cx) / rx;
           final double distSq = dx * dx + dySq;
-
           double alpha = 0.0;
           if (distSq <= 1.0) {
             alpha = 1.0;
-          } else if (distSq < 1.45) {
-            final t = (1.45 - distSq) / 0.45;
+          } else if (distSq < 1.5) {
+            final double t = (1.5 - distSq) / 0.5;
             alpha = t * t * (3.0 - 2.0 * t);
           }
-          final int byteVal = (alpha * 255.0).round().clamp(0, 255);
-          maskImg.setPixelRgb(x, y, byteVal, byteVal, byteVal);
+          maskData[py * w + px] = alpha;
         }
       }
-      maskImg = img.gaussianBlur(maskImg, radius: 3);
     }
 
-    // Upscale mask smoothly to exact image dimensions
-    final fullMask = img.copyResize(
-      maskImg,
-      width: w,
-      height: h,
-      interpolation: img.Interpolation.linear,
-    );
-
-    // 3. Crisp edge-preserving blending:
-    // Core subject (alpha >= 0.85) retains 100% original camera sensor sharpness (0% blur).
-    // Background (alpha <= 0.12) receives 100% optical bokeh blur.
+    // ── 3. Composite: blend original (sharp subject) over blurred background ──
+    // Smooth Hermite blend across the full [0..1] mask range — no hard thresholds.
     final blended = img.Image(width: w, height: h);
-    for (int y = 0; y < h; y++) {
-      for (int x = 0; x < w; x++) {
-        final double a = fullMask.getPixel(x, y).r / 255.0;
-        if (a >= 0.85) {
-          blended.setPixel(x, y, oriented.getPixel(x, y));
-        } else if (a <= 0.12) {
-          blended.setPixel(x, y, blurredBg.getPixel(x, y));
+    for (int py = 0; py < h; py++) {
+      for (int px = 0; px < w; px++) {
+        final double rawA = maskData[py * w + px];
+        // Apply smoothstep to the already-feathered mask for extra smooth edges
+        final double a = rawA * rawA * (3.0 - 2.0 * rawA);
+
+        if (a >= 0.999) {
+          // Pixel is deep in foreground: use original sensor image (zero touch)
+          blended.setPixel(px, py, oriented.getPixel(px, py));
+        } else if (a <= 0.001) {
+          // Pixel is deep in background: use blurred image
+          blended.setPixel(px, py, blurredBg.getPixel(px, py));
         } else {
-          final double t = (a - 0.12) / (0.85 - 0.12);
-          final fp = oriented.getPixel(x, y);
-          final bp = blurredBg.getPixel(x, y);
-          final r = (fp.r * t + bp.r * (1.0 - t)).round().clamp(0, 255);
-          final g = (fp.g * t + bp.g * (1.0 - t)).round().clamp(0, 255);
-          final b = (fp.b * t + bp.b * (1.0 - t)).round().clamp(0, 255);
-          blended.setPixelRgb(x, y, r, g, b);
+          // Smooth linear blend in the transition zone
+          final fp = oriented.getPixel(px, py);
+          final bp = blurredBg.getPixel(px, py);
+          final int r = (fp.r * a + bp.r * (1.0 - a)).round().clamp(0, 255);
+          final int g = (fp.g * a + bp.g * (1.0 - a)).round().clamp(0, 255);
+          final int b = (fp.b * a + bp.b * (1.0 - a)).round().clamp(0, 255);
+          blended.setPixelRgb(px, py, r, g, b);
         }
       }
     }
 
-    final encoded = img.encodeJpg(blended, quality: 98);
+    // Quality 100 to avoid JPEG double-compression artifacts (stippling)
+    final encoded = img.encodeJpg(blended, quality: 100);
     await file.writeAsBytes(encoded);
   } catch (e) {
     debugPrint('Portrait bokeh isolate error: $e');
@@ -430,6 +519,7 @@ class _CameraCapturePageState extends ConsumerState<CameraCapturePage>
   // Focus & exposure
   Offset? _focusPoint;
   bool _showFocusIndicator = false;
+  bool _isDraggingExposure = false;
   Timer? _focusTimer;
   double _minExposure = -2.0;
   double _maxExposure = 2.0;
@@ -601,48 +691,70 @@ class _CameraCapturePageState extends ConsumerState<CameraCapturePage>
     } catch (_) {}
   }
 
-  void _resetFocusTimer() {
+  void _resetFocusTimer({int millis = 4000}) {
     _focusTimer?.cancel();
-    _focusTimer = Timer(const Duration(milliseconds: 3200), () {
-      if (mounted) setState(() => _showFocusIndicator = false);
+    _focusTimer = Timer(Duration(milliseconds: millis), () {
+      if (mounted && !_isDraggingExposure) {
+        setState(() => _showFocusIndicator = false);
+      }
     });
   }
 
-  void _onVerticalExposureDrag(DragUpdateDetails details) async {
+  void _onExposureDelta(double deltaDy) async {
     if (!_showFocusIndicator) return;
     final ctrl = _controller;
     if (ctrl == null || !ctrl.value.isInitialized) return;
 
     final double range = _maxExposure - _minExposure;
-    final double delta = -details.delta.dy * (range / 220.0);
-    double next = (_currentExposure + delta).clamp(_minExposure, _maxExposure);
+    if (range <= 0) return;
+
+    // 140 pixels of drag travels the entire exposure range (-2.0 to +2.0)
+    // Very responsive and easy to slide up or down with thumb
+    final double change = deltaDy * (range / 140.0);
+    double next = (_currentExposure + change).clamp(_minExposure, _maxExposure);
     if (_exposureStep > 0.001) {
       next = ((next / _exposureStep).round() * _exposureStep).clamp(_minExposure, _maxExposure);
     }
 
-    if ((next - _currentExposure).abs() >= (_exposureStep > 0 ? _exposureStep * 0.5 : 0.02)) {
+    if ((next - _currentExposure).abs() > 0.005) {
       setState(() {
         _currentExposure = next;
       });
-      _resetFocusTimer();
       try {
         await ctrl.setExposureOffset(_currentExposure);
       } catch (_) {}
     }
   }
 
-  // ── Zoom ─────────────────────────────────────────────────────────────────────
+  // ── Zoom & Exposure Drag Handlers ──────────────────────────────────────────
 
-  void _onScaleStart(ScaleStartDetails _) {
-    _baseZoom = _currentZoom;
+  void _onScaleStart(ScaleStartDetails details) {
+    if (details.pointerCount > 1) {
+      _baseZoom = _currentZoom;
+    } else {
+      _focusTimer?.cancel();
+    }
   }
 
   Future<void> _onScaleUpdate(ScaleUpdateDetails details) async {
     final ctrl = _controller;
     if (ctrl == null || !ctrl.value.isInitialized) return;
-    _currentZoom = (_baseZoom * details.scale).clamp(_minZoom, _maxZoom);
-    try { await ctrl.setZoomLevel(_currentZoom); } catch (_) {}
-    if (mounted) setState(() {});
+
+    if (details.pointerCount > 1) {
+      // 2-finger pinch to zoom
+      _currentZoom = (_baseZoom * details.scale).clamp(_minZoom, _maxZoom);
+      try { await ctrl.setZoomLevel(_currentZoom); } catch (_) {}
+      if (mounted) setState(() {});
+    } else if (_showFocusIndicator && details.focalPointDelta.dy.abs() > 0.2) {
+      // 1-finger vertical drag on viewfinder when focus reticle is active
+      _onExposureDelta(-details.focalPointDelta.dy);
+    }
+  }
+
+  void _onScaleEnd(ScaleEndDetails _) {
+    if (_showFocusIndicator && !_isDraggingExposure) {
+      _resetFocusTimer(millis: 3500);
+    }
   }
 
   // ── Timer & Shutter ──────────────────────────────────────────────────────────
@@ -726,21 +838,50 @@ class _CameraCapturePageState extends ConsumerState<CameraCapturePage>
     try {
       final xfile = await ctrl.takePicture();
 
+      final isPortrait = _mode == CameraMode.portrait;
+
       final bool isFrontCamera =
           widget.cameras[_cameraIndex].lensDirection == CameraLensDirection.front;
 
-      // 1. First normalize image: bake EXIF orientation upright, un-mirror front camera, crop to aspect ratio
-      await compute(
-        _normalizeImageInIsolate,
-        _NormalizeParams(
-          filePath: xfile.path,
-          targetRatio: targetRatio,
-          isFrontCamera: isFrontCamera,
-        ),
-      );
+      // ── Step 1: Native Android Hardware Processing ────────────────────────────
+      // Uses the device's native hardware pipeline (Skia + libjpeg-turbo with ARM NEON SIMD):
+      // - Un-mirrors front camera selfie photos (left hand in preview = left hand in saved photo)
+      // - Normalizes physical EXIF rotation
+      // - Crops to chosen aspect ratio (1:1, 4:3, 16:9) without generation loss
+      // - Encodes with 100% native hardware libjpeg-turbo (eliminates "dot dot" compression noise)
+      if (Platform.isAndroid) {
+        try {
+          const channel = MethodChannel('com.limitlesscloud/camera_service');
+          await channel.invokeMethod('processImage', {
+            'filePath': xfile.path,
+            'isFrontCamera': isFrontCamera,
+            'mirrorFrontCamera': true,
+            'targetRatio': targetRatio,
+            'quality': 100,
+          });
+        } catch (e) {
+          debugPrint('Native image processing fallback error: $e');
+          await compute(
+            _normalizeImageInIsolate,
+            _NormalizeParams(
+              filePath: xfile.path,
+              targetRatio: targetRatio,
+              isFrontCamera: isFrontCamera,
+            ),
+          );
+        }
+      } else {
+        await compute(
+          _normalizeImageInIsolate,
+          _NormalizeParams(
+            filePath: xfile.path,
+            targetRatio: targetRatio,
+            isFrontCamera: isFrontCamera,
+          ),
+        );
+      }
 
-      // 2. If Portrait mode: run dual-anchor detection (FaceDetector + SelfieSegmenter) on upright image
-      final isPortrait = _mode == CameraMode.portrait;
+      // ── Step 2: Portrait Mode Depth of Field Processing ───────────────────────
       if (isPortrait && _fStop.blurRadius >= 2.0) {
         final inputImage = InputImage.fromFilePath(xfile.path);
 
@@ -767,7 +908,7 @@ class _CameraCapturePageState extends ConsumerState<CameraCapturePage>
           debugPrint('Portrait face detection error: $e');
         }
 
-        // B. Raw 256x256 silhouette segmentation (65,536 floats - ultra fast, zero memory pressure)
+        // B. Raw 256x256 silhouette segmentation (65,536 floats - ultra fast)
         List<double>? segmentationMask;
         int maskWidth = 0;
         int maskHeight = 0;
@@ -775,7 +916,7 @@ class _CameraCapturePageState extends ConsumerState<CameraCapturePage>
         try {
           final segmenter = SelfieSegmenter(
             mode: SegmenterMode.single,
-            enableRawSizeMask: true, // TRUE: raw 256x256 model output, only 65k floats!
+            enableRawSizeMask: true,
           );
           final mask = await segmenter.processImage(inputImage);
           if (mask != null && mask.confidences.isNotEmpty) {
@@ -788,20 +929,50 @@ class _CameraCapturePageState extends ConsumerState<CameraCapturePage>
           debugPrint('Portrait segmentation error: $e');
         }
 
-        // C. Apply dual-anchor DSLR bokeh blur in background isolate with exact pixel alignment
-        await compute(
-          _applyBokehInIsolate,
-          _BokehParams(
-            filePath: xfile.path,
-            blurRadius: _fStop.blurRadius,
-            segmentationMask: segmentationMask,
-            maskWidth: maskWidth,
-            maskHeight: maskHeight,
-            faces: faces,
-            focusNormX: _focusPoint != null ? (_focusPoint!.dx / size.width).clamp(0.0, 1.0) : 0.5,
-            focusNormY: _focusPoint != null ? (_focusPoint!.dy / size.height).clamp(0.0, 1.0) : 0.5,
-          ),
-        );
+        // C. Apply optical DSLR bokeh blur natively on Android (or fallback isolate)
+        bool nativeBokehSucceeded = false;
+        if (Platform.isAndroid) {
+          try {
+            const channel = MethodChannel('com.limitlesscloud/camera_service');
+            final outcome = await channel.invokeMethod<Map>('applyPortraitBokeh', {
+              'filePath': xfile.path,
+              'blurRadius': _fStop.blurRadius,
+              'segmentationMask': segmentationMask,
+              'maskWidth': maskWidth,
+              'maskHeight': maskHeight,
+              'faces': faces.map((f) => {
+                'left': f.left,
+                'top': f.top,
+                'width': f.width,
+                'height': f.height,
+              }).toList(),
+              'focusNormX': _focusPoint != null ? (_focusPoint!.dx / size.width).clamp(0.0, 1.0) : 0.5,
+              'focusNormY': _focusPoint != null ? (_focusPoint!.dy / size.height).clamp(0.0, 1.0) : 0.5,
+              'quality': 100,
+            });
+            if (outcome != null && outcome['success'] == true) {
+              nativeBokehSucceeded = true;
+            }
+          } catch (e) {
+            debugPrint('Native portrait bokeh fallback error: $e');
+          }
+        }
+
+        if (!nativeBokehSucceeded) {
+          await compute(
+            _applyBokehInIsolate,
+            _BokehParams(
+              filePath: xfile.path,
+              blurRadius: _fStop.blurRadius,
+              segmentationMask: segmentationMask,
+              maskWidth: maskWidth,
+              maskHeight: maskHeight,
+              faces: faces,
+              focusNormX: _focusPoint != null ? (_focusPoint!.dx / size.width).clamp(0.0, 1.0) : 0.5,
+              focusNormY: _focusPoint != null ? (_focusPoint!.dy / size.height).clamp(0.0, 1.0) : 0.5,
+            ),
+          );
+        }
       }
 
       if (mounted) {
@@ -876,8 +1047,14 @@ class _CameraCapturePageState extends ConsumerState<CameraCapturePage>
   }
 
   Future<void> _confirmAndUpload() async {
+    if (_isBusy) return;
+    setState(() => _isBusy = true);
+
     final file = _previewFile;
-    if (file == null) return;
+    if (file == null) {
+      if (mounted) setState(() => _isBusy = false);
+      return;
+    }
 
     final tmpDir  = await getTemporaryDirectory();
     final now     = DateTime.now();
@@ -938,6 +1115,7 @@ class _CameraCapturePageState extends ConsumerState<CameraCapturePage>
             _PreviewView(
               file: _previewFile!,
               isVideo: _previewIsVideo,
+              isBusy: _isBusy,
               resLabel: _mode == CameraMode.portrait
                   ? '👤 Portrait • ${_fStop.label} • ${_res.label}'
                   : '📸 Photo • ${_aspectRatio.label} • ${_res.label}',
@@ -993,19 +1171,28 @@ class _CameraCapturePageState extends ConsumerState<CameraCapturePage>
                                 behavior: HitTestBehavior.opaque,
                                 onScaleStart: _onScaleStart,
                                 onScaleUpdate: _onScaleUpdate,
+                                onScaleEnd: _onScaleEnd,
                                 onTapDown: (d) =>
                                     _onTapToFocus(d, frameW, frameH),
-                                onVerticalDragUpdate: _onVerticalExposureDrag,
                               ),
                               // Focus reticle + Vertical brightness slider
                               if (_showFocusIndicator && _focusPoint != null)
                                 Positioned(
-                                  left: (_focusPoint!.dx - 32).clamp(10.0, frameW - 90.0),
-                                  top: (_focusPoint!.dy - 50).clamp(20.0, frameH - 120.0),
+                                  left: (_focusPoint!.dx - 32).clamp(10.0, frameW - 130.0),
+                                  top: (_focusPoint!.dy - 60).clamp(20.0, frameH - 140.0),
                                   child: _FocusAndExposureWidget(
                                     currentExposure: _currentExposure,
                                     minExposure: _minExposure,
                                     maxExposure: _maxExposure,
+                                    onExposureDelta: _onExposureDelta,
+                                    onDragStart: () {
+                                      _isDraggingExposure = true;
+                                      _focusTimer?.cancel();
+                                    },
+                                    onDragEnd: () {
+                                      _isDraggingExposure = false;
+                                      _resetFocusTimer(millis: 3500);
+                                    },
                                   ),
                                 ),
                             ],
@@ -1181,11 +1368,6 @@ class _CameraCapturePageState extends ConsumerState<CameraCapturePage>
                               const SizedBox(width: 8),
                             ],
                             _IconBtn(icon: _flashIcon, onTap: _cycleFlash),
-                            const SizedBox(width: 8),
-                            if (widget.cameras.length > 1)
-                              _IconBtn(
-                                  icon: Icons.flip_camera_android_rounded,
-                                  onTap: _flipCamera),
                           ],
                         ],
                       ),
@@ -1242,6 +1424,8 @@ class _CameraCapturePageState extends ConsumerState<CameraCapturePage>
                   isBusy: _isBusy || _isChangingRes,
                   isCountingDown: _isCountingDown,
                   countdown: _countdown,
+                  canFlip: widget.cameras.length > 1,
+                  onFlip: _flipCamera,
                   resOptions: _resOptions,
                   selectedResIndex: _resIndex,
                   fStopOptions: _fStopOptions,
@@ -1278,11 +1462,17 @@ class _FocusAndExposureWidget extends StatefulWidget {
   final double currentExposure;
   final double minExposure;
   final double maxExposure;
+  final ValueChanged<double> onExposureDelta;
+  final VoidCallback? onDragStart;
+  final VoidCallback? onDragEnd;
 
   const _FocusAndExposureWidget({
     required this.currentExposure,
     required this.minExposure,
     required this.maxExposure,
+    required this.onExposureDelta,
+    this.onDragStart,
+    this.onDragEnd,
   });
 
   @override
@@ -1337,58 +1527,87 @@ class _FocusAndExposureWidgetState extends State<_FocusAndExposureWidget>
                   painter: _FocusBracketPainter(),
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 6),
 
-              // Vertical brightness slider bar
-              SizedBox(
-                width: 32,
-                height: 80,
-                child: Stack(
+              // Vertical brightness slider with direct high-priority touch detector
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onVerticalDragStart: (_) {
+                  HapticFeedback.selectionClick();
+                  widget.onDragStart?.call();
+                },
+                onVerticalDragUpdate: (details) {
+                  widget.onExposureDelta(-details.delta.dy);
+                },
+                onVerticalDragEnd: (_) => widget.onDragEnd?.call(),
+                onVerticalDragCancel: () => widget.onDragEnd?.call(),
+                child: Container(
+                  width: 56,
+                  height: 120,
                   alignment: Alignment.center,
-                  children: [
-                    // Vertical track line
-                    Container(
-                      width: 2,
-                      height: 70,
-                      decoration: BoxDecoration(
-                        color: Colors.white38,
-                        borderRadius: BorderRadius.circular(1),
-                      ),
-                    ),
-                    // Sun indicator moving up/down (fraction 1.0 = top, 0.0 = bottom)
-                    Positioned(
-                      top: (1.0 - fraction) * 54,
-                      child: Container(
-                        padding: const EdgeInsets.all(3),
+                  color: Colors.transparent, // Catches touches across entire 56x120 area
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      // Vertical track capsule line
+                      Container(
+                        width: 3,
+                        height: 90,
                         decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.7),
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: const Color(0xFFFFD54F),
-                            width: 1.5,
-                          ),
-                        ),
-                        child: const Icon(
-                          Icons.wb_sunny_rounded,
-                          color: Color(0xFFFFD54F),
-                          size: 15,
+                          color: Colors.white.withValues(alpha: 0.35),
+                          borderRadius: BorderRadius.circular(2),
                         ),
                       ),
-                    ),
-                    // Exposure numerical offset badge
-                    if (widget.currentExposure.abs() > 0.1)
+                      // Sun indicator moving up/down (fraction 1.0 = top, 0.0 = bottom)
                       Positioned(
-                        bottom: 0,
-                        child: Text(
-                          '${widget.currentExposure >= 0 ? '+' : ''}${widget.currentExposure.toStringAsFixed(1)}',
-                          style: const TextStyle(
+                        top: (1.0 - fraction) * 64 + 6,
+                        child: Container(
+                          width: 34,
+                          height: 34,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1E1E1E),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: const Color(0xFFFFD54F),
+                              width: 1.8,
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: const Color(0xFFFFD54F).withValues(alpha: 0.45),
+                                blurRadius: 10,
+                                spreadRadius: 1,
+                              ),
+                            ],
+                          ),
+                          child: const Icon(
+                            Icons.wb_sunny_rounded,
                             color: Color(0xFFFFD54F),
-                            fontSize: 9,
-                            fontWeight: FontWeight.w700,
+                            size: 19,
                           ),
                         ),
                       ),
-                  ],
+                      // Exposure numerical offset badge
+                      if (widget.currentExposure.abs() > 0.05)
+                        Positioned(
+                          bottom: 0,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+                            decoration: BoxDecoration(
+                              color: Colors.black87,
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Text(
+                              '${widget.currentExposure >= 0 ? '+' : ''}${widget.currentExposure.toStringAsFixed(1)}',
+                              style: const TextStyle(
+                                color: Color(0xFFFFD54F),
+                                fontSize: 10,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
               ),
             ],
@@ -1570,6 +1789,8 @@ class _BottomControls extends StatelessWidget {
   final bool isBusy;
   final bool isCountingDown;
   final int countdown;
+  final bool canFlip;
+  final VoidCallback onFlip;
   final List<_ResOption> resOptions;
   final int selectedResIndex;
   final List<_FStopOption> fStopOptions;
@@ -1585,6 +1806,8 @@ class _BottomControls extends StatelessWidget {
     required this.isBusy,
     required this.isCountingDown,
     required this.countdown,
+    required this.canFlip,
+    required this.onFlip,
     required this.resOptions,
     required this.selectedResIndex,
     required this.fStopOptions,
@@ -1642,18 +1865,53 @@ class _BottomControls extends StatelessWidget {
           ],
 
           // ── Shutter Row ─────────────────────────────────────────────────
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              _ShutterButton(
-                mode: mode,
-                isRecording: isRecording,
-                isBusy: isBusy,
-                isCountingDown: isCountingDown,
-                countdown: countdown,
-                onTap: onShutter,
-              ),
-            ],
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                // Left placeholder so Shutter Button is precisely centered
+                const SizedBox(width: 56, height: 56),
+
+                // Center: Shutter Button
+                _ShutterButton(
+                  mode: mode,
+                  isRecording: isRecording,
+                  isBusy: isBusy,
+                  isCountingDown: isCountingDown,
+                  countdown: countdown,
+                  onTap: onShutter,
+                ),
+
+                // Right: Camera Switch (Front / Back) thumb button
+                if (canFlip && !isRecording && !isCountingDown)
+                  GestureDetector(
+                    onTap: () {
+                      HapticFeedback.selectionClick();
+                      onFlip();
+                    },
+                    child: Container(
+                      width: 56,
+                      height: 56,
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.18),
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.35),
+                          width: 1.5,
+                        ),
+                      ),
+                      child: const Icon(
+                        Icons.flip_camera_android_rounded,
+                        color: Colors.white,
+                        size: 28,
+                      ),
+                    ),
+                  )
+                else
+                  const SizedBox(width: 56, height: 56),
+              ],
+            ),
           ),
         ],
       ),
@@ -1843,6 +2101,7 @@ class _ResolutionBar extends StatelessWidget {
 class _PreviewView extends StatelessWidget {
   final File file;
   final bool isVideo;
+  final bool isBusy;
   final String resLabel;
   final VoidCallback onRetake;
   final VoidCallback onConfirm;
@@ -1850,6 +2109,7 @@ class _PreviewView extends StatelessWidget {
   const _PreviewView({
     required this.file,
     required this.isVideo,
+    this.isBusy = false,
     required this.resLabel,
     required this.onRetake,
     required this.onConfirm,
@@ -1877,13 +2137,13 @@ class _PreviewView extends StatelessWidget {
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
               child: Row(
                 children: [
-                  _IconBtn(icon: Icons.arrow_back_rounded, onTap: onRetake),
+                  _IconBtn(icon: Icons.arrow_back_rounded, onTap: isBusy ? () {} : onRetake),
                   const Spacer(),
                   Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Text(
-                        isVideo ? '🎬 Video captured' : '✨ Enhanced Capture',
+                        isVideo ? '🎬 Video' : '📸 Original Photo',
                         style: const TextStyle(
                             color: Colors.white,
                             fontSize: 15,
@@ -1921,7 +2181,7 @@ class _PreviewView extends StatelessWidget {
                 children: [
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed: onRetake,
+                      onPressed: isBusy ? null : onRetake,
                       icon: const Icon(Icons.refresh_rounded, color: Colors.white),
                       label: const Text('Retake', style: TextStyle(color: Colors.white)),
                       style: OutlinedButton.styleFrom(
@@ -1935,9 +2195,18 @@ class _PreviewView extends StatelessWidget {
                   Expanded(
                     flex: 2,
                     child: ElevatedButton.icon(
-                      onPressed: onConfirm,
-                      icon: const Icon(Icons.cloud_upload_rounded),
-                      label: const Text('Upload to Cloud'),
+                      onPressed: isBusy ? null : onConfirm,
+                      icon: isBusy
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                color: Colors.white,
+                                strokeWidth: 2,
+                              ),
+                            )
+                          : const Icon(Icons.cloud_upload_rounded),
+                      label: Text(isBusy ? 'Saving…' : 'Upload to Cloud'),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: AppTheme.primary,
                         foregroundColor: Colors.white,

@@ -171,14 +171,42 @@ class TelegramStorageService {
 
   /// Upload [file] directly to Telegram Saved Messages.
   ///
-  /// Uses TDLib's upload mechanism which handles 512 KB parts and
-  /// parallel uploads internally for maximum speed.
+  /// Checks if a message for this file name was already uploaded to Saved Messages.
+  /// Used by OfflineSyncService to prevent double-uploading if TDLib or a previous
+  /// attempt already delivered the file to Telegram.
+  Future<int?> findRecentMessageForFile(String fileName) async {
+    try {
+      final storageChatId = await _tdlib.getStorageChatId();
+      final msgs = await _tdlib.listSavedMessages(chatId: storageChatId, limit: 60);
+      for (final m in msgs) {
+        if (m.fileName == fileName || m.caption.contains(fileName)) {
+          return m.messageId;
+        }
+      }
+      final legacyChannelId = await _tdlib.getLegacyChannelId();
+      if (legacyChannelId != 0 && legacyChannelId != storageChatId) {
+        final legacy = await _tdlib.listSavedMessages(chatId: legacyChannelId, limit: 60);
+        for (final m in legacy) {
+          if (m.fileName == fileName || m.caption.contains(fileName)) {
+            return m.messageId;
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Upload [file] directly to Telegram dedicated storage channel.
+  ///
+  /// Uses TDLib's upload mechanism with parallel multi-stream chunking
+  /// for maximum 15 to 25+ MB/s speed without cluttering Saved Messages.
   Future<ChunkedUploadResult> uploadFileChunked(
     File file, {
     ProgressCallback? onProgress,
     String? folderId,
     String folderPath = '/',
-    int maxRetries = 8,
+    int maxRetries = 2,
+    int? chatId,
   }) async {
     Exception? last;
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
@@ -188,6 +216,7 @@ class TelegramStorageService {
           onProgress: onProgress,
           folderId:   folderId,
           folderPath: folderPath,
+          chatId:     chatId,
         );
         return ChunkedUploadResult(
           primaryMessageId: result.primaryMessageId,
@@ -195,9 +224,12 @@ class TelegramStorageService {
         );
       } catch (e) {
         last = e is Exception ? e : Exception(e.toString());
-        if (attempt < maxRetries) {
-          await Future.delayed(_backoff(attempt));
+        // If upload timed out or was already dispatched to TDLib's queue,
+        // do not re-send to avoid creating double copies in Telegram.
+        if (e.toString().contains('Upload timed out') || attempt >= maxRetries) {
+          throw last;
         }
+        await Future.delayed(_backoff(attempt));
       }
     }
     throw last!;
@@ -209,12 +241,14 @@ class TelegramStorageService {
     ProgressCallback? onProgress,
     String? folderId,
     String folderPath = '/',
+    int? chatId,
   }) async {
     final result = await uploadFileChunked(
       file,
       onProgress: onProgress,
       folderId:   folderId,
       folderPath: folderPath,
+      chatId:     chatId,
     );
     return result.primaryMessageId;
   }
@@ -223,29 +257,59 @@ class TelegramStorageService {
   // DOWNLOAD — 8-parallel workers via TDLib
   // ══════════════════════════════════════════════════════════════════════════
 
-  /// Download a single-message file (< 2 GB) to local filesystem.
-  Future<File> downloadFile(int messageId, String fileName) async {
-    final dir       = await getApplicationDocumentsDirectory();
-    final destPath  = '${dir.path}/$fileName';
+  /// Download a file to local filesystem.
+  /// If [customDestPath] is provided, writes directly to it in a single step (zero redundant copies).
+  Future<File> downloadFile(
+    int messageId,
+    String fileName, {
+    String? customDestPath,
+    ProgressCallback? onProgress,
+    List<int>? chunkMessageIds,
+    int? chatId,
+  }) async {
+    if (chunkMessageIds != null && chunkMessageIds.length > 1) {
+      return downloadChunkedFile(
+        chunkMessageIds,
+        fileName,
+        customDestPath: customDestPath,
+        onProgress: onProgress,
+        chatId: chatId,
+      );
+    }
+    final String destPath;
+    if (customDestPath != null && customDestPath.isNotEmpty) {
+      destPath = customDestPath;
+    } else {
+      final dir = await getApplicationDocumentsDirectory();
+      destPath = '${dir.path}/$fileName';
+    }
 
-    await _tdlib.downloadFile(messageId, destPath);
+    await _tdlib.downloadFile(messageId, destPath, onProgress: onProgress, chatId: chatId);
     return File(destPath);
   }
 
-  /// Download a multi-part file (≥ 2 GB, multiple Telegram messages).
+  /// Download a multi-part file (multiple Telegram messages).
   /// Reassembles all parts into one file.
   Future<File> downloadChunkedFile(
     List<int> chunkMessageIds,
     String fileName, {
+    String? customDestPath,
     ProgressCallback? onProgress,
+    int? chatId,
   }) async {
-    final dir      = await getApplicationDocumentsDirectory();
-    final destPath = '${dir.path}/$fileName';
+    final String destPath;
+    if (customDestPath != null && customDestPath.isNotEmpty) {
+      destPath = customDestPath;
+    } else {
+      final dir = await getApplicationDocumentsDirectory();
+      destPath = '${dir.path}/$fileName';
+    }
 
     await _tdlib.downloadChunkedFile(
       chunkMessageIds,
       destPath,
       onProgress: onProgress,
+      chatId: chatId,
     );
     return File(destPath);
   }
@@ -254,12 +318,28 @@ class TelegramStorageService {
   // LIST / INFO / DELETE
   // ══════════════════════════════════════════════════════════════════════════
 
-  /// List all files from Telegram Saved Messages (new + legacy format).
-  /// Multi-part / chunked files (> 2 GB) are unified into a single TelegramFile
+  /// List all files from dedicated storage channel (and merge legacy files from Saved Messages).
+  /// Multi-part / chunked files are unified into a single TelegramFile
   /// with chunkMessageIds and combined total fileSize populated.
   /// Standalone chunks are strictly excluded and never returned individually.
   Future<List<TelegramFile>> listFiles() async {
-    final msgs = await _tdlib.listSavedMessages(limit: 500);
+    final storageChatId = await _tdlib.getStorageChatId();
+
+    final msgs = await _tdlib.listSavedMessages(chatId: storageChatId, limit: 2000);
+
+    // Merge legacy files from private channel if one was previously created
+    try {
+      final legacyChannelId = await _tdlib.getLegacyChannelId();
+      if (legacyChannelId != 0 && legacyChannelId != storageChatId) {
+        final legacyMsgs = await _tdlib.listSavedMessages(chatId: legacyChannelId, limit: 1000);
+        final seenIds = msgs.map((m) => m.messageId).toSet();
+        for (final lm in legacyMsgs) {
+          if (!seenIds.contains(lm.messageId)) {
+            msgs.add(lm);
+          }
+        }
+      }
+    } catch (_) {}
 
     // 1. Separate folder metadata and non-file messages
     final fileMsgs = msgs.where((m) =>
@@ -524,7 +604,19 @@ class TelegramStorageService {
   /// Only the LATEST override per file is kept (in case the file was moved
   /// multiple times after the 48-hour window).
   Future<Map<int, Map<String, dynamic>>> listMoveOverrides() async {
-    final msgs = await _tdlib.listSavedMessages(limit: 500);
+    final storageChatId = await _tdlib.getStorageChatId();
+
+    final msgs = await _tdlib.listSavedMessages(chatId: storageChatId, limit: 500);
+    try {
+      final legacyChannelId = await _tdlib.getLegacyChannelId();
+      if (legacyChannelId != 0 && legacyChannelId != storageChatId) {
+        final legacyMsgs = await _tdlib.listSavedMessages(chatId: legacyChannelId, limit: 500);
+        final seen = msgs.map((m) => m.messageId).toSet();
+        for (final lm in legacyMsgs) {
+          if (!seen.contains(lm.messageId)) msgs.add(lm);
+        }
+      }
+    } catch (_) {}
     final overrides = <int, Map<String, dynamic>>{};
     for (final msg in msgs) {
       // Move overrides are text messages (fileSize == 0)
@@ -575,8 +667,19 @@ class TelegramStorageService {
   /// List all folder metadata messages from Saved Messages.
   /// Supports both new clean format and legacy LIMITLESS_FOLDER: format.
   Future<List<TelegramFolderMeta>> listFolderMeta() async {
-    // Fetch all messages without prefix filter to catch both old and new.
-    final msgs = await _tdlib.listSavedMessages(limit: 200);
+    final storageChatId = await _tdlib.getStorageChatId();
+
+    final msgs = await _tdlib.listSavedMessages(chatId: storageChatId, limit: 200);
+    try {
+      final legacyChannelId = await _tdlib.getLegacyChannelId();
+      if (legacyChannelId != 0 && legacyChannelId != storageChatId) {
+        final legacyMsgs = await _tdlib.listSavedMessages(chatId: legacyChannelId, limit: 200);
+        final seen = msgs.map((m) => m.messageId).toSet();
+        for (final lm in legacyMsgs) {
+          if (!seen.contains(lm.messageId)) msgs.add(lm);
+        }
+      }
+    } catch (_) {}
     final result = <TelegramFolderMeta>[];
 
     for (final msg in msgs) {

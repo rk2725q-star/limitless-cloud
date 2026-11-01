@@ -169,13 +169,50 @@ class TelegramAuthService {
   /// Return stored profile info (no network call).
   Future<Map<String, String>> getProfile() async {
     final prefs = await _prefs;
+    final customNick = prefs.getString('custom_nickname') ?? '';
+    final customId = prefs.getString('custom_user_id') ?? '';
+    final fn = prefs.getString(_kFirstName) ?? '';
+    final ln = prefs.getString(_kLastName) ?? '';
+    final rawUsername = prefs.getString(_kUsername) ?? '';
+    final phone = prefs.getString(_kPhone) ?? '';
+
+    String displayName = customNick;
+    if (displayName.isEmpty) {
+      displayName = '$fn $ln'.trim();
+    }
+    if (displayName.isEmpty) {
+      displayName = rawUsername.isNotEmpty ? rawUsername : (phone.isNotEmpty ? phone : 'User');
+    }
+
+    final handle = customId.isNotEmpty ? customId : rawUsername;
+
     return {
-      'userId':    prefs.getString(_kUserId)    ?? '',
-      'firstName': prefs.getString(_kFirstName) ?? '',
-      'lastName':  prefs.getString(_kLastName)  ?? '',
-      'phone':     prefs.getString(_kPhone)     ?? '',
-      'username':  prefs.getString(_kUsername)  ?? '',
+      'userId':      prefs.getString(_kUserId)    ?? '',
+      'firstName':   fn,
+      'lastName':    ln,
+      'phone':       phone,
+      'username':    handle,
+      'nickname':    customNick,
+      'customId':    handle,
+      'displayName': displayName,
     };
+  }
+
+  /// Update custom nickname & unique ID for this user.
+  Future<void> updateNickname({required String nickname, String? customId}) async {
+    final prefs = await _prefs;
+    await prefs.setString('custom_nickname', nickname.trim());
+    if (customId != null && customId.trim().isNotEmpty) {
+      final cleanId = customId.trim().replaceAll('@', '');
+      await prefs.setString('custom_user_id', cleanId);
+      // Attempt to register with TDLib username if possible
+      try {
+        await _tdlib.sendRaw({
+          '@type': 'setUsername',
+          'username': cleanId,
+        });
+      } catch (_) {}
+    }
   }
 
   /// Returns a non-empty string when logged in (used by storage service checks).

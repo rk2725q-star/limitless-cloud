@@ -158,25 +158,32 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
   /// Wait for TDLib to reach authorizationStateReady before downloading.
   /// Throws if TDLib doesn't become ready within [timeout].
   Future<void> _waitForTdlib({
-    Duration timeout = const Duration(seconds: 30),
+    Duration timeout = const Duration(seconds: 45),
   }) async {
     final tdlib = TdlibService.instance;
     final deadline = DateTime.now().add(timeout);
+    bool retried = false;
     while (tdlib.authState != 'authorizationStateReady') {
       if (tdlib.initError != null) {
+        if (!retried && (tdlib.initError!.contains('lock file') || tdlib.initError!.contains('closed'))) {
+          retried = true;
+          await tdlib.retryInit();
+          continue;
+        }
         throw Exception(
-            'Telegram core failed to load: ${tdlib.initError}. The split ABI APK might be missing native libraries. Please install the universal APK.');
+            'Telegram core failed to load: ${tdlib.initError}.');
       }
       if (DateTime.now().isAfter(deadline)) {
         throw Exception(
-            'Telegram is stuck connecting (State: "${tdlib.authState}"). Please clear app data and log in again.');
+            'Telegram is taking longer than usual to connect. Please try again.');
       }
       final s = tdlib.authState;
-      if (s == 'authorizationStateWaitPhoneNumber' ||
-          s == 'authorizationStateClosed' ||
-          s == 'authorizationStateClosing') {
-        throw Exception(
-            'Not logged in to Telegram. Please log in and try again.');
+      if (s == 'authorizationStateClosed' || s == 'authorizationStateClosing') {
+        if (!retried) {
+          retried = true;
+          await tdlib.retryInit();
+          continue;
+        }
       }
       await Future.delayed(const Duration(milliseconds: 300));
     }
@@ -234,14 +241,17 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
             },
           );
         } else {
-          // Single-message file — TDLib fetches via getMessage → downloadFile
-          // tg.downloadFile() saves to app documents dir and returns the File.
-          final downloaded = await tg.downloadFile(
+          // Single-message file — TDLib downloads and writes directly to public Downloads folder in a single step!
+          // Eliminates redundant 2GB intermediate disk copy and reports real-time progress.
+          await tg.downloadFile(
             file.telegramMessageId,
             file.name,
+            customDestPath: dest,
+            onProgress: (p) {
+              _updateTask(taskId, progress: p, totalBytes: file.sizeBytes);
+              UploadBackgroundService.updateProgress(file.name, p);
+            },
           );
-          // Copy from TDLib's internal cache to the public Downloads folder.
-          await downloaded.copy(dest);
           _updateTask(taskId, progress: 1.0, totalBytes: file.sizeBytes);
         }
 
@@ -311,11 +321,13 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
     final uri = Uri.tryParse(url.trim());
     if (uri == null) return;
 
-    final segments = uri.pathSegments;
-    String name = segments.isNotEmpty ? segments.last : 'download_${DateTime.now().millisecondsSinceEpoch}';
-    if (!name.contains('.')) name += '.bin';
-    final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
+    // ── Phase 0: Resolve real filename via HTTP HEAD ──────────────────────────
+    // URLs like /download.php?file=video.mp4 don't expose the filename in the
+    // path. We fire a HEAD request first to read Content-Disposition and
+    // Content-Type headers, which servers always set correctly.
+    String name = await _resolveFilename(url, uri);
 
+    final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
     final taskId = DateTime.now().microsecondsSinceEpoch.toString();
     state = [...state, DlTask(id: taskId, name: name, url: url, ext: ext)];
     _updateTask(taskId, status: DlStatus.downloading);
@@ -390,6 +402,132 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
     }
   }
 
+  /// Resolves the true filename for a URL by:
+  /// 1. Checking Content-Disposition header (most reliable)
+  /// 2. Falling back to URL path segment if it has a real extension
+  /// 3. Mapping Content-Type to extension as last resort
+  Future<String> _resolveFilename(String url, Uri uri) async {
+    try {
+      final response = await _dio.head(
+        url,
+        options: Options(
+          receiveTimeout: const Duration(seconds: 8),
+          sendTimeout: const Duration(seconds: 8),
+          followRedirects: true,
+          maxRedirects: 5,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0',
+          },
+          validateStatus: (_) => true,
+        ),
+      );
+
+      // ── 1. Content-Disposition: attachment; filename="real-name.mp4" ──────
+      final disposition = response.headers.value('content-disposition') ?? '';
+      if (disposition.isNotEmpty) {
+        // Try filename*=UTF-8''encoded-name.mp4 (RFC 5987)
+        final rfc5987 = RegExp(r"filename\*\s*=\s*[^']*''([^\s;]+)", caseSensitive: false);
+        final m5987 = rfc5987.firstMatch(disposition);
+        if (m5987 != null) {
+          final decoded = Uri.decodeFull(m5987.group(1)!);
+          if (decoded.isNotEmpty) return _sanitizeFilename(decoded);
+        }
+        // Try filename="name.mp4" or filename=name.mp4
+        final plain = RegExp(r'filename\s*=\s*"?([^";]+)"?', caseSensitive: false);
+        final mplain = plain.firstMatch(disposition);
+        if (mplain != null) {
+          final name = mplain.group(1)!.trim();
+          if (name.isNotEmpty) return _sanitizeFilename(name);
+        }
+      }
+
+      // ── 2. URL path segment (only if it looks like a real file) ──────────
+      final segments = uri.pathSegments;
+      if (segments.isNotEmpty) {
+        final last = segments.last;
+        // A "real" filename has a meaningful extension (not .php, .asp, .aspx etc.)
+        final isDynamic = RegExp(r'\.(php\d?|asp|aspx|cgi|py|rb|do|action|jsp)$', caseSensitive: false);
+        if (last.contains('.') && !isDynamic.hasMatch(last)) {
+          return _sanitizeFilename(last);
+        }
+      }
+
+      // ── 3. Content-Type → extension mapping ───────────────────────────────
+      final contentType = response.headers.value('content-type') ?? '';
+      final ext = _mimeToExtension(contentType);
+      final ts = DateTime.now().millisecondsSinceEpoch;
+      return 'download_$ts$ext';
+
+    } catch (_) {
+      // Network error during HEAD — fall back to path parsing
+      final segments = uri.pathSegments;
+      if (segments.isNotEmpty && segments.last.contains('.')) {
+        return _sanitizeFilename(segments.last);
+      }
+      return 'download_${DateTime.now().millisecondsSinceEpoch}.bin';
+    }
+  }
+
+  /// Maps a MIME Content-Type to a file extension string (with dot).
+  String _mimeToExtension(String contentType) {
+    final mime = contentType.split(';').first.trim().toLowerCase();
+    const map = <String, String>{
+      'image/jpeg': '.jpg',
+      'image/jpg': '.jpg',
+      'image/png': '.png',
+      'image/gif': '.gif',
+      'image/webp': '.webp',
+      'image/bmp': '.bmp',
+      'image/svg+xml': '.svg',
+      'image/tiff': '.tif',
+      'image/heic': '.heic',
+      'image/heif': '.heif',
+      'image/avif': '.avif',
+      'video/mp4': '.mp4',
+      'video/mpeg': '.mpeg',
+      'video/quicktime': '.mov',
+      'video/x-msvideo': '.avi',
+      'video/x-matroska': '.mkv',
+      'video/webm': '.webm',
+      'video/3gpp': '.3gp',
+      'video/x-flv': '.flv',
+      'video/x-ms-wmv': '.wmv',
+      'audio/mpeg': '.mp3',
+      'audio/mp4': '.m4a',
+      'audio/ogg': '.ogg',
+      'audio/wav': '.wav',
+      'audio/flac': '.flac',
+      'audio/aac': '.aac',
+      'application/pdf': '.pdf',
+      'application/zip': '.zip',
+      'application/x-rar-compressed': '.rar',
+      'application/x-7z-compressed': '.7z',
+      'application/x-tar': '.tar',
+      'application/gzip': '.gz',
+      'application/octet-stream': '.bin',
+      'text/plain': '.txt',
+      'text/html': '.html',
+      'text/csv': '.csv',
+      'application/json': '.json',
+      'application/xml': '.xml',
+      'application/msword': '.doc',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+      'application/vnd.ms-excel': '.xls',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+      'application/vnd.ms-powerpoint': '.ppt',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+    };
+    return map[mime] ?? '.bin';
+  }
+
+  /// Strips path separators and null bytes from a filename for safe local storage.
+  String _sanitizeFilename(String name) {
+    return name
+        .replaceAll(RegExp(r'[\\/\x00]'), '_')
+        .replaceAll(RegExp(r'\.{2,}'), '.')
+        .trim();
+  }
+
 
   /// Upload URL content → Telegram Saved Messages via chunked upload with live % progress.
   ///
@@ -402,12 +540,10 @@ class DlManagerNotifier extends StateNotifier<List<DlTask>> {
     final uri = Uri.tryParse(url.trim());
     if (uri == null) return;
 
-    final segments = uri.pathSegments;
-    String name = segments.isNotEmpty
-        ? segments.last
-        : 'upload_${DateTime.now().millisecondsSinceEpoch}';
-    if (!name.contains('.')) name += '.bin';
-    final ext = name.split('.').last.toLowerCase();
+    // Resolve real filename (same logic as downloadUrl — reads HTTP headers)
+    final name = await _resolveFilename(url, uri);
+    final ext = name.contains('.') ? name.split('.').last.toLowerCase() : 'bin';
+
 
     final taskId = 'ul_${DateTime.now().microsecondsSinceEpoch}';
     state = [...state, DlTask(
@@ -970,26 +1106,11 @@ class _TaskTile extends StatefulWidget {
   State<_TaskTile> createState() => _TaskTileState();
 }
 
-class _TaskTileState extends State<_TaskTile>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _barCtrl;
-  late Animation<double> _barAnim;
-
+class _TaskTileState extends State<_TaskTile> {
   double _prevProgress = 0;
   DateTime _prevTime = DateTime.now();
   double _speedBps = 0;
   String _etaLabel = '';
-
-  @override
-  void initState() {
-    super.initState();
-    _barCtrl = AnimationController(
-        vsync: this, duration: const Duration(milliseconds: 500));
-    final initP = widget.task.progress.clamp(0.0, 1.0);
-    _barAnim = Tween<double>(begin: 0, end: initP)
-        .animate(CurvedAnimation(parent: _barCtrl, curve: Curves.easeOut));
-    if (initP > 0) _barCtrl.forward();
-  }
 
   @override
   void didUpdateWidget(_TaskTile old) {
@@ -997,12 +1118,6 @@ class _TaskTileState extends State<_TaskTile>
     final newP = widget.task.progress.clamp(0.0, 1.0);
     final oldP = old.task.progress.clamp(0.0, 1.0);
     if ((newP - oldP).abs() > 0.0005) {
-      _barAnim = Tween<double>(begin: _barAnim.value, end: newP)
-          .animate(CurvedAnimation(parent: _barCtrl, curve: Curves.easeOut));
-      _barCtrl
-        ..reset()
-        ..forward();
-
       final now = DateTime.now();
       final dtMs = now.difference(_prevTime).inMilliseconds;
       final dp = newP - _prevProgress;
@@ -1020,12 +1135,6 @@ class _TaskTileState extends State<_TaskTile>
         _prevTime = now;
       }
     }
-  }
-
-  @override
-  void dispose() {
-    _barCtrl.dispose();
-    super.dispose();
   }
 
   @override
@@ -1078,7 +1187,8 @@ class _TaskTileState extends State<_TaskTile>
 
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(14),
+      // No uniform padding — we handle it per-row so the progress bar sits
+      // flush with the card edges (left/right/bottom) with its own bottom inset.
       decoration: BoxDecoration(
         color: AppTheme.card,
         borderRadius: BorderRadius.circular(14),
@@ -1091,8 +1201,10 @@ class _TaskTileState extends State<_TaskTile>
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // ── Top row: icon + name + action buttons ─────────────────────────
-          Row(
-            children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 14, 6, 0),
+            child: Row(
+              children: [
               Container(
                 width: 42,
                 height: 42,
@@ -1212,46 +1324,49 @@ class _TaskTileState extends State<_TaskTile>
               ),
             ],
           ),
+          ),
 
-          // ── Progress bar (gradient) ────────────────────────────────────────
-          if (widget.showProgress && isActive && task.progress >= 0) ...[
-            const SizedBox(height: 8),
-            AnimatedBuilder(
-              animation: _barAnim,
-              builder: (_, __) => _DlGradientBar(
-                value: _barAnim.value,
-                accent: accent,
+          // ── ETA row ───────────────────────────────────────────────────────
+          if (isActive && (_etaLabel.isNotEmpty || task.error != null)) ...[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 4, 14, 0),
+              child: Text(
+                task.error != null
+                    ? task.error!
+                    : '$_etaLabel left',
+                style: TextStyle(
+                  fontSize: 9,
+                  color: task.error != null
+                      ? AppTheme.warning
+                      : AppTheme.textHint,
+                ),
               ),
             ),
           ],
-          if (widget.showProgress && isActive && task.progress < 0) ...[
+
+          // ── Progress bar (gradient) — flush with card bottom ──────────────
+          if (widget.showProgress && isActive && task.progress >= 0) ...[
             const SizedBox(height: 8),
             ClipRRect(
-              borderRadius: BorderRadius.circular(4),
-              child: const LinearProgressIndicator(
+              borderRadius: const BorderRadius.vertical(bottom: Radius.circular(14)),
+              child: _DlGradientBar(
+                value: progress,
+                accent: accent,
+              ),
+            ),
+          ] else if (widget.showProgress && isActive && task.progress < 0) ...[
+            const SizedBox(height: 8),
+            const ClipRRect(
+              borderRadius: BorderRadius.vertical(bottom: Radius.circular(14)),
+              child: LinearProgressIndicator(
                 backgroundColor: AppTheme.surfaceVariant,
                 valueColor:
                     AlwaysStoppedAnimation(Colors.lightBlueAccent),
                 minHeight: 4,
               ),
             ),
-          ],
-
-          // ── ETA row ───────────────────────────────────────────────────────
-          if (isActive && (_etaLabel.isNotEmpty || task.error != null)) ...[
-            const SizedBox(height: 4),
-            Text(
-              task.error != null
-                  ? task.error!
-                  : '$_etaLabel left',
-              style: TextStyle(
-                fontSize: 9,
-                color: task.error != null
-                    ? AppTheme.warning
-                    : AppTheme.textHint,
-              ),
-            ),
-          ],
+          ] else
+            const SizedBox(height: 14),
         ],
       ),
     );
@@ -1307,28 +1422,39 @@ class _DlGradientBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const double h = 4;
+    const double h = 5;
     final c1 = accent;
-    final c2 = accent.withValues(alpha: 0.6);
+    final c2 = accent.withValues(alpha: 0.65);
 
     return LayoutBuilder(builder: (_, constraints) {
+      final maxWidth = constraints.maxWidth;
       return SizedBox(
         height: h,
-        width: constraints.maxWidth,
+        width: maxWidth,
         child: ClipRRect(
           borderRadius: BorderRadius.circular(h / 2),
           child: Stack(
             children: [
-              Container(color: AppTheme.surfaceVariant),
+              // Track background
+              Container(
+                width: maxWidth,
+                height: h,
+                color: AppTheme.surfaceVariant.withValues(alpha: 0.5),
+              ),
+              // Animated progress fill (fills from left to right accurately)
               TweenAnimationBuilder<double>(
-                tween: Tween<double>(begin: 0, end: value.clamp(0.0, 1.0)),
-                duration: const Duration(milliseconds: 300),
+                tween: Tween<double>(end: value.clamp(0.0, 1.0)),
+                duration: const Duration(milliseconds: 200),
+                curve: Curves.easeOutQuad,
                 builder: (context, val, _) {
-                  return FractionallySizedBox(
-                    widthFactor: val,
+                  return Align(
+                    alignment: Alignment.centerLeft,
                     child: Container(
+                      width: maxWidth * val.clamp(0.0, 1.0),
+                      height: h,
                       decoration: BoxDecoration(
                         gradient: LinearGradient(colors: [c1, c2]),
+                        borderRadius: BorderRadius.circular(h / 2),
                       ),
                     ),
                   );

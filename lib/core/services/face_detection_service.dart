@@ -57,6 +57,7 @@ class FaceDetectionService extends ChangeNotifier {
   static final FaceDetectionService instance = FaceDetectionService._();
   FaceDetectionService._();
 
+  static const int _kFaceAlgoVersion = 4;
   FaceDetector? _detector;
   bool _isScanning = false;
   bool get isScanning => _isScanning;
@@ -68,10 +69,10 @@ class FaceDetectionService extends ChangeNotifier {
     _detector ??= FaceDetector(
       options: FaceDetectorOptions(
         enableLandmarks: true,
-        enableContours: false,
-        enableClassification: false,
-        performanceMode: FaceDetectorMode.fast,
-        minFaceSize: 0.12,
+        enableContours: true,
+        enableClassification: true,
+        performanceMode: FaceDetectorMode.accurate,
+        minFaceSize: 0.05,
       ),
     );
     return _detector!;
@@ -79,11 +80,40 @@ class FaceDetectionService extends ChangeNotifier {
 
   /// Initialize and load saved people from SharedPreferences for a user.
   Future<List<PersonGroup>> getPeople(String userId) async {
+    final prefs = await SharedPreferences.getInstance();
+
+    // Migration / cache version check: auto-resets corrupt single-cluster data
+    final currentVer = prefs.getInt('face_algo_version_$userId') ?? 0;
+    if (currentVer < _kFaceAlgoVersion) {
+      final customNames = <String>[];
+      final oldRaw = prefs.getString('face_people_$userId');
+      if (oldRaw != null && oldRaw.isNotEmpty) {
+        try {
+          final list = (jsonDecode(oldRaw) as List<dynamic>)
+              .map((e) => PersonGroup.fromJson(e as Map<String, dynamic>));
+          for (final p in list) {
+            if (!p.name.startsWith('Person ') && p.name.trim().isNotEmpty) {
+              customNames.add(p.name);
+            }
+          }
+        } catch (_) {}
+      }
+
+      _userPeopleCache[userId] = [];
+      _scannedFileIdsCache[userId] = {};
+      await prefs.remove('face_people_$userId');
+      await prefs.remove('face_scanned_$userId');
+      await prefs.setInt('face_algo_version_$userId', _kFaceAlgoVersion);
+      if (customNames.isNotEmpty) {
+        await prefs.setStringList('face_custom_names_$userId', customNames);
+      }
+      return [];
+    }
+
     if (_userPeopleCache.containsKey(userId)) {
       return _userPeopleCache[userId]!;
     }
 
-    final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString('face_people_$userId');
     if (raw != null && raw.isNotEmpty) {
       try {
@@ -234,8 +264,22 @@ class FaceDetectionService extends ChangeNotifier {
 
         String? localPath = file.thumbnailPath;
         if (localPath == null || !File(localPath).existsSync()) {
-          // If thumbnail not downloaded yet, try downloading via TDLib
-          if (file.telegramThumbnailId != null && file.telegramThumbnailId! > 0) {
+          // 1. Check local Camera directories on device (e.g. auto backup photos)
+          const cameraDirs = [
+            '/storage/emulated/0/DCIM/Camera',
+            '/storage/emulated/0/DCIM',
+            '/storage/emulated/0/Pictures',
+          ];
+          for (final dirPath in cameraDirs) {
+            final candidate = File('$dirPath/${file.name}');
+            if (candidate.existsSync()) {
+              localPath = candidate.path;
+              break;
+            }
+          }
+
+          // 2. If not found locally, try downloading via TDLib
+          if (localPath == null && file.telegramThumbnailId != null && file.telegramThumbnailId! > 0) {
             try {
               localPath = await TdlibService.instance
                   .downloadThumbnail(file.telegramThumbnailId!);
@@ -258,6 +302,16 @@ class FaceDetectionService extends ChangeNotifier {
       _isScanning = false;
       notifyListeners();
     }
+  }
+
+  /// Forces a complete re-scan of all photos and clears stale clusters
+  Future<void> rescanAll(String userId, List<CloudFile> files) async {
+    final prefs = await SharedPreferences.getInstance();
+    _scannedFileIdsCache[userId] = {};
+    _userPeopleCache[userId] = [];
+    await prefs.remove('face_scanned_$userId');
+    await prefs.remove('face_people_$userId');
+    await batchScanImages(userId, files);
   }
 
   /// Scan a single freshly uploaded or viewed file
@@ -295,6 +349,10 @@ class FaceDetectionService extends ChangeNotifier {
         facesDir.createSync(recursive: true);
       }
 
+      // Track person IDs matched in THIS photo:
+      // Multiple faces in the SAME photo MUST belong to different people!
+      final matchedInThisFile = <String>{};
+
       for (int i = 0; i < faces.length; i++) {
         final face = faces[i];
         final box = face.boundingBox;
@@ -316,37 +374,49 @@ class FaceDetectionService extends ChangeNotifier {
         final avatarFile = File(p.join(facesDir.path, avatarFileName));
         await avatarFile.writeAsBytes(jpgBytes);
 
-        // Compute feature vector for clustering
+        // Compute 268-element normalized appearance + landmark geometry feature vector
         final features = _computeFeatureVector(face, resized);
 
-        // Find best match among existing PersonGroups
+        // Find best match among existing PersonGroups (excluding anyone already matched in this photo)
         PersonGroup? bestMatch;
-        double highestSimilarity = 0.0;
+        double highestSimilarity = -1.0;
 
         for (final p in people) {
-          final sim = _cosineSimilarity(features, p.featureVector);
+          if (matchedInThisFile.contains(p.id)) continue;
+          final sim = _computeSimilarity(features, p.featureVector);
           if (sim > highestSimilarity) {
             highestSimilarity = sim;
             bestMatch = p;
           }
         }
 
-        // Threshold for grouping the same person
-        if (bestMatch != null && highestSimilarity >= 0.72) {
+        // Strict threshold for matching the exact same person
+        if (bestMatch != null && highestSimilarity >= 0.70) {
+          matchedInThisFile.add(bestMatch.id);
           if (!bestMatch.fileIds.contains(file.id)) {
             bestMatch.fileIds.add(file.id);
             bestMatch.updatedAt = DateTime.now();
           }
+          // Adapt feature vector
+          _adaptFeatureVector(bestMatch.featureVector, features);
         } else {
           // New person cluster
+          String personName = 'Person ${people.length + 1}';
+          final prefs = await SharedPreferences.getInstance();
+          final customNames = prefs.getStringList('face_custom_names_$userId');
+          if (customNames != null && customNames.isNotEmpty && people.isEmpty) {
+            personName = customNames.first;
+          }
+
           final newPerson = PersonGroup(
-            id: 'person_${DateTime.now().millisecondsSinceEpoch}_$i',
-            name: 'Person ${people.length + 1}',
+            id: 'person_${DateTime.now().millisecondsSinceEpoch}_${people.length}_$i',
+            name: personName,
             avatarPath: avatarFile.path,
             fileIds: [file.id],
             featureVector: features,
             updatedAt: DateTime.now(),
           );
+          matchedInThisFile.add(newPerson.id);
           people.add(newPerson);
         }
       }
@@ -355,104 +425,185 @@ class FaceDetectionService extends ChangeNotifier {
     }
   }
 
-  /// Calculates facial geometry ratios and a 16-bin color histogram
+  /// Calculates a 268-element vector:
+  /// - 256 floats: 16x16 normalized grayscale appearance map (illumination-invariant)
+  /// - 8 floats: facial landmark geometry ratios
+  /// - 4 floats: facial contrast signatures (glasses, beard, hair, tone)
   List<double> _computeFeatureVector(Face face, img.Image faceCrop) {
     final List<double> vec = [];
+
+    // 1. Appearance: 16x16 normalized grayscale grid (256 floats)
+    final grayCrop = img.copyResize(faceCrop, width: 16, height: 16);
+    final List<double> grayVals = [];
+    double graySum = 0.0;
+    for (int y = 0; y < 16; y++) {
+      for (int x = 0; x < 16; x++) {
+        final pixel = grayCrop.getPixel(x, y);
+        final lum = 0.299 * pixel.r + 0.587 * pixel.g + 0.114 * pixel.b;
+        grayVals.add(lum);
+        graySum += lum;
+      }
+    }
+    final mean = graySum / 256.0;
+    double varSum = 0.0;
+    for (final g in grayVals) {
+      final diff = g - mean;
+      varSum += diff * diff;
+    }
+    final std = sqrt(varSum / 256.0);
+    final denom = std < 1.0 ? 1.0 : std;
+    for (final g in grayVals) {
+      vec.add((g - mean) / denom);
+    }
+
+    // 2. Geometry: 8 landmark geometry ratios
     final box = face.boundingBox;
     final w = box.width.abs();
     final h = box.height.abs();
-
-    // 1. Aspect ratio
-    vec.add((h > 0 ? (w / h) : 1.0).clamp(0.0, 3.0));
-
-    // 2. Eye landmarks geometry
     final leftEye = face.landmarks[FaceLandmarkType.leftEye];
     final rightEye = face.landmarks[FaceLandmarkType.rightEye];
     final nose = face.landmarks[FaceLandmarkType.noseBase];
     final mouth = face.landmarks[FaceLandmarkType.bottomMouth];
+    final leftMouth = face.landmarks[FaceLandmarkType.leftMouth];
+    final rightMouth = face.landmarks[FaceLandmarkType.rightMouth];
+    final leftCheek = face.landmarks[FaceLandmarkType.leftCheek];
+    final rightCheek = face.landmarks[FaceLandmarkType.rightCheek];
 
+    double eyeDist = w * 0.4;
     if (leftEye != null && rightEye != null) {
-      final eyeDx = (rightEye.position.x - leftEye.position.x).toDouble();
-      final eyeDy = (rightEye.position.y - leftEye.position.y).toDouble();
-      final eyeDist = sqrt(eyeDx * eyeDx + eyeDy * eyeDy);
-      vec.add(w > 0 ? (eyeDist / w) : 0.4);
+      final dx = (rightEye.position.x - leftEye.position.x).toDouble();
+      final dy = (rightEye.position.y - leftEye.position.y).toDouble();
+      eyeDist = sqrt(dx * dx + dy * dy);
+    }
+    if (eyeDist < 1.0) eyeDist = 1.0;
+
+    // G1: Eye spacing ratio
+    vec.add((eyeDist / (w > 0 ? w : 1.0)).clamp(0.1, 1.0));
+
+    // G2: Nose vertical distance relative to eye spacing
+    if (nose != null && leftEye != null && rightEye != null) {
+      final eyeMidY = (leftEye.position.y + rightEye.position.y) / 2.0;
+      final noseDistY = (nose.position.y - eyeMidY).toDouble();
+      vec.add((noseDistY / eyeDist).clamp(0.1, 2.0));
     } else {
-      vec.add(0.4);
+      vec.add(0.65);
     }
 
-    if (nose != null && h > 0) {
-      vec.add(((nose.position.y - box.top) / h).clamp(0.0, 1.0));
+    // G3: Mouth vertical distance relative to eye spacing
+    if (mouth != null && nose != null) {
+      final mouthDistY = (mouth.position.y - nose.position.y).toDouble();
+      vec.add((mouthDistY / eyeDist).clamp(0.1, 2.0));
     } else {
-      vec.add(0.5);
+      vec.add(0.55);
     }
 
-    if (mouth != null && h > 0) {
-      vec.add(((mouth.position.y - box.top) / h).clamp(0.0, 1.0));
+    // G4: Mouth width ratio relative to eye spacing
+    if (leftMouth != null && rightMouth != null) {
+      final mdx = (rightMouth.position.x - leftMouth.position.x).toDouble();
+      final mdy = (rightMouth.position.y - leftMouth.position.y).toDouble();
+      final mouthW = sqrt(mdx * mdx + mdy * mdy);
+      vec.add((mouthW / eyeDist).clamp(0.2, 2.0));
     } else {
-      vec.add(0.75);
+      vec.add(0.8);
     }
 
-    // 3. 12-bin HSV color histogram from center face region
-    final int centerX = faceCrop.width ~/ 4;
-    final int centerY = faceCrop.height ~/ 4;
-    final int centerW = faceCrop.width ~/ 2;
-    final int centerH = faceCrop.height ~/ 2;
+    // G5: Nose horizontal centering ratio
+    if (nose != null && leftEye != null && rightEye != null) {
+      final dLeft = (nose.position.x - leftEye.position.x).abs().toDouble();
+      final dRight = (rightEye.position.x - nose.position.x).abs().toDouble();
+      vec.add((dLeft / (dRight > 0 ? dRight : 1.0)).clamp(0.3, 3.0));
+    } else {
+      vec.add(1.0);
+    }
 
-    final hist = List<double>.filled(12, 0.0);
-    int count = 0;
+    // G6: Face aspect ratio
+    vec.add((h > 0 ? (w / h) : 0.85).clamp(0.3, 2.5));
 
-    for (int y = centerY; y < centerY + centerH; y += 2) {
-      for (int x = centerX; x < centerX + centerW; x += 2) {
-        final pixel = faceCrop.getPixel(x, y);
-        final r = pixel.r.toDouble();
-        final g = pixel.g.toDouble();
-        final b = pixel.b.toDouble();
+    // G7: Cheek distance relative to eye spacing
+    if (leftCheek != null && rightCheek != null) {
+      final cdx = (rightCheek.position.x - leftCheek.position.x).toDouble();
+      final cdy = (rightCheek.position.y - leftCheek.position.y).toDouble();
+      final cheekDist = sqrt(cdx * cdx + cdy * cdy);
+      vec.add((cheekDist / eyeDist).clamp(0.5, 3.0));
+    } else {
+      vec.add(1.6);
+    }
 
-        // Convert to Hue [0..360]
-        final maxC = max(r, max(g, b));
-        final minC = min(r, min(g, b));
-        final delta = maxC - minC;
-        double hue = 0.0;
-        if (delta > 0.0001) {
-          if (maxC == r) {
-            hue = 60 * (((g - b) / delta) % 6);
-          } else if (maxC == g) {
-            hue = 60 * (((b - r) / delta) + 2);
-          } else {
-            hue = 60 * (((r - g) / delta) + 4);
-          }
+    // G8: Head roll
+    vec.add((face.headEulerAngleZ ?? 0.0) / 90.0);
+
+    // 3. Contrast Signatures (Glasses, Beard, Hair, Tone)
+    double glassesAvg = 0.0;
+    int glassesCount = 0;
+    double cheekAvg = 0.0;
+    int cheekCount = 0;
+    double beardAvg = 0.0;
+    int beardCount = 0;
+    for (int y = 0; y < 16; y++) {
+      for (int x = 0; x < 16; x++) {
+        final val = grayVals[y * 16 + x];
+        if (y >= 5 && y <= 7 && x >= 3 && x <= 12) {
+          glassesAvg += val;
+          glassesCount++;
         }
-        if (hue < 0) hue += 360;
-
-        final bin = ((hue / 360) * 12).floor().clamp(0, 11);
-        hist[bin] += 1.0;
-        count++;
+        if (y >= 9 && y <= 11 && ((x >= 2 && x <= 4) || (x >= 11 && x <= 13))) {
+          cheekAvg += val;
+          cheekCount++;
+        }
+        if (y >= 12 && y <= 15 && x >= 4 && x <= 11) {
+          beardAvg += val;
+          beardCount++;
+        }
       }
     }
+    final gVal = glassesCount > 0 ? glassesAvg / glassesCount : mean;
+    final cVal = cheekCount > 0 ? cheekAvg / cheekCount : mean;
+    final bVal = beardCount > 0 ? beardAvg / beardCount : mean;
 
-    if (count > 0) {
-      for (int k = 0; k < 12; k++) {
-        vec.add(hist[k] / count);
-      }
-    } else {
-      vec.addAll(List.filled(12, 0.0));
-    }
+    vec.add(((gVal - cVal) / 128.0).clamp(-1.0, 1.0));
+    vec.add(((bVal - cVal) / 128.0).clamp(-1.0, 1.0));
+    vec.add((mean / 255.0).clamp(0.0, 1.0));
+    vec.add((std / 128.0).clamp(0.0, 2.0));
 
     return vec;
   }
 
-  double _cosineSimilarity(List<double> v1, List<double> v2) {
-    if (v1.length != v2.length || v1.isEmpty) return 0.0;
+  /// Discriminates between different individuals using normalized appearance correlation,
+  /// facial geometry, and contrast signatures.
+  double _computeSimilarity(List<double> v1, List<double> v2) {
+    if (v1.length < 268 || v2.length < 268) return 0.0;
+
+    // 1. Appearance correlation: Pearson normalized cross-correlation
     double dot = 0.0;
-    double norm1 = 0.0;
-    double norm2 = 0.0;
-    for (int i = 0; i < v1.length; i++) {
+    for (int i = 0; i < 256; i++) {
       dot += v1[i] * v2[i];
-      norm1 += v1[i] * v1[i];
-      norm2 += v2[i] * v2[i];
     }
-    if (norm1 == 0 || norm2 == 0) return 0.0;
-    return (dot / (sqrt(norm1) * sqrt(norm2))).clamp(0.0, 1.0);
+    final appCorr = (dot / 256.0).clamp(-1.0, 1.0);
+
+    // 2. Geometry distance
+    double geomDist = 0.0;
+    for (int i = 256; i < 264; i++) {
+      geomDist += (v1[i] - v2[i]).abs();
+    }
+    geomDist /= 8.0;
+    final geomSim = (1.0 - geomDist * 1.5).clamp(0.0, 1.0);
+
+    // 3. Contrast distance
+    double contrastDist = 0.0;
+    for (int i = 264; i < 268; i++) {
+      contrastDist += (v1[i] - v2[i]).abs();
+    }
+    contrastDist /= 4.0;
+    final contrastSim = (1.0 - contrastDist * 1.5).clamp(0.0, 1.0);
+
+    return 0.70 * appCorr + 0.20 * geomSim + 0.10 * contrastSim;
+  }
+
+  void _adaptFeatureVector(List<double> target, List<double> incoming) {
+    if (target.length != incoming.length) return;
+    for (int i = 0; i < target.length; i++) {
+      target[i] = 0.85 * target[i] + 0.15 * incoming[i];
+    }
   }
 
   Future<void> _savePeople(String userId) async {

@@ -860,6 +860,18 @@ class LocalMetadataService {
     return ids;
   }
 
+  /// Returns all active file names already backed up for this user.
+  Future<Set<String>> getExistingFileNames(String userId) async {
+    final db = await _DB.instance;
+    final rows = await db.query(
+      'files',
+      columns: ['name'],
+      where: 'userId = ? AND isTrashed = 0',
+      whereArgs: [userId],
+    );
+    return rows.map((r) => r['name'] as String).toSet();
+  }
+
   /// Purges any accidentally imported chunk files from the local database.
   Future<int> purgeChunkGhostFiles(String userId) async {
     final db = await _DB.instance;
@@ -897,7 +909,11 @@ class LocalMetadataService {
         whereArgs: [userId, ...allChunkIds],
       );
     }
-    return count1 + count2;
+    final total = count1 + count2;
+    if (total > 0) {
+      await recalculateFolderItemCounts(userId);
+    }
+    return total;
   }
 
   /// Returns all existing folder IDs for a user.
@@ -939,11 +955,49 @@ class LocalMetadataService {
     final db = await _DB.instance;
     final rows = await db.query(
       'files',
-      where: 'userId = ? AND (telegramMessageId <= 0 OR telegramFileId LIKE "offline_pending_%") AND isTrashed = 0',
+      where: '(userId = ? OR userId = "" OR userId IS NULL) AND telegramMessageId <= 0 AND telegramFileId NOT LIKE "offline_uploading_%" AND isTrashed = 0',
       whereArgs: [userId],
       orderBy: 'uploadedAt ASC',
     );
     return rows.map(_fileFromMap).toList();
+  }
+
+  /// Returns an already-uploaded cloud file with matching userId, name, and folderPath.
+  Future<CloudFile?> getUploadedFileByName({
+    required String userId,
+    required String name,
+    required String folderPath,
+  }) async {
+    final db = await _DB.instance;
+    final rows = await db.query(
+      'files',
+      where: '(userId = ? OR userId = "" OR userId IS NULL) AND name = ? AND folderPath = ? AND telegramMessageId > 0 AND isTrashed = 0',
+      whereArgs: [userId, name, folderPath],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return _fileFromMap(rows.first);
+  }
+
+  /// Marks a file as currently uploading in background so other queries don't pick it up.
+  Future<void> markFileUploading(String fileId) async {
+    final db = await _DB.instance;
+    await db.update(
+      'files',
+      {'telegramFileId': 'offline_uploading_$fileId'},
+      where: 'id = ?',
+      whereArgs: [fileId],
+    );
+  }
+
+  /// Resets uploading files back to pending (e.g. if an upload failed or on app start).
+  Future<void> resetUploadingFiles(String userId) async {
+    final db = await _DB.instance;
+    await db.rawUpdate('''
+      UPDATE files
+      SET telegramFileId = 'offline_pending_' || id
+      WHERE userId = ? AND telegramMessageId <= 0 AND telegramFileId LIKE 'offline_uploading_%'
+    ''', [userId]);
   }
 
   /// Scans files table for any duplicate rows (same userId + name + folderPath, or same msgId > 0)
@@ -989,10 +1043,54 @@ class LocalMetadataService {
       for (final dupId in idsToDelete) {
         await db.delete('files', where: 'id = ?', whereArgs: [dupId]);
       }
+
+      // ── Always reconcile folder counters after dedup ─────────────────────────
+      // Prevents itemCount drift caused by sync retries, chunk ghost rows, or
+      // duplicates being removed without adjusting the parent folder counter.
+      if (idsToDelete.isNotEmpty) {
+        await recalculateFolderItemCounts(userId);
+      }
+
       return idsToDelete.length;
     } catch (e) {
       debugPrint('[LocalMetadataService] deduplicateFiles error: $e');
       return 0;
+    }
+  }
+
+  /// Recalculates every folder's itemCount from actual files + subfolders.
+  ///
+  /// Counts both:
+  ///  - Direct non-trashed files inside the folder (excluding chunk/part artifacts)
+  ///  - Direct non-trashed subfolders inside the folder
+  ///
+  /// This is the authoritative fix for count drift — it never relies on
+  /// incremental +1 / -1 counters that can de-sync after failed uploads,
+  /// multi-device sync, chunk ghost rows, or interrupted operations.
+  Future<void> recalculateFolderItemCounts(String userId) async {
+    try {
+      final db = await _DB.instance;
+      await db.rawUpdate('''
+        UPDATE folders
+        SET itemCount = (
+          SELECT COUNT(*)
+          FROM files
+          WHERE files.folderId = folders.id
+            AND files.userId   = folders.userId
+            AND files.isTrashed = 0
+            AND files.name NOT LIKE 'lc_chunk_%'
+            AND files.name NOT LIKE '%.part%of%'
+        ) + (
+          SELECT COUNT(*)
+          FROM folders AS sub
+          WHERE sub.parentId  = folders.id
+            AND sub.userId    = folders.userId
+            AND sub.isTrashed = 0
+        )
+        WHERE folders.userId = ?
+      ''', [userId]);
+    } catch (e) {
+      debugPrint('[LocalMetadataService] recalculateFolderItemCounts error: $e');
     }
   }
 

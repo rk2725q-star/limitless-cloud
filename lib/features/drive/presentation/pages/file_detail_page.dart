@@ -1,9 +1,11 @@
-import 'dart:io';
+import 'dart:io' as io;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 
+import '../../../../core/services/smart_streaming_session.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/file_utils.dart';
 import '../../../../core/utils/date_utils.dart';
@@ -29,32 +31,93 @@ class FileDetailPage extends ConsumerStatefulWidget {
 class _FileDetailPageState extends ConsumerState<FileDetailPage> {
   CloudFile get _file => widget.args['file'] as CloudFile;
 
-  bool _opening  = false;
+  // Current streaming session — held so we can dispose it when the page closes
+  SmartStreamingSession? _streamSession;
+  bool _opening     = false;
   String? _openError;
 
-  // ── Temp stream → native app (zero permanent storage) ─────────────────────
+  @override
+  void dispose() {
+    _streamSession?.dispose();
+    super.dispose();
+  }
+
+  // ── Smart part-based stream → native video player ──────────────────────────
 
   Future<void> _openWithNativeApp() async {
     setState(() { _opening = true; _openError = null; });
     try {
       final auth = ref.read(telegramAuthServiceProvider);
-      final tg   = TelegramStorageService(auth);
 
-      final tmpDir  = await getTemporaryDirectory();
-      final tmpFile = File('${tmpDir.path}/${_file.name}');
+      // Dispose previous session if user re-opens
+      await _streamSession?.dispose();
+      _streamSession = null;
 
-      // Stream from Telegram to temp (temp is cleared by OS)
-      final downloaded = await tg.downloadFile(_file.telegramMessageId, _file.name);
-      await downloaded.copy(tmpFile.path);
+      // Decide: is this a streamable media file?
+      final ext = _file.extension.toLowerCase();
+      final isVideo = ['mp4','mkv','avi','mov','wmv','flv','webm','m4v','3gp'].contains(ext);
+      final isAudio = ['mp3','wav','aac','flac','ogg','m4a','opus','wma'].contains(ext);
 
-      final result = await OpenFilex.open(tmpFile.path, type: _file.mimeType);
+      if (isVideo || isAudio) {
+        // ── Smart streaming: download parts progressively ──────────────────
+        final session = await SmartStreamingSession.create(
+          file: _file,
+          authService: auth,
+          onBuffer: (progress, ready) {
+            if (mounted) setState(() {}); // refresh loading UI
+          },
+        );
+        _streamSession = session;
 
-      if (result.type == ResultType.noAppToOpen) {
-        setState(() => _openError =
-            'No app found for .${_file.extension}\nInstall a compatible app and try again.');
-      } else if (result.type == ResultType.error ||
-                 result.type == ResultType.permissionDenied) {
-        setState(() => _openError = result.message);
+        if (!mounted) { await session.dispose(); return; }
+
+        // Open the local HTTP stream URL with the native video player (VLC, MX Player, etc.)
+        final uri = Uri.parse(session.streamUrl);
+        bool opened = false;
+        try {
+          opened = await launchUrl(uri, mode: LaunchMode.externalNonBrowserApplication);
+        } catch (_) {}
+
+        if (!opened) {
+          try {
+            opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+          } catch (_) {}
+        }
+
+        if (!opened) {
+          // Fallback: If intent wasn't handled, attempt opening initial part via OpenFilex
+          final firstPart = session.parts.isNotEmpty ? session.parts[0].localPath : null;
+          if (firstPart != null && io.File(firstPart).existsSync()) {
+            final res = await OpenFilex.open(firstPart, type: _file.mimeType);
+            if (res.type == ResultType.done) opened = true;
+          }
+        }
+
+        if (!opened) {
+          setState(() => _openError =
+              'No media player found.\nPlease install VLC or MX Player to stream.');
+        }
+      } else {
+        // ── Non-media files: fall back to full download → open ─────────────
+        final tg      = TelegramStorageService(auth);
+        final tmpDir  = await getTemporaryDirectory();
+        final tmpFile = io.File('${tmpDir.path}/${_file.name}');
+
+        final downloaded = await tg.downloadFile(
+          _file.telegramMessageId,
+          _file.name,
+          chunkMessageIds: _file.chunkMessageIds,
+        );
+        await downloaded.copy(tmpFile.path);
+
+        final result = await OpenFilex.open(tmpFile.path, type: _file.mimeType);
+        if (result.type == ResultType.noAppToOpen) {
+          setState(() => _openError =
+              'No app found for .${_file.extension}\nInstall a compatible app and try again.');
+        } else if (result.type == ResultType.error ||
+                   result.type == ResultType.permissionDenied) {
+          setState(() => _openError = result.message);
+        }
       }
     } catch (e) {
       setState(() => _openError = 'Could not open: $e');
@@ -62,6 +125,7 @@ class _FileDetailPageState extends ConsumerState<FileDetailPage> {
       if (mounted) setState(() => _opening = false);
     }
   }
+
 
   // ── Save to public Downloads/LimitlessCloud via Download Manager ──────────
 

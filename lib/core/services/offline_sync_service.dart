@@ -32,6 +32,10 @@ class OfflineSyncService {
   WidgetRef? _ref;
   Ref? _containerRef;
   bool _isSyncing = false;
+  bool _syncRequestedWhileBusy = false;
+  Timer? _connectivityDebounce;
+
+  static final Set<String> _inFlightFileNames = <String>{};
 
   void init(dynamic ref) {
     if (ref is WidgetRef) {
@@ -44,16 +48,38 @@ class OfflineSyncService {
     _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
       final isOnline = results.any((r) => r != ConnectivityResult.none);
       if (isOnline) {
-        debugPrint('[OfflineSyncService] Internet connection restored. Triggering auto-backup…');
-        syncPendingFiles();
+        debugPrint('[OfflineSyncService] Internet connection event. Debouncing sync…');
+        _connectivityDebounce?.cancel();
+        _connectivityDebounce = Timer(const Duration(milliseconds: 1500), () {
+          syncPendingFiles();
+        });
       }
     });
 
-    // Initial check on launch
-    syncPendingFiles();
+    // Reset interrupted uploads from any previous sessions
+    _resetInterruptedUploads();
+
+    // Initial check on launch after brief delay for TDLib init
+    _connectivityDebounce?.cancel();
+    _connectivityDebounce = Timer(const Duration(milliseconds: 1500), () {
+      syncPendingFiles();
+    });
+  }
+
+  Future<void> _resetInterruptedUploads() async {
+    try {
+      final authService = _read(telegramAuthServiceProvider);
+      if (authService == null) return;
+      final profile = await authService.getProfile();
+      final userId = profile['userId'] ?? '';
+      if (userId.isEmpty) return;
+      final firestoreService = _read(firestoreServiceProvider) ?? LocalMetadataService();
+      await firestoreService.resetUploadingFiles(userId);
+    } catch (_) {}
   }
 
   void dispose() {
+    _connectivityDebounce?.cancel();
     _connectivitySub?.cancel();
     _connectivitySub = null;
   }
@@ -64,6 +90,20 @@ class OfflineSyncService {
     if (_ref != null) return _ref!.read(provider);
     if (_containerRef != null) return _containerRef!.read(provider);
     return null;
+  }
+
+  Future<String> _resolveUserId(TelegramAuthService? authService) async {
+    if (authService == null) return '';
+    final profile = await authService.getProfile();
+    var uid = profile['userId'] ?? '';
+    if (uid.isEmpty) {
+      try {
+        await authService.saveProfileFromTdlib();
+        final refreshed = await authService.getProfile();
+        uid = refreshed['userId'] ?? '';
+      } catch (_) {}
+    }
+    return uid;
   }
 
   // ── Save captured photo/video locally (works offline & online) ─────────────
@@ -93,13 +133,9 @@ class OfflineSyncService {
     final thumbPath = p.join(thumbDir.path, 'local_${DateTime.now().microsecondsSinceEpoch}_$fileName');
     await savedFile.copy(thumbPath);
 
-    // 3. Resolve user ID
+    // 3. Resolve user ID robustly (fallback to TDLib if SharedPreferences not populated)
     final authService = _read(telegramAuthServiceProvider);
-    String userId = '';
-    if (authService != null) {
-      final profile = await authService.getProfile();
-      userId = profile['userId'] ?? '';
-    }
+    final userId = await _resolveUserId(authService);
 
     final fileSize = await savedFile.length();
     final ext = p.extension(fileName).replaceAll('.', '');
@@ -132,30 +168,47 @@ class OfflineSyncService {
   // ── Sync all pending offline files to Telegram Cloud ────────────────────────
 
   Future<void> syncPendingFiles() async {
-    if (_isSyncing) return;
-
-    final results = await Connectivity().checkConnectivity();
-    final isOnline = results.any((r) => r != ConnectivityResult.none);
-    if (!isOnline) {
-      debugPrint('[OfflineSyncService] Device is offline. Pending photos remain safe in local gallery.');
+    if (_isSyncing) {
+      debugPrint('[OfflineSyncService] Sync already in progress. Queuing follow-up sync.');
+      _syncRequestedWhileBusy = true;
       return;
     }
-
-    final authService = _read(telegramAuthServiceProvider);
-    if (authService == null) return;
-    final profile = await authService.getProfile();
-    final userId = profile['userId'] ?? '';
-    if (userId.isEmpty) return;
-
-    final firestoreService = _read(firestoreServiceProvider) ?? LocalMetadataService();
-    final pendingFiles = await firestoreService.getPendingOfflineFiles(userId);
-    if (pendingFiles.isEmpty) return;
-
+    // Take synchronous lock immediately BEFORE any async boundary
     _isSyncing = true;
-    debugPrint('[OfflineSyncService] Starting auto-backup for ${pendingFiles.length} pending files…');
+    _syncRequestedWhileBusy = false;
 
     try {
-      // Ensure TDLib client is ready
+      final results = await Connectivity().checkConnectivity();
+      final isOnline = results.any((r) => r != ConnectivityResult.none);
+      if (!isOnline) {
+        debugPrint('[OfflineSyncService] Device is offline. Pending photos remain safe in local gallery.');
+        return;
+      }
+
+      final authService = _read(telegramAuthServiceProvider);
+      if (authService == null) return;
+      final userId = await _resolveUserId(authService);
+      if (userId.isEmpty && !await authService.isLoggedIn()) return;
+
+      final firestoreService = _read(firestoreServiceProvider) ?? LocalMetadataService();
+      final pendingFiles = await firestoreService.getPendingOfflineFiles(userId);
+      if (pendingFiles.isEmpty) return;
+
+      debugPrint('[OfflineSyncService] Starting auto-backup for ${pendingFiles.length} pending files…');
+
+      // Ensure TDLib client is ready; if closed, wake it up immediately
+      if (!TdlibService.instance.isReady) {
+        if (await authService.isLoggedIn()) {
+          debugPrint('[OfflineSyncService] TDLib client not ready. Attempting re-init…');
+          await TdlibService.instance.retryInit();
+          var waitTries = 0;
+          while (!TdlibService.instance.isReady && waitTries < 25) {
+            await Future.delayed(const Duration(milliseconds: 200));
+            waitTries++;
+          }
+        }
+      }
+
       var waitTries = 0;
       while (!TdlibService.instance.isReady && waitTries < 40) {
         await Future.delayed(const Duration(milliseconds: 300));
@@ -171,6 +224,54 @@ class OfflineSyncService {
       final telegramService = TelegramStorageService(authService);
 
       for (final pending in pendingFiles) {
+        // Guard 1: In-flight mutex
+        if (_inFlightFileNames.contains(pending.name)) {
+          debugPrint('[OfflineSyncService] File ${pending.name} is already uploading. Skipping duplicate.');
+          continue;
+        }
+
+        // Guard 2: Already uploaded to Telegram cloud check in local SQLite
+        final alreadyUploaded = await firestoreService.getUploadedFileByName(
+          userId: userId,
+          name: pending.name,
+          folderPath: pending.folderPath,
+        );
+        if (alreadyUploaded != null && alreadyUploaded.telegramMessageId > 0) {
+          debugPrint('[OfflineSyncService] File ${pending.name} already in cloud (msgId: ${alreadyUploaded.telegramMessageId}). Purging pending duplicate.');
+          final targetPath = p.join(offlineDir.path, pending.name);
+          try {
+            final f = File(targetPath);
+            if (await f.exists()) await f.delete();
+          } catch (_) {}
+          await firestoreService.deleteFile(
+            userId: userId,
+            fileId: pending.id,
+            fileSizeBytes: pending.sizeBytes,
+          );
+          continue;
+        }
+
+        // Guard 3: Check if Telegram Saved Messages already has this file delivered!
+        // This is the definitive guarantee against double uploads in Telegram!
+        final existingCloudMsgId = await telegramService.findRecentMessageForFile(pending.name);
+        if (existingCloudMsgId != null && existingCloudMsgId > 0) {
+          debugPrint('[OfflineSyncService] File ${pending.name} already exists in Telegram Saved Messages (msgId: $existingCloudMsgId). Adopting without re-upload.');
+          final targetPath = p.join(offlineDir.path, pending.name);
+          try {
+            final f = File(targetPath);
+            if (await f.exists()) await f.delete();
+          } catch (_) {}
+          await firestoreService.markFileUploaded(
+            fileId: pending.id,
+            userId: userId,
+            telegramMessageId: existingCloudMsgId,
+            telegramFileId: existingCloudMsgId.toString(),
+            chunkMessageIds: [existingCloudMsgId],
+            permanentThumbPath: pending.thumbnailPath,
+          );
+          continue;
+        }
+
         // Resolve local file path
         File? uploadSource;
         final targetPath = p.join(offlineDir.path, pending.name);
@@ -185,6 +286,9 @@ class OfflineSyncService {
           continue;
         }
 
+        _inFlightFileNames.add(pending.name);
+        await firestoreService.markFileUploading(pending.id);
+
         debugPrint('[OfflineSyncService] Uploading ${pending.name} (${uploadSource.lengthSync()} bytes) to Telegram…');
 
         // Start Android foreground service to guarantee upload completes in background
@@ -195,6 +299,7 @@ class OfflineSyncService {
             uploadSource,
             folderId: pending.folderId,
             folderPath: pending.folderPath,
+            maxRetries: 1, // Single attempt: prevents re-dispatching sendMessage
             onProgress: (progress) {
               UploadBackgroundService.updateProgress(pending.name, progress);
             },
@@ -233,6 +338,7 @@ class OfflineSyncService {
         } catch (e) {
           debugPrint('[OfflineSyncService] Failed to upload ${pending.name}: $e');
         } finally {
+          _inFlightFileNames.remove(pending.name);
           await UploadBackgroundService.stopUpload();
         }
       }
@@ -246,6 +352,10 @@ class OfflineSyncService {
       debugPrint('[OfflineSyncService] Error during auto-backup: $e');
     } finally {
       _isSyncing = false;
+      if (_syncRequestedWhileBusy) {
+        _syncRequestedWhileBusy = false;
+        Future.microtask(() => syncPendingFiles());
+      }
     }
   }
 }

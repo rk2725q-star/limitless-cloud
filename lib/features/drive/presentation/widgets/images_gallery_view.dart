@@ -2,7 +2,9 @@ import 'dart:io' as io;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:path_provider/path_provider.dart';
 import '../../../../core/constants/app_routes.dart';
+import '../../../../core/services/smart_photo_categorizer.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../../../core/utils/date_utils.dart';
 import '../../../../core/utils/file_utils.dart';
@@ -55,6 +57,9 @@ class _ImagesGalleryViewState extends ConsumerState<ImagesGalleryView> {
   // Folder navigation stack for Albums mode
   final List<CloudFolder> _folderStack = [];
   CloudFolder? get _currentFolder => _folderStack.isEmpty ? null : _folderStack.last;
+
+  // Selected Smart Album (Travel, Food, etc.)
+  SmartAlbum? _selectedSmartAlbum;
 
   String? _userId;
   final Set<String> _newlyCreatedFolderIds = {};
@@ -169,7 +174,10 @@ class _ImagesGalleryViewState extends ConsumerState<ImagesGalleryView> {
               count: allImages.length,
               isSelected: _mode == _ImagesMode.timeline,
               accentColor: widget.accentColor,
-              onTap: () => setState(() => _mode = _ImagesMode.timeline),
+              onTap: () => setState(() {
+                _mode = _ImagesMode.timeline;
+                _selectedSmartAlbum = null;
+              }),
             ),
           ),
           const SizedBox(width: 4),
@@ -401,6 +409,18 @@ class _ImagesGalleryViewState extends ConsumerState<ImagesGalleryView> {
                           style: TextStyle(color: widget.accentColor, fontSize: 11),
                         ),
                       ],
+                    )
+                  else
+                    IconButton(
+                      icon: Icon(Icons.refresh_rounded, size: 16, color: widget.accentColor.withValues(alpha: 0.8)),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                      tooltip: 'Re-scan & detect faces',
+                      onPressed: () {
+                        if (_userId != null) {
+                          FaceDetectionService.instance.rescanAll(_userId!, allImages);
+                        }
+                      },
                     ),
                 ],
               ),
@@ -804,9 +824,15 @@ class _ImagesGalleryViewState extends ConsumerState<ImagesGalleryView> {
             children: [
               Row(
                 children: [
-                  if (_folderStack.isNotEmpty) ...[
+                  if (_folderStack.isNotEmpty || _selectedSmartAlbum != null) ...[
                     GestureDetector(
-                      onTap: () => setState(() => _folderStack.removeLast()),
+                      onTap: () {
+                        if (_selectedSmartAlbum != null) {
+                          setState(() => _selectedSmartAlbum = null);
+                        } else {
+                          setState(() => _folderStack.removeLast());
+                        }
+                      },
                       child: Container(
                         padding: const EdgeInsets.all(4),
                         margin: const EdgeInsets.only(right: 6),
@@ -825,27 +851,48 @@ class _ImagesGalleryViewState extends ConsumerState<ImagesGalleryView> {
                       child: Row(
                         children: [
                           GestureDetector(
-                            onTap: () => setState(() => _folderStack.clear()),
+                            onTap: () => setState(() {
+                              _folderStack.clear();
+                              _selectedSmartAlbum = null;
+                            }),
                             child: Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
                                 Icon(
                                   Icons.photo_library_rounded,
                                   size: 13,
-                                  color: _folderStack.isEmpty ? AppTheme.primary : AppTheme.textSecondary,
+                                  color: (_folderStack.isEmpty && _selectedSmartAlbum == null) ? AppTheme.primary : AppTheme.textSecondary,
                                 ),
                                 const SizedBox(width: 4),
                                 Text(
                                   'Gallery Root',
                                   style: TextStyle(
-                                    fontWeight: _folderStack.isEmpty ? FontWeight.w700 : FontWeight.w500,
-                                    color: _folderStack.isEmpty ? AppTheme.primary : AppTheme.textSecondary,
+                                    fontWeight: (_folderStack.isEmpty && _selectedSmartAlbum == null) ? FontWeight.w700 : FontWeight.w500,
+                                    color: (_folderStack.isEmpty && _selectedSmartAlbum == null) ? AppTheme.primary : AppTheme.textSecondary,
                                     fontSize: 12,
                                   ),
                                 ),
                               ],
                             ),
                           ),
+                          if (_selectedSmartAlbum != null) ...[
+                            const Text(' / ', style: TextStyle(color: AppTheme.textHint, fontSize: 12)),
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(_selectedSmartAlbum!.icon, size: 13, color: _selectedSmartAlbum!.color),
+                                const SizedBox(width: 4),
+                                Text(
+                                  _selectedSmartAlbum!.title,
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                    color: _selectedSmartAlbum!.color,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
                           ..._folderStack.asMap().entries.map((entry) {
                             final idx = entry.key;
                             final f = entry.value;
@@ -918,86 +965,181 @@ class _ImagesGalleryViewState extends ConsumerState<ImagesGalleryView> {
           ),
         ),
 
-        // ── Subfolders & Images inside Current Folder ─────────────────────────
+        // ── Subfolders & Images inside Current Folder OR Selected Smart Album ─────────────────────────
         Expanded(
-          child: foldersAsync.when(
-            loading: () => const Center(child: CircularProgressIndicator()),
-            error: (e, _) => Center(child: Text('$e', style: AppTheme.bodyMedium)),
-            data: (folders) {
-              // Automatically filter to only show folders that contain images or were newly created
-              final imageFolders = folders.where((f) => _isImageFolder(f, allImages)).toList();
+          child: _selectedSmartAlbum != null
+              ? _buildSmartAlbumDetailContent(_selectedSmartAlbum!)
+              : foldersAsync.when(
+                  loading: () => const Center(child: CircularProgressIndicator()),
+                  error: (e, _) => Center(child: Text('$e', style: AppTheme.bodyMedium)),
+                  data: (folders) {
+                    // Automatically filter to only show folders that contain images or were newly created
+                    final imageFolders = folders.where((f) => _isImageFolder(f, allImages)).toList();
 
-              if (currentF == null) {
-                // Root view: show folders and root images
-                final rootImages = allImages.where((f) => f.folderId == null || f.folderId!.isEmpty).toList();
+                    if (currentF == null) {
+                      final smartAlbums = SmartPhotoCategorizer.categorize(allImages);
+                      // Root view: show folders and root images
+                      final rootImages = allImages.where((f) => f.folderId == null || f.folderId!.isEmpty).toList();
 
-                if (imageFolders.isEmpty && rootImages.isEmpty) {
-                  return _buildEmptyCard('No image albums or photos yet.\nTap "+ Folder" to create an album or "Upload" to add photos.');
-                }
+                      if (smartAlbums.isEmpty && imageFolders.isEmpty && rootImages.isEmpty) {
+                        return _buildEmptyCard('No image albums or photos yet.\nTap "+ Folder" to create an album or "Upload" to add photos.');
+                      }
 
-                return ListView(
-                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 90),
-                  children: [
-                    if (imageFolders.isNotEmpty) ...[
-                      const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 8),
-                        child: Text(
-                          'FOLDERS & ALBUMS',
-                          style: TextStyle(
-                            color: AppTheme.textSecondary,
-                            letterSpacing: 1.1,
-                            fontWeight: FontWeight.w700,
-                            fontSize: 11,
-                          ),
-                        ),
-                      ),
-                      _buildFolderGrid(imageFolders, allImages),
-                      const SizedBox(height: 16),
-                    ],
-
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      child: Row(
+                      return ListView(
+                        padding: const EdgeInsets.fromLTRB(16, 4, 16, 90),
                         children: [
-                          Text(
-                            'UNORGANIZED IMAGES (${rootImages.length})',
-                            style: const TextStyle(
-                              color: AppTheme.textSecondary,
-                              letterSpacing: 1.1,
-                              fontWeight: FontWeight.w700,
-                              fontSize: 11,
+                          // 🌟 1. SMART ALBUMS (AUTO-DETECTED BY LIMITLESS CLOUD)
+                          if (smartAlbums.isNotEmpty) ...[
+                            Padding(
+                              padding: const EdgeInsets.only(top: 4, bottom: 8),
+                              child: Row(
+                                children: [
+                                  Container(
+                                    padding: const EdgeInsets.all(4),
+                                    decoration: BoxDecoration(
+                                      color: AppTheme.primary.withValues(alpha: 0.15),
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                                    child: const Icon(Icons.auto_awesome_rounded, size: 13, color: AppTheme.primary),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  const Text(
+                                    'SMART ALBUMS (AUTO-DETECTED)',
+                                    style: TextStyle(
+                                      color: AppTheme.textSecondary,
+                                      letterSpacing: 1.1,
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                    decoration: BoxDecoration(
+                                      color: AppTheme.primary.withValues(alpha: 0.15),
+                                      borderRadius: BorderRadius.circular(4),
+                                    ),
+                                    child: Text(
+                                      '${smartAlbums.length} Categories',
+                                      style: const TextStyle(fontSize: 10, color: AppTheme.primary, fontWeight: FontWeight.w600),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            _buildSmartAlbumsHorizontalList(smartAlbums),
+                            const SizedBox(height: 18),
+                          ],
+
+                          // 📁 2. MY FOLDERS & ALBUMS (USER-CREATED)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            child: Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(4),
+                                  decoration: BoxDecoration(
+                                    color: AppTheme.folderColor.withValues(alpha: 0.15),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: const Icon(Icons.folder_copy_rounded, size: 13, color: AppTheme.folderColor),
+                                ),
+                                const SizedBox(width: 8),
+                                const Text(
+                                  'MY FOLDERS & ALBUMS',
+                                  style: TextStyle(
+                                    color: AppTheme.textSecondary,
+                                    letterSpacing: 1.1,
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                                const Spacer(),
+                                Text(
+                                  '${imageFolders.length} albums',
+                                  style: const TextStyle(fontSize: 11, color: AppTheme.textHint),
+                                ),
+                              ],
                             ),
                           ),
-                          const Spacer(),
-                          const Text(
-                            'Select folder to organize',
-                            style: TextStyle(fontSize: 11, color: AppTheme.textHint),
+                          if (imageFolders.isEmpty)
+                            Container(
+                              padding: const EdgeInsets.all(16),
+                              decoration: BoxDecoration(
+                                color: AppTheme.surface,
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(color: AppTheme.cardBorder),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(Icons.create_new_folder_outlined, color: AppTheme.folderColor.withValues(alpha: 0.7), size: 22),
+                                  const SizedBox(width: 12),
+                                  const Expanded(
+                                    child: Text(
+                                      'No custom folders yet. Tap "+ Folder" above to create personal albums.',
+                                      style: TextStyle(color: AppTheme.textHint, fontSize: 12),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            )
+                          else
+                            _buildFolderGrid(imageFolders, allImages),
+                          const SizedBox(height: 18),
+
+                          // 📸 3. UNORGANIZED IMAGES
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            child: Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(4),
+                                  decoration: BoxDecoration(
+                                    color: widget.accentColor.withValues(alpha: 0.15),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Icon(Icons.photo_library_outlined, size: 13, color: widget.accentColor),
+                                ),
+                                const SizedBox(width: 8),
+                                Text(
+                                  'UNORGANIZED IMAGES (${rootImages.length})',
+                                  style: const TextStyle(
+                                    color: AppTheme.textSecondary,
+                                    letterSpacing: 1.1,
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                                const Spacer(),
+                                const Text(
+                                  'Select folder to organize',
+                                  style: TextStyle(fontSize: 11, color: AppTheme.textHint),
+                                ),
+                              ],
+                            ),
                           ),
+                          if (rootImages.isEmpty)
+                            _buildEmptyCard('No images at root. Create a folder above or upload images.')
+                          else
+                            GridView.builder(
+                              shrinkWrap: true,
+                              physics: const NeverScrollableScrollPhysics(),
+                              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: 3,
+                                crossAxisSpacing: 4,
+                                mainAxisSpacing: 4,
+                              ),
+                              itemCount: rootImages.length,
+                              itemBuilder: (_, i) => _ImageTile(
+                                file: rootImages[i],
+                                allImages: rootImages,
+                                accentColor: widget.accentColor,
+                                onMoreTap: () => _showFileOptions(context, rootImages[i]),
+                              ),
+                            ),
                         ],
-                      ),
-                    ),
-                    if (rootImages.isEmpty)
-                      _buildEmptyCard('No images at root. Create a folder above or upload images.')
-                    else
-                      GridView.builder(
-                        shrinkWrap: true,
-                        physics: const NeverScrollableScrollPhysics(),
-                        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: 3,
-                          crossAxisSpacing: 4,
-                          mainAxisSpacing: 4,
-                        ),
-                        itemCount: rootImages.length,
-                        itemBuilder: (_, i) => _ImageTile(
-                          file: rootImages[i],
-                          allImages: rootImages,
-                          accentColor: widget.accentColor,
-                          onMoreTap: () => _showFileOptions(context, rootImages[i]),
-                        ),
-                      ),
-                  ],
-                );
-              }
+                      );
+                    }
 
               // Inside a Subfolder
               return folderFilesAsync?.when(
@@ -1138,6 +1280,263 @@ class _ImagesGalleryViewState extends ConsumerState<ImagesGalleryView> {
           ),
         );
       },
+    );
+  }
+
+  Widget _buildSmartAlbumsHorizontalList(List<SmartAlbum> smartAlbums) {
+    return SizedBox(
+      height: 122,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        clipBehavior: Clip.none,
+        itemCount: smartAlbums.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 10),
+        itemBuilder: (context, i) {
+          final album = smartAlbums[i];
+          final hasItems = album.count > 0;
+          return GestureDetector(
+            onTap: () {
+              setState(() {
+                _selectedSmartAlbum = album;
+              });
+            },
+            child: Container(
+              width: 145,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: AppTheme.surface,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: hasItems
+                      ? album.color.withValues(alpha: 0.45)
+                      : album.color.withValues(alpha: 0.18),
+                  width: hasItems ? 1.2 : 1.0,
+                ),
+                boxShadow: hasItems
+                    ? [
+                        BoxShadow(
+                          color: album.color.withValues(alpha: 0.12),
+                          blurRadius: 10,
+                          offset: const Offset(0, 3),
+                        ),
+                      ]
+                    : null,
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Container(
+                        width: 38,
+                        height: 38,
+                        decoration: BoxDecoration(
+                          color: album.color.withValues(alpha: hasItems ? 0.20 : 0.10),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Icon(
+                          album.icon,
+                          color: hasItems ? album.color : album.color.withValues(alpha: 0.6),
+                          size: 20,
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2.5),
+                        decoration: BoxDecoration(
+                          color: hasItems
+                              ? album.color.withValues(alpha: 0.16)
+                              : AppTheme.card,
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(
+                            color: hasItems
+                                ? album.color.withValues(alpha: 0.4)
+                                : AppTheme.cardBorder,
+                          ),
+                        ),
+                        child: Text(
+                          '${album.count}',
+                          style: TextStyle(
+                            color: hasItems ? album.color : AppTheme.textHint,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 11,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        album.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: hasItems ? AppTheme.textPrimary : AppTheme.textSecondary,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 13,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        hasItems ? album.subtitle : '0 items',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: hasItems ? AppTheme.textHint : AppTheme.textHint.withValues(alpha: 0.7),
+                          fontSize: 10,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildSmartAlbumDetailContent(SmartAlbum album) {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 90),
+      children: [
+        // Category Header banner
+        Container(
+          margin: const EdgeInsets.only(bottom: 14),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: AppTheme.surface,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: album.color.withValues(alpha: 0.35)),
+            boxShadow: [
+              BoxShadow(
+                color: album.color.withValues(alpha: 0.08),
+                blurRadius: 12,
+                offset: const Offset(0, 4),
+              ),
+            ],
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  color: album.color.withValues(alpha: 0.18),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(album.icon, color: album.color, size: 26),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Text(
+                          album.title,
+                          style: const TextStyle(
+                            color: AppTheme.textPrimary,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 16,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: album.color.withValues(alpha: 0.15),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: const Text(
+                            'AI Smart Album',
+                            style: TextStyle(fontSize: 10, color: AppTheme.textSecondary, fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      album.count > 0
+                          ? '${album.count} ${album.count == 1 ? 'photo' : 'photos'} automatically organized'
+                          : 'Smart auto-detection album',
+                      style: const TextStyle(color: AppTheme.textHint, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+
+        // Photo Grid or Helpful Empty State
+        if (album.files.isEmpty)
+          Container(
+            padding: const EdgeInsets.symmetric(vertical: 40, horizontal: 24),
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: AppTheme.surface,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: AppTheme.cardBorder),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(album.icon, size: 48, color: album.color.withValues(alpha: 0.5)),
+                const SizedBox(height: 16),
+                Text(
+                  'No ${album.title} Yet',
+                  style: const TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  album.emptyHint,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: AppTheme.textSecondary, fontSize: 13, height: 1.4),
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: album.color.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: album.color.withValues(alpha: 0.3)),
+                  ),
+                  child: const Text(
+                    'Auto-organized as photos are added',
+                    style: TextStyle(fontSize: 11, color: AppTheme.textHint),
+                  ),
+                ),
+              ],
+            ),
+          )
+        else
+          GridView.builder(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 3,
+              crossAxisSpacing: 4,
+              mainAxisSpacing: 4,
+            ),
+            itemCount: album.files.length,
+            itemBuilder: (_, i) => _ImageTile(
+              file: album.files[i],
+              allImages: album.files,
+              accentColor: widget.accentColor,
+              onMoreTap: () => _showFileOptions(context, album.files[i]),
+            ),
+          ),
+      ],
     );
   }
 
@@ -1486,6 +1885,7 @@ class _ImageTile extends ConsumerStatefulWidget {
 
 class _ImageTileState extends ConsumerState<_ImageTile> {
   bool _isLoadingThumbnail = false;
+  String? _resolvedThumbPath;
 
   @override
   void initState() {
@@ -1498,6 +1898,7 @@ class _ImageTileState extends ConsumerState<_ImageTile> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.file.id != widget.file.id ||
         oldWidget.file.thumbnailPath != widget.file.thumbnailPath) {
+      _resolvedThumbPath = null;
       _checkThumbnail();
     }
   }
@@ -1505,11 +1906,57 @@ class _ImageTileState extends ConsumerState<_ImageTile> {
   void _checkThumbnail() {
     final f = widget.file;
     final isImg = _imageExtensions.contains(f.extension.toLowerCase());
-    final needsLoad = isImg &&
-        (f.thumbnailPath == null || f.thumbnailPath!.isEmpty) &&
-        f.telegramThumbnailId != null &&
-        f.telegramThumbnailId! > 0;
-    if (needsLoad) _loadThumbnail(f.telegramThumbnailId!);
+    if (!isImg) return;
+
+    final currentPath = _resolvedThumbPath ?? f.thumbnailPath;
+    if (currentPath != null && currentPath.isNotEmpty) {
+      if (io.File(currentPath).existsSync()) return;
+    }
+
+    _autoResolveThumbnail(f);
+  }
+
+  Future<void> _autoResolveThumbnail(CloudFile f) async {
+    if (_isLoadingThumbnail) return;
+    _isLoadingThumbnail = true;
+
+    try {
+      // 1. Check local Camera folders first (fixes auto-backup photos showing green placeholders)
+      const cameraDirs = [
+        '/storage/emulated/0/DCIM/Camera',
+        '/storage/emulated/0/DCIM',
+        '/storage/emulated/0/Pictures',
+      ];
+      for (final dir in cameraDirs) {
+        final candidate = io.File('$dir/${f.name}');
+        if (candidate.existsSync()) {
+          final appDocDir = await getApplicationDocumentsDirectory();
+          final thumbDir = io.Directory('${appDocDir.path}/thumbnails');
+          if (!await thumbDir.exists()) await thumbDir.create(recursive: true);
+          final thumbPath = '${thumbDir.path}/thumb_${f.name}';
+          if (!io.File(thumbPath).existsSync()) {
+            await candidate.copy(thumbPath);
+          }
+          final authService = ref.read(telegramAuthServiceProvider);
+          final profile = await authService.getProfile();
+          final userId = profile['userId'];
+          if (userId != null && userId.isNotEmpty) {
+            await ref.read(firestoreServiceProvider).updateThumbnailPath(f.id, thumbPath);
+            FaceDetectionService.instance.scanSingleFile(userId, f, thumbPath);
+          }
+          if (mounted) setState(() => _resolvedThumbPath = thumbPath);
+          return;
+        }
+      }
+
+      // 2. Fallback to Telegram thumbnail download via TDLib
+      if (f.telegramThumbnailId != null && f.telegramThumbnailId! > 0) {
+        await _loadThumbnail(f.telegramThumbnailId!);
+      }
+    } catch (_) {
+    } finally {
+      if (mounted) _isLoadingThumbnail = false;
+    }
   }
 
   Future<void> _loadThumbnail(int thumbnailId) async {
@@ -1524,6 +1971,7 @@ class _ImageTileState extends ConsumerState<_ImageTile> {
         if (userId != null && userId.isNotEmpty) {
           await ref.read(firestoreServiceProvider).updateThumbnailPath(widget.file.id, localPath);
           FaceDetectionService.instance.scanSingleFile(userId, widget.file, localPath);
+          if (mounted) setState(() => _resolvedThumbPath = localPath);
         }
       }
     } catch (_) {
@@ -1535,7 +1983,8 @@ class _ImageTileState extends ConsumerState<_ImageTile> {
   @override
   Widget build(BuildContext context) {
     final f = widget.file;
-    final hasThumb = f.thumbnailPath != null && f.thumbnailPath!.isNotEmpty;
+    final activeThumb = _resolvedThumbPath ?? f.thumbnailPath;
+    final hasThumb = activeThumb != null && activeThumb.isNotEmpty;
     final initialIdx = widget.allImages.indexOf(f);
 
     return GestureDetector(
@@ -1560,15 +2009,15 @@ class _ImageTileState extends ConsumerState<_ImageTile> {
             children: [
               // Image content
               if (hasThumb)
-                f.thumbnailPath!.startsWith('http')
+                activeThumb.startsWith('http')
                     ? CachedNetworkImage(
-                        imageUrl: f.thumbnailPath!,
+                        imageUrl: activeThumb,
                         fit: BoxFit.cover,
                         placeholder: (_, __) => _placeholder(),
                         errorWidget: (_, __, ___) => _placeholder(),
                       )
                     : Image.file(
-                        io.File(f.thumbnailPath!),
+                        io.File(activeThumb),
                         fit: BoxFit.cover,
                         errorBuilder: (_, __, ___) => _placeholder(),
                       )

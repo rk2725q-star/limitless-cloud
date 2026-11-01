@@ -99,7 +99,10 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
       final authService = ref.read(telegramAuthServiceProvider);
       final telegramService = TelegramStorageService(authService);
       final f = await telegramService.downloadFile(
-          _allFiles[index].telegramMessageId, _allFiles[index].name);
+        _allFiles[index].telegramMessageId,
+        _allFiles[index].name,
+        chunkMessageIds: _allFiles[index].chunkMessageIds,
+      );
       if (!mounted) return;
       _localFiles[index] = f;
       _loading[index] = false;
@@ -248,7 +251,11 @@ class _ImageViewerPageState extends ConsumerState<ImageViewerPage>
       } else {
         final authService = ref.read(telegramAuthServiceProvider);
         final tg = TelegramStorageService(authService);
-        final downloaded = await tg.downloadFile(_file.telegramMessageId, _file.name);
+        final downloaded = await tg.downloadFile(
+          _file.telegramMessageId,
+          _file.name,
+          chunkMessageIds: _file.chunkMessageIds,
+        );
         await downloaded.copy(dest.path);
       }
       _showSnack('Saved to Downloads/LimitlessCloud ✓');

@@ -466,6 +466,20 @@ class _TaskRowState extends ConsumerState<_TaskRow>
                   const SizedBox(height: 2),
                   Row(
                     children: [
+                      if (task.totalChunks > 1) ...[
+                        Text(
+                          'Part ${task.currentChunk}/${task.totalChunks}',
+                          style: GoogleFonts.outfit(
+                            fontSize: 9,
+                            fontWeight: FontWeight.w700,
+                            color: AppTheme.accent,
+                          ),
+                        ),
+                        if (_etaLabel.isNotEmpty || task.progress <= 0.0)
+                          Text('  ·  ',
+                              style: GoogleFonts.inter(
+                                  fontSize: 9, color: AppTheme.textHint)),
+                      ],
                       if (task.progress <= 0.0)
                         Text(
                           'Connecting to Telegram…',

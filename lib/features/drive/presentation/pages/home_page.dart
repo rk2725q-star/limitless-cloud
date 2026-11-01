@@ -20,6 +20,8 @@ import '../../../../core/services/face_detection_service.dart';
 import './download_manager_page.dart';
 import './camera_capture_page.dart';
 import '../widgets/upload_progress_card.dart';
+import './shared_with_me_page.dart';
+import '../widgets/share_sheet.dart';
 
 // ── Global nav-index provider — lets any widget switch the HomePage tab ────────
 final homeNavIndexProvider = StateProvider<int>((ref) => 0);
@@ -180,12 +182,16 @@ class _DriveTabState extends ConsumerState<_DriveTab> {
         if (mounted) setState(() => _syncDone = false);
       }
     } catch (e) {
-      // Sync failed — show error banner so user knows and can retry.
-      // Previously this was silently swallowed, leaving an empty drive with
-      // no feedback whatsoever.
       if (mounted) {
+        final authService = ref.read(telegramAuthServiceProvider);
+        final isLoggedIn = await authService.isLoggedIn();
         final msg = e.toString().replaceAll('Exception: ', '');
-        setState(() => _syncError = msg);
+        // Only show not logged in error banner if the user is truly unauthenticated
+        if (!isLoggedIn) {
+          setState(() => _syncError = 'Not logged in to Telegram. Please log in again.');
+        } else if (!msg.contains('Not logged in') && !msg.contains('reconnecting')) {
+          setState(() => _syncError = msg);
+        }
       }
     }
   }
@@ -638,7 +644,24 @@ class _StarredTab extends ConsumerWidget {
     final filesAsync = ref.watch(allFilesProvider((starredOnly: true, trashedOnly: false)));
     return Scaffold(
       backgroundColor: AppTheme.background,
-      appBar: AppBar(title: const Text('Starred'), backgroundColor: AppTheme.background),
+      appBar: AppBar(
+        title: const Text('Starred'),
+        backgroundColor: AppTheme.background,
+        actions: [
+          TextButton.icon(
+            onPressed: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => const SharedWithMePage())),
+            icon: const Icon(Icons.folder_shared_rounded,
+                size: 18, color: AppTheme.primary),
+            label: const Text('Shared',
+                style: TextStyle(
+                    color: AppTheme.primary,
+                    fontWeight: FontWeight.w600,
+                    fontSize: 13)),
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
       body: filesAsync.when(
         data: (files) => files.isEmpty
             ? const _EmptyState(message: 'No starred files\nStar files to find them quickly')
@@ -1459,6 +1482,12 @@ class _FolderOptionsSheet extends StatelessWidget {
               const SizedBox(height: 16),
               ListTile(
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                leading: const Icon(Icons.share_rounded, color: AppTheme.accent),
+                title: const Text('Share'),
+                onTap: () { Navigator.pop(context); showShareFolderSheet(context, ref, folder); },
+              ),
+              ListTile(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                 leading: const Icon(Icons.drive_file_rename_outline_rounded),
                 title: const Text('Rename'),
                 onTap: () { Navigator.pop(context); _rename(context); },
@@ -1645,7 +1674,7 @@ class _FileOptionsSheet extends StatelessWidget {
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                 leading: const Icon(Icons.share_rounded, color: AppTheme.accent),
                 title: const Text('Share'),
-                onTap: () { Navigator.pop(context); },
+                onTap: () { Navigator.pop(context); showShareFileSheet(context, ref, file); },
               ),
               ListTile(
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),

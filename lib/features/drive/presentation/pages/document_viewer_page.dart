@@ -45,7 +45,11 @@ class _DocumentViewerPageState extends ConsumerState<DocumentViewerPage> {
     try {
       final authService = ref.read(telegramAuthServiceProvider);
       final telegramService = TelegramStorageService(authService);
-      final f = await telegramService.downloadFile(_file.telegramMessageId, _file.name);
+      final f = await telegramService.downloadFile(
+        _file.telegramMessageId,
+        _file.name,
+        chunkMessageIds: _file.chunkMessageIds,
+      );
       if (!mounted) return;
 
       String? textContent;

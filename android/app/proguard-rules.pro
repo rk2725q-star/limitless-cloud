@@ -32,6 +32,9 @@
 -keep class com.dexterous.** { *; }
 -keep class com.baseflow.** { *; }
 
+# App native services and processors
+-keep class com.limitlesscloud.limitless_cloud.** { *; }
+
 # General
 -keepattributes *Annotation*
 -keepattributes SourceFile,LineNumberTable
