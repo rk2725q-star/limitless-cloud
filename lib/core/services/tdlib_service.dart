@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io' as io;
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:handy_tdlib/handy_tdlib.dart';
 import 'package:path/path.dart' as p;
@@ -115,6 +116,7 @@ class TdlibService {
   // Auth state tracking
   String _authState = '';
   String get authState => _authState;
+  bool get isInitialized => _initialized;
   bool get isReady => _initialized && _authState == 'authorizationStateReady';
 
   // Initialization error
@@ -140,7 +142,11 @@ class TdlibService {
     // Subscribe to auth state changes internally
     updates.listen((upd) {
       if (upd['@type'] == 'error') {
-        initError = 'TDLib Error: ${upd['message']}';
+        debugPrint('[TDLib Core Error] ${upd['message']}');
+        // Only treat as fatal init error if TDLib is in a closed/dead state
+        if (_authState == 'authorizationStateClosed') {
+          initError = 'TDLib Error: ${upd['message']}';
+        }
         return;
       }
 
@@ -148,6 +154,8 @@ class TdlibService {
         final state = upd['authorization_state'] as Map<String, dynamic>?;
         final type = state?['@type'] as String? ?? '';
         _authState = type;
+        // Any progressing auth state indicates TDLib core is running successfully
+        initError = null;
         
         // Respond to encryption key request automatically
         if (type == 'authorizationStateWaitEncryptionKey') {
@@ -160,6 +168,11 @@ class TdlibService {
         if (type == 'authorizationStateReady') {
           // Pre-resolve storage chat ID in background so uploads/downloads start with zero delay
           getStorageChatId().catchError((_) => 0);
+          _fireAndForget({
+            '@type': 'setOption',
+            'name': 'online',
+            'value': {'@type': 'optionValueBoolean', 'value': true},
+          });
         }
       }
     });
@@ -191,70 +204,17 @@ class TdlibService {
   // ── TDLib Performance & Network Tuning ─────────────────────────────────────
 
   void _setPerformanceOptions() {
-    // 1. Disable disk-heavy network stats (eliminates continuous SQLite commits per packet)
-    _fireAndForget({
-      '@type': 'setOption',
-      'name': 'disable_persistent_network_statistics',
-      'value': {'@type': 'optionValueBoolean', 'value': true},
-    });
-    _fireAndForget({
-      '@type': 'setOption',
-      'name': 'disable_network_statistics',
-      'value': {'@type': 'optionValueBoolean', 'value': true},
-    });
-    _fireAndForget({
-      '@type': 'setOption',
-      'name': 'disable_time_adjustment_protection',
-      'value': {'@type': 'optionValueBoolean', 'value': true},
-    });
-
-    // 2. Enable quick-ack for low-latency DC acknowledgements
-    _fireAndForget({
-      '@type': 'setOption',
-      'name': 'use_quick_ack',
-      'value': {'@type': 'optionValueBoolean', 'value': true},
-    });
-
-    // 3. Perfect Forward Secrecy for faster and reliable multi-channel sessions
-    _fireAndForget({
-      '@type': 'setOption',
-      'name': 'use_pfs',
-      'value': {'@type': 'optionValueBoolean', 'value': true},
-    });
-
-    // 4. Mark user active/online for priority routing on Telegram DC gateways
-    _fireAndForget({
-      '@type': 'setOption',
-      'name': 'online',
-      'value': {'@type': 'optionValueBoolean', 'value': true},
-    });
-
-    // 5. Enable storage optimizer to prevent disk bloat
-    _fireAndForget({
-      '@type': 'setOption',
-      'name': 'use_storage_optimizer',
-      'value': {'@type': 'optionValueBoolean', 'value': true},
-    });
-
-    // 6. Prefer IPv6 for 5G/5G++ direct carrier routing without NAT overhead
+    // Standard valid TDLib network & performance options:
     _fireAndForget({
       '@type': 'setOption',
       'name': 'prefer_ipv6',
       'value': {'@type': 'optionValueBoolean', 'value': true},
     });
 
-    // 7. Prevent background sleep throttling
     _fireAndForget({
       '@type': 'setOption',
       'name': 'ignore_background_updates',
       'value': {'@type': 'optionValueBoolean', 'value': false},
-    });
-
-    // 8. Disable animated emojis & stickers to keep CPU 100% focused on network I/O
-    _fireAndForget({
-      '@type': 'setOption',
-      'name': 'disable_animated_emojis',
-      'value': {'@type': 'optionValueBoolean', 'value': true},
     });
   }
 
